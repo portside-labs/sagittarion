@@ -1,0 +1,12 @@
+node_modules/
+out/
+dist/
+release/
+*.log
+.DS_Store
+test/e2e/artifacts/
+test/mock-ssh/.hostkey*
+test/fixtures/*.db
+test/fixtures/*.db-*
+test/docker/.context/
+*.tsbuildinfo

@@ -1,0 +1,251 @@
+// End-to-end test: drives the built Electron app with Playwright against the
+// mock SSH server. Run with `npm run test:e2e`. Screenshots land in
+// test/e2e/artifacts/.
+import { _electron as electron } from 'playwright'
+import { spawnSync } from 'node:child_process'
+import { createHash } from 'node:crypto'
+import fs from 'node:fs'
+import os from 'node:os'
+import path from 'node:path'
+import { fileURLToPath } from 'node:url'
+import ssh2 from 'ssh2'
+const { utils } = ssh2
+import { ensureSampleDb, startMockServer } from '../mock-ssh/server.mjs'
+
+const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..')
+const artifacts = path.join(root, 'test', 'e2e', 'artifacts')
+fs.mkdirSync(artifacts, { recursive: true })
+const isMac = process.platform === 'darwin'
+const mod = isMac ? 'Meta' : 'Control'
+
+function assert(cond, msg) {
+  if (!cond) throw new Error('Assertion failed: ' + msg)
+}
+
+/** Query the database file directly (via python3, which the tests need anyway) to verify what the GUI wrote. */
+function sqlite(db, sql) {
+  const script =
+    'import sqlite3, sys\n' +
+    'c = sqlite3.connect(sys.argv[1])\n' +
+    'for row in c.execute(sys.argv[2]):\n' +
+    '    print("|".join("" if v is None else str(v) for v in row))\n'
+  const r = spawnSync('python3', ['-c', script, db, sql], { encoding: 'utf8' })
+  if (r.status !== 0) throw new Error(r.stderr)
+  return r.stdout.trim()
+}
+
+async function main() {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'sqlite-ssh-e2e-'))
+  const userData = path.join(tmp, 'userData')
+  fs.mkdirSync(userData)
+  const db = path.join(tmp, 'e2e.db')
+  fs.copyFileSync(ensureSampleDb(), db)
+
+  const server = await startMockServer({ noise: true })
+  // Pre-trust the mock server's host key so no native dialog appears.
+  const parsed = utils.parseKey(server.hostKey)
+  const pub = parsed.getPublicSSH()
+  fs.writeFileSync(
+    path.join(userData, 'known_hosts.json'),
+    JSON.stringify([
+      {
+        host: server.host,
+        port: server.port,
+        keyType: parsed.type,
+        fingerprint: 'SHA256:' + createHash('sha256').update(pub).digest('base64').replace(/=+$/, ''),
+        key: pub.toString('base64'),
+        addedAt: Date.now()
+      }
+    ])
+  )
+
+  const app = await electron.launch({
+    args: [path.join(root, 'out', 'main', 'index.js')],
+    env: { ...process.env, SQLITE_SSH_USER_DATA: userData, NODE_ENV: 'production' }
+  })
+  const consoleErrors = []
+  const page = await app.firstWindow()
+  page.on('console', (m) => {
+    if (m.type() === 'error') consoleErrors.push(m.text())
+  })
+  page.on('pageerror', (e) => consoleErrors.push(String(e)))
+  await page.waitForLoadState('domcontentloaded')
+  const shot = (name) => page.screenshot({ path: path.join(artifacts, name + '.png') })
+
+  try {
+    // ------------------------------------------------------------ connect
+    await page.getByPlaceholder('Production analytics').fill('E2E mock host')
+    await page.getByPlaceholder('db.example.com').fill(server.host)
+    await page.locator('input[type=number]').fill(String(server.port))
+    await page.getByPlaceholder('ubuntu').fill(server.username)
+    await page.getByRole('button', { name: 'Password', exact: true }).click()
+    await page.locator('input[type=password]').fill(server.password)
+    await page.getByPlaceholder('/var/lib/app/data.sqlite or ~/app.db').fill(db)
+    await shot('01-connect')
+
+    // Remote file browser round trip
+    await page.getByRole('button', { name: /Browse…/ }).click()
+    await page.getByText('Choose a database on the remote host').waitFor({ timeout: 20000 })
+    await page.locator('.fb-row.db', { hasText: 'e2e.db' }).waitFor({ timeout: 20000 })
+    await shot('02-file-browser')
+    await page.locator('.fb-row.db', { hasText: 'e2e.db' }).dblclick()
+    const picked = await page.getByPlaceholder('/var/lib/app/data.sqlite or ~/app.db').inputValue()
+    assert(fs.realpathSync(picked) === fs.realpathSync(db), `file browser filled the path (got ${picked})`)
+
+    await page.getByTestId('connect-button').click()
+    await page.getByTestId('tree-table-users').waitFor({ timeout: 30000 })
+    console.log('connected; schema loaded')
+
+    // ------------------------------------------------------------ table browsing
+    await page.getByTestId('tree-table-users').click()
+    const grid = page.getByTestId('table-grid')
+    await grid.locator('tbody tr').first().waitFor({ timeout: 20000 })
+    const rowCount = await grid.locator('tbody tr').count()
+    assert(rowCount === 60, `users grid shows 60 rows (got ${rowCount})`)
+    assert((await page.getByTestId('pager-label').textContent()).includes('1–60 of 60'), 'pager label')
+    await grid.locator('td[data-r="0"][data-c="1"]').click()
+    await page.locator('.toolbar button[title="Toggle cell inspector"]').click()
+    await page.getByTestId('inspector').waitFor()
+    await shot('03-table-users')
+    await page.locator('.toolbar button[title="Toggle cell inspector"]').click()
+
+    // Sort by clicking the header
+    await grid.locator('thead th', { hasText: 'age' }).click()
+    await page.waitForFunction(() => document.querySelector('[data-testid=table-grid] thead th.sorted') !== null)
+    await grid.locator('tbody tr').first().waitFor()
+
+    // Filter
+    const where = page.getByTestId('where-input')
+    await where.fill("is_admin = 1")
+    await where.press('Enter')
+    await page.waitForFunction(() => document.querySelector('[data-testid=pager-label]')?.textContent?.includes('of 6'))
+    const filtered = await grid.locator('tbody tr').count()
+    assert(filtered === 6, `filter narrows to 6 admins (got ${filtered})`)
+    await where.fill('')
+    await where.press('Enter')
+    await page.waitForFunction(() => document.querySelector('[data-testid=pager-label]')?.textContent?.includes('of 60'))
+
+    // Bad filter shows an error banner
+    await where.fill('nonsense === 1')
+    await where.press('Enter')
+    await page.locator('.banner.error').waitFor()
+    await where.fill('')
+    await where.press('Enter')
+    await page.waitForFunction(() => !document.querySelector('.banner.error'))
+
+    // ------------------------------------------------------------ editing
+    await grid.locator('thead th', { hasText: 'age' }).click() // desc
+    await grid.locator('thead th', { hasText: 'age' }).click() // off -> default order
+    await page.waitForFunction(() => document.querySelector('[data-testid=table-grid] thead th.sorted') === null)
+    await grid.locator('td[data-r="0"][data-c="1"]').waitFor()
+    const originalName = await grid.locator('td[data-r="0"][data-c="1"]').textContent()
+    await grid.locator('td[data-r="0"][data-c="1"]').dblclick()
+    const editor = grid.locator('textarea.cell-editor')
+    await editor.waitFor()
+    await editor.fill('Edited via GUI')
+    await editor.press('Enter')
+    await grid.locator('td[data-r="0"][data-c="1"].cell-dirty').waitFor()
+    // Stage a NULL via keyboard on the email column of row 2
+    await grid.locator('td[data-r="1"][data-c="2"]').click()
+    await page.keyboard.press(`${mod}+Backspace`)
+    await grid.locator('td[data-r="1"][data-c="2"].cell-dirty.cell-null').waitFor()
+    // Add a row and fill its name
+    await page.getByTestId('add-row').click()
+    await grid.locator('tr.row-new').waitFor()
+    await grid.locator('tr.row-new td[data-c="1"]').dblclick()
+    await grid.locator('textarea.cell-editor').fill('Brand New Person')
+    await grid.locator('textarea.cell-editor').press('Enter')
+    // Mark row 3 for deletion
+    await grid.locator('td[data-r="2"][data-c="0"]').click()
+    await page.getByTestId('delete-row').click()
+    await grid.locator('tr.row-deleted').waitFor()
+    await shot('04-table-pending-edits')
+    const applyText = await page.getByTestId('apply-button').textContent()
+    assert(applyText.includes('Apply 4'), `apply button counts 4 changes (got "${applyText}")`)
+    await page.getByTestId('apply-button').click()
+    await page.getByTestId('confirm-dialog').waitFor()
+    await page.getByTestId('confirm-ok').click()
+    await page.locator('.toast.success').waitFor({ timeout: 20000 })
+    await page.waitForFunction(() => document.querySelector('[data-testid=table-grid] td[data-r="0"][data-c="1"]')?.textContent === 'Edited via GUI')
+    assert(sqlite(db, 'SELECT name FROM users WHERE id = 1') === 'Edited via GUI', 'update reached the database file')
+    assert(sqlite(db, 'SELECT email IS NULL FROM users WHERE id = 2') === '1', 'NULL reached the database file')
+    assert(sqlite(db, "SELECT count(*) FROM users WHERE name = 'Brand New Person'") === '1', 'insert reached the database file')
+    assert(sqlite(db, 'SELECT count(*) FROM users WHERE id = 3') === '0', 'delete reached the database file')
+    console.log(`edits applied (renamed "${originalName}")`)
+
+    // ------------------------------------------------------------ structure view
+    await page.getByTestId('structure-toggle').click()
+    await page.getByTestId('structure-view').waitFor()
+    await page.locator('.struct-sql .cm-content').first().waitFor()
+    await shot('05-structure')
+    assert((await page.getByTestId('structure-view').textContent()).includes('PRIMARY KEY') || (await page.getByTestId('structure-view').textContent()).includes('PK'), 'structure shows the primary key')
+
+    // ------------------------------------------------------------ query tab
+    await page.getByTestId('new-query-tab').click()
+    const cm = page.locator('.tab-pane:not([hidden]) .query-tab .cm-content')
+    await cm.waitFor()
+    await cm.click()
+    await page.keyboard.type('SELECT id, name, email, balance FROM users ORDER BY id LIMIT 5;\nSELECT count(*) AS orders FROM orders;')
+    await page.keyboard.press(`${mod}+Enter`)
+    await page.getByTestId('results').waitFor({ timeout: 20000 })
+    await page.locator('.result-chips .chip').nth(1).waitFor()
+    // The last SELECT is shown by default; switch to the first one.
+    await page.locator('.result-chips .chip').first().click()
+    const resultGrid = page.getByTestId('result-grid')
+    await resultGrid.locator('tbody tr').first().waitFor()
+    const resultRows = await resultGrid.locator('tbody tr').count()
+    assert(resultRows === 5, `query result has 5 rows (got ${resultRows})`)
+    assert((await resultGrid.locator('td[data-r="0"][data-c="1"]').textContent()) === 'Edited via GUI', 'query sees the applied edit')
+    await shot('06-query')
+
+    // Error handling
+    await cm.click()
+    await page.keyboard.press(`${mod}+A`)
+    await page.keyboard.type('SELECT * FROM does_not_exist;')
+    await page.keyboard.press(`${mod}+Enter`)
+    await page.getByTestId('error-message').waitFor({ timeout: 20000 })
+    assert((await page.getByTestId('error-message').textContent()).includes('no such table'), 'SQL error is shown')
+
+    // DDL refreshes the schema tree
+    await page.keyboard.press(`${mod}+A`)
+    await page.keyboard.type('CREATE TABLE e2e_created (id INTEGER PRIMARY KEY, note TEXT);')
+    await page.keyboard.press(`${mod}+Enter`)
+    await page.getByTestId('exec-message').waitFor({ timeout: 20000 })
+    await page.getByTestId('tree-table-e2e_created').waitFor({ timeout: 20000 })
+
+    // Cancel a long query
+    await page.keyboard.press(`${mod}+A`)
+    await page.keyboard.type('WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c) SELECT count(*) FROM c;')
+    await page.keyboard.press(`${mod}+Enter`)
+    await page.getByTestId('stop-button').waitFor()
+    await page.waitForTimeout(300)
+    await page.getByTestId('stop-button').click()
+    await page.getByTestId('error-message').waitFor({ timeout: 20000 })
+    assert((await page.getByTestId('error-message').textContent()).includes('interrupted'), 'cancelled query reports interruption')
+
+    // ------------------------------------------------------------ disconnect
+    await page.getByTestId('disconnect-button').click()
+    await page.getByTestId('connect-button').waitFor()
+    assert((await page.locator('.conn-item').count()) === 1, 'connection was saved')
+    await shot('07-back-to-connections')
+
+    const realErrors = consoleErrors.filter((e) => !/Autofill|DevTools/.test(e))
+    if (realErrors.length) {
+      console.log('Renderer console errors:\n' + realErrors.join('\n'))
+      throw new Error('renderer logged errors')
+    }
+    console.log('E2E passed. Screenshots in', artifacts)
+  } catch (err) {
+    await shot('99-failure').catch(() => {})
+    throw err
+  } finally {
+    await app.close().catch(() => {})
+    await server.close()
+    fs.rmSync(tmp, { recursive: true, force: true })
+  }
+}
+
+main().catch((err) => {
+  console.error(err)
+  process.exit(1)
+})
