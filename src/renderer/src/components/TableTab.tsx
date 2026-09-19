@@ -39,6 +39,7 @@ export function TableTab({ tab, active }: { tab: Extract<Tab, { kind: 'table' }>
   const [exportMenu, setExportMenu] = useState<{ x: number; y: number } | null>(null)
   const [applying, setApplying] = useState(false)
   const [structureKey, setStructureKey] = useState(0)
+  const [loadCount, setLoadCount] = useState(0)
   const reqSeq = useRef(0)
 
   const pendingCount = updates.size + deletes.size + inserts.length
@@ -73,7 +74,10 @@ export function TableTab({ tab, active }: { tab: Extract<Tab, { kind: 'table' }>
     } catch (e) {
       if (seq === reqSeq.current) setError(errorMessage(e))
     } finally {
-      if (seq === reqSeq.current) setLoading(false)
+      if (seq === reqSeq.current) {
+        setLoading(false)
+        setLoadCount((c) => c + 1)
+      }
     }
   }, [session.sessionId, tab.table, page, pageSize, sort, where, clearPending, setInTransaction, setStatus])
 
@@ -252,7 +256,7 @@ export function TableTab({ tab, active }: { tab: Extract<Tab, { kind: 'table' }>
   }
 
   return (
-    <div className="table-tab">
+    <div className="table-tab" data-loads={loadCount}>
       <div className="toolbar">
         <div className="segmented small">
           <button className={view === 'data' ? 'active' : ''} onClick={() => setView('data')}>

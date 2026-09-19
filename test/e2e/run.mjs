@@ -100,6 +100,17 @@ async function main() {
     await page.getByTestId('tree-table-users').click()
     const grid = page.getByTestId('table-grid')
     await grid.locator('tbody tr').first().waitFor({ timeout: 20000 })
+    const tableTab = page.locator('.tab-pane:not([hidden]) .table-tab')
+    // Runs fn, then waits until the visible table tab has completed one more row load.
+    const afterReload = async (fn) => {
+      const before = Number(await tableTab.getAttribute('data-loads'))
+      await fn()
+      await page.waitForFunction(
+        (b) => Number(document.querySelector('.tab-pane:not([hidden]) .table-tab')?.getAttribute('data-loads')) > b,
+        before,
+        { timeout: 20000 }
+      )
+    }
     const rowCount = await grid.locator('tbody tr').count()
     assert(rowCount === 60, `users grid shows 60 rows (got ${rowCount})`)
     assert((await page.getByTestId('pager-label').textContent()).includes('1–60 of 60'), 'pager label')
@@ -110,33 +121,41 @@ async function main() {
     await page.locator('.toolbar button[title="Toggle cell inspector"]').click()
 
     // Sort by clicking the header
-    await grid.locator('thead th', { hasText: 'age' }).click()
-    await page.waitForFunction(() => document.querySelector('[data-testid=table-grid] thead th.sorted') !== null)
-    await grid.locator('tbody tr').first().waitFor()
+    await afterReload(() => grid.locator('thead th', { hasText: 'age' }).click())
+    assert((await grid.locator('thead th.sorted').count()) === 1, 'sorted column is marked')
 
     // Filter
     const where = page.getByTestId('where-input')
-    await where.fill("is_admin = 1")
-    await where.press('Enter')
-    await page.waitForFunction(() => document.querySelector('[data-testid=pager-label]')?.textContent?.includes('of 6'))
+    await afterReload(async () => {
+      await where.fill('is_admin = 1')
+      await where.press('Enter')
+    })
+    const filteredLabel = (await page.getByTestId('pager-label').textContent()).trim()
+    assert(filteredLabel === '1–6 of 6', `pager shows the filtered count (got "${filteredLabel}")`)
     const filtered = await grid.locator('tbody tr').count()
     assert(filtered === 6, `filter narrows to 6 admins (got ${filtered})`)
-    await where.fill('')
-    await where.press('Enter')
-    await page.waitForFunction(() => document.querySelector('[data-testid=pager-label]')?.textContent?.includes('of 60'))
+    await afterReload(async () => {
+      await where.fill('')
+      await where.press('Enter')
+    })
+    assert((await page.getByTestId('pager-label').textContent()).includes('of 60'), 'filter cleared')
 
     // Bad filter shows an error banner
-    await where.fill('nonsense === 1')
-    await where.press('Enter')
+    await afterReload(async () => {
+      await where.fill('nonsense === 1')
+      await where.press('Enter')
+    })
     await page.locator('.banner.error').waitFor()
-    await where.fill('')
-    await where.press('Enter')
-    await page.waitForFunction(() => !document.querySelector('.banner.error'))
+    await afterReload(async () => {
+      await where.fill('')
+      await where.press('Enter')
+    })
+    assert((await page.locator('.banner.error').count()) === 0, 'error banner cleared')
 
     // ------------------------------------------------------------ editing
-    await grid.locator('thead th', { hasText: 'age' }).click() // desc
-    await grid.locator('thead th', { hasText: 'age' }).click() // off -> default order
-    await page.waitForFunction(() => document.querySelector('[data-testid=table-grid] thead th.sorted') === null)
+    await afterReload(() => grid.locator('thead th', { hasText: 'age' }).click()) // desc
+    await afterReload(() => grid.locator('thead th', { hasText: 'age' }).click()) // off -> default order
+    assert((await grid.locator('thead th.sorted').count()) === 0, 'sort cleared')
     await grid.locator('td[data-r="0"][data-c="1"]').waitFor()
     const originalName = await grid.locator('td[data-r="0"][data-c="1"]').textContent()
     await grid.locator('td[data-r="0"][data-c="1"]').dblclick()
@@ -164,9 +183,9 @@ async function main() {
     assert(applyText.includes('Apply 4'), `apply button counts 4 changes (got "${applyText}")`)
     await page.getByTestId('apply-button').click()
     await page.getByTestId('confirm-dialog').waitFor()
-    await page.getByTestId('confirm-ok').click()
+    await afterReload(() => page.getByTestId('confirm-ok').click())
     await page.locator('.toast.success').waitFor({ timeout: 20000 })
-    await page.waitForFunction(() => document.querySelector('[data-testid=table-grid] td[data-r="0"][data-c="1"]')?.textContent === 'Edited via GUI')
+    assert((await grid.locator('td[data-r="0"][data-c="1"]').textContent()) === 'Edited via GUI', 'grid shows the applied edit')
     assert(sqlite(db, 'SELECT name FROM users WHERE id = 1') === 'Edited via GUI', 'update reached the database file')
     assert(sqlite(db, 'SELECT email IS NULL FROM users WHERE id = 2') === '1', 'NULL reached the database file')
     assert(sqlite(db, "SELECT count(*) FROM users WHERE name = 'Brand New Person'") === '1', 'insert reached the database file')
