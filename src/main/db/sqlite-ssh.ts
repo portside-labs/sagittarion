@@ -1,4 +1,4 @@
-import type { DatabaseInfo, PendingChange, QueryResponse, RowsRequest, RowsResponse, SchemaInfo, TableDetails, TableRef } from '@shared/types'
+import type { DatabaseInfo, PendingChange, QueryOptions, QueryResponse, RowsRequest, RowsResponse, SchemaInfo, TableDetails, TableRef } from '@shared/types'
 import { formatBytes } from '@shared/export'
 import { Session } from '../ssh/session'
 import type { DatabaseDriver } from './driver'
@@ -50,8 +50,8 @@ export class SqliteSshDriver implements DatabaseDriver {
     return this.session.rows(req)
   }
 
-  query(sql: string, params: unknown[] = [], maxRows = 1000): Promise<QueryResponse> {
-    return this.session.query(sql, params, maxRows)
+  query(sql: string, params: unknown[] = [], maxRows = 1000, options?: QueryOptions): Promise<QueryResponse> {
+    return this.session.query(sql, params, maxRows, options)
   }
 
   async cancel(): Promise<void> {

@@ -99,6 +99,8 @@ describe('Session over SSH', () => {
     expect(filtered.total).toBeGreaterThan(0)
     expect(filtered.rows.every((r) => r[3] === 'paid')).toBe(true)
 
+    expect(schema.relations).toEqual([{ table: 'orders', column: 'user_id', refTable: 'users', refColumn: 'id' }])
+
     const details = await s.tableDetails('orders')
     expect(details.foreignKeys[0]).toMatchObject({ table: 'users', from: 'user_id', to: 'id' })
     expect(details.indexes.map((i) => i.name).sort()).toEqual(['idx_orders_status_placed', 'idx_orders_user'])
@@ -184,6 +186,25 @@ describe('Session over SSH', () => {
     const res = await s.query("UPDATE users SET name = 'nope' WHERE id = 1")
     expect(res.results[0].kind).toBe('error')
     expect((res.results[0] as any).message).toMatch(/readonly/)
+    s.close()
+  })
+
+  it('runs individual queries read-only on a writable database', async () => {
+    const db = freshDb('c2.db')
+    const s = makeSession(baseConfig())
+    await s.connect()
+    const info = await s.openDatabase(db)
+    expect(info.readonly).toBe(false)
+    const blocked = await s.query("UPDATE users SET name = 'nope' WHERE id = 1", [], 100, { readOnly: true })
+    expect(blocked.results[0].kind).toBe('error')
+    expect((blocked.results[0] as any).message).toMatch(/readonly/)
+    const plan = await s.query('EXPLAIN QUERY PLAN SELECT count(*) FROM orders WHERE status = ?', ['paid'], 100, { readOnly: true })
+    expect(plan.results[0].kind).toBe('rows')
+    // The guard is per call: the connection is writable again afterwards.
+    const ok = await s.query("UPDATE users SET name = name WHERE id = 1")
+    expect(ok.results[0].kind).toBe('exec')
+    const unchanged = await s.query('SELECT name FROM users WHERE id = 1')
+    expect((unchanged.results[0] as RowsResult).rows[0][0]).toBe('Radia Hamilton')
     s.close()
   })
 

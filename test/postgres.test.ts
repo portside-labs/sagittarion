@@ -110,6 +110,12 @@ describe.skipIf(!enabled)('PostgreSQL driver', () => {
     expect(schema.indexes.map((i) => i.name)).toEqual(expect.arrayContaining(['idx_orders_user', 'idx_orders_status_placed', 'users_email_key']))
     expect(schema.indexes.some((i) => i.name === 'users_pkey')).toBe(false)
     expect(schema.triggers.map((t) => t.name)).toEqual(['users_touch'])
+    expect(schema.relations).toEqual([{ schema: 'public', table: 'orders', column: 'user_id', refSchema: 'public', refTable: 'users', refColumn: 'id' }])
+    // Row estimates come from planner statistics: unknown until the table is analyzed.
+    expect(schema.tables.find((t) => t.name === 'orders')!.rowEstimate ?? null).toBeNull()
+    await d.query('ANALYZE orders')
+    const analyzed = await d.schema()
+    expect(analyzed.tables.find((t) => t.name === 'orders')!.rowEstimate).toBeGreaterThan(0)
     await d.close()
   })
 
@@ -254,6 +260,25 @@ describe.skipIf(!enabled)('PostgreSQL driver', () => {
     const res = await d.query("UPDATE settings SET value = 'nope' WHERE key = 'theme'")
     expect(res.results[0].kind).toBe('error')
     expect((res.results[0] as any).message).toMatch(/read-only/)
+    await d.close()
+  })
+
+  it('runs individual queries in a read-only transaction', async () => {
+    const d = driver()
+    await d.connect()
+    const blocked = await d.query("UPDATE settings SET value = 'nope' WHERE key = 'theme'", [], 100, { readOnly: true })
+    expect(blocked.results[0].kind).toBe('error')
+    expect((blocked.results[0] as any).message).toMatch(/read-only transaction/)
+    expect(blocked.tx).toBe(false)
+    const plan = await d.query('EXPLAIN SELECT count(*) FROM orders WHERE status = $1', ['paid'], 100, { readOnly: true })
+    expect(plan.results[0].kind).toBe('rows')
+    expect(plan.tx).toBe(false)
+    const value = await d.query("SELECT value FROM settings WHERE key = 'theme'")
+    expect((value.results[0] as RowsResult).rows[0][0]).not.toBe('nope')
+    // Refuses to run inside a user's open transaction rather than disturbing it.
+    await d.query('BEGIN')
+    await expect(d.query('SELECT 1', [], 100, { readOnly: true })).rejects.toThrow(/transaction is open/)
+    await d.query('ROLLBACK')
     await d.close()
   })
 

@@ -1847,3 +1847,108 @@ table.struct {
 .tree-schema .tree-schema-body {
   padding-left: 10px;
 }
+
+/* ---------------------------------------------------------------- settings + ask */
+.settings-body {
+  padding: 16px 18px 18px;
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+}
+.settings-body h2 {
+  margin: 0 0 6px;
+  font-size: 13px;
+  font-weight: 700;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.settings-body p.hint,
+.settings-body span.hint {
+  color: var(--text-muted);
+  font-size: 12px;
+  line-height: 1.55;
+  margin: 0 0 12px;
+}
+.settings-body .field {
+  gap: 6px;
+}
+.ask-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg-panel);
+}
+.ask-bar .ask-icon {
+  color: #e6a23c;
+  flex: 0 0 auto;
+}
+.ask-bar input.text {
+  flex: 1;
+  height: 28px;
+}
+.ask-result {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg-panel);
+  font-size: 12px;
+}
+.ask-result.clarify {
+  background: var(--warn-soft);
+}
+.ask-result .ask-message {
+  color: var(--text);
+  flex: 1 1 100%;
+}
+.ask-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  height: 22px;
+  padding: 0 8px;
+  border-radius: 999px;
+  border: 1px solid var(--border-strong);
+  background: var(--bg-elev);
+  color: var(--text-muted);
+  white-space: nowrap;
+}
+.ask-chip strong {
+  color: var(--text);
+  font-weight: 600;
+}
+.ask-chip.warn {
+  border-color: rgba(230, 162, 60, 0.5);
+  color: var(--warn);
+}
+.ask-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 600;
+  white-space: nowrap;
+  border: 1px solid transparent;
+}
+.ask-badge.ok {
+  color: var(--ok);
+  background: var(--ok-soft);
+}
+.ask-badge.warn {
+  color: var(--warn);
+  background: var(--warn-soft);
+}
+.ask-result .muted.small {
+  font-size: 11px;
+  white-space: nowrap;
+}
+.ask-result .spacer {
+  flex: 1;
+}

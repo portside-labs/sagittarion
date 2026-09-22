@@ -65,6 +65,74 @@ What the Postgres backend does differently:
 - *Open read-only* sets `default_transaction_read_only` for the session.
 - Requires PostgreSQL 12 or newer.
 
+## Ask in plain English
+
+Every query tab has an *Ask* box. Type a question such as "top 10 customers by
+revenue last quarter", "orders that have no invoice" or "average time from
+signup to first purchase per plan", and the app asks a language model of your
+choice to write the SQL. The generated query is checked before it runs:
+
+1. **Read-only by construction.** Only a single `SELECT` (or `WITH ... SELECT`)
+   is accepted, and the statement is executed under SQLite's `query_only`
+   pragma or a PostgreSQL `READ ONLY` transaction, so even a query that slipped
+   past the text check cannot change anything.
+2. **Validated by the database.** The query is run through `EXPLAIN` first.
+   If the database rejects it (unknown column, bad join, syntax), the error is
+   sent back to the model, which gets up to two attempts to fix it.
+3. **Explained.** The result panel shows what the query does, which tables it
+   used, any assumptions the model made ("treated `total` as revenue"), how much
+   of the schema it saw and how many tokens the request cost. Turn off *Run
+   generated queries automatically* in Settings to review the SQL before it runs.
+
+Follow-up questions work: the last few question/SQL pairs in the same tab are
+sent along, so "now only for 2025" refines the previous query. *New topic*
+clears that history.
+
+### Providers
+
+Settings lets you pick any standard provider and bring your own key: OpenAI,
+Anthropic, Google Gemini, Groq, OpenRouter, a local Ollama server, or any
+OpenAI-compatible endpoint (vLLM, LM Studio, a company gateway). *Test* checks
+the connection and *Fetch models* lists what the account can use. Keys are
+stored encrypted with the OS keychain via Electron's `safeStorage`, one per
+provider. With Ollama nothing leaves your machine.
+
+### Large schemas
+
+Sending a whole schema with every question is expensive and, past a few
+hundred tables, impossible. The app keeps a local index of the schema and
+decides per question what the model needs to see:
+
+- Each table is described in one compact line, e.g.
+  `orders(id int pk, user_id int fk->users.id, status text {paid|pending|refunded}, total numeric, placed_at timestamp) ~12k rows`,
+  roughly a tenth of the tokens of the `CREATE TABLE` text. Tables with more
+  than 60 columns are shortened to keys, foreign keys and columns matching the
+  question, with a note that `describe_table` has the rest.
+- If the whole compact schema fits the budget chosen in Settings (default about
+  8k tokens), it is sent every time. A stable schema block is cache-friendly:
+  with Anthropic it is marked for prompt caching, and OpenAI caches long
+  repeated prefixes automatically, so repeat questions cost a fraction.
+- Otherwise the question is matched against table and column names with a
+  BM25 keyword search (identifiers are split on underscores and camelCase and
+  singularised, so "customer" finds `customers` and `customer_addresses`), the
+  best tables are expanded one hop along foreign keys so joins are possible,
+  and lines are added in relevance order until the budget is full. Tables used
+  by recent questions in the session get a boost. Optionally an embedding model
+  (OpenAI-compatible providers only) is fused in for questions phrased unlike
+  the schema; each table is embedded once and cached on disk.
+- The model can look further itself with four tools: `search_schema`,
+  `describe_table`, `sample_values` and `propose_query`. A question about a
+  table that was not in the excerpt costs one extra round trip instead of a
+  wrong answer. Models without tool support fall back to plain JSON answers.
+
+Privacy: the question, the compact lines of the selected tables (names, types,
+keys, comments, approximate row counts) and, for follow-ups, earlier questions
+and SQL are sent to the provider. Turning on *Send sample column values* in
+Settings also sends up to 20 distinct values of short text columns of the
+tables in context so words like "paid" can be matched to a status; it is off by
+default and skipped for tables estimated at over two million rows. Query
+results are never sent.
+
 ## Requirements
 
 - Local: Node.js 20 or newer to build and run from source.
@@ -135,6 +203,7 @@ src/main/            Electron main process: window, IPC, dialogs
 src/main/ssh/        Session (ssh2): exec, SFTP, local port forwarding; host key store
 src/main/db/         DatabaseDriver interface, SQLite-over-SSH adapter, PostgreSQL driver
 src/main/connections/ ConnectionManager: opens either kind, tunnels, lifecycle
+src/main/ai/         plain-English queries: provider adapters, schema index and retrieval, read-only guard, orchestrator
 src/main/agent/      sqlite_agent.py – runs on the remote host
 src/main/store/      saved connections (secrets encrypted with safeStorage)
 src/preload/         contextBridge API exposed as window.api
@@ -161,6 +230,9 @@ pulled, point them at any Alpine-flavoured image you already have, e.g.
 The PostgreSQL tests start a `postgres:16-alpine` container unless `PG_URL`
 points at a server you provide (set `PG_IMAGE` to use a different image). They
 recreate their own tables in that database, so use a scratch database.
+
+The query-builder tests script the model's answers, so they need no key. Set
+`TYPESAFE_API_KEY` to also run one live interpretation against the real API.
 
 `npm run dev:server` starts the mock SSH server on port 2222 (user `test`,
 password `test`) serving `test/fixtures/sample.db`, which is handy for trying

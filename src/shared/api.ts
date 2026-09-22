@@ -14,6 +14,7 @@ import type {
   TableDetails,
   TableRef
 } from './types'
+import type { AiResult, AiSettings, AiSettingsUpdate, AiTurn } from './ai'
 
 export interface OpenOptions {
   /** Open the configured database after connecting (default true). SQLite only; Postgres always opens. */
@@ -68,4 +69,15 @@ export interface Api {
     pickPrivateKey(): Promise<string | null>
   }
   exportData(req: ExportRequest): Promise<{ saved: boolean; path?: string }>
+  settings: {
+    get(): Promise<AiSettings>
+    update(u: AiSettingsUpdate): Promise<AiSettings>
+    /** Checks that the provider answers with the given overrides on top of the saved settings. */
+    testProvider(overrides?: AiSettingsUpdate): Promise<{ ok: boolean; message: string }>
+    listModels(overrides?: AiSettingsUpdate): Promise<string[]>
+  }
+  ai: {
+    /** Turn a plain-English question into a verified read-only query for the open database. */
+    ask(sessionId: string, question: string, history?: AiTurn[]): Promise<AiResult>
+  }
 }

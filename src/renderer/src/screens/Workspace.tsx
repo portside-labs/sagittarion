@@ -20,6 +20,7 @@ export function Workspace() {
   const closeTab = useStore((s) => s.closeTab)
   const refreshSchema = useStore((s) => s.refreshSchema)
   const disconnect = useStore((s) => s.disconnect)
+  const setSettingsOpen = useStore((s) => s.setSettingsOpen)
   const [sidebarWidth, setSidebarWidth] = useState(() => Number(localStorage.getItem('sidebarWidth')) || 260)
 
   useEffect(() => {
@@ -67,6 +68,9 @@ export function Workspace() {
             </button>
             <button className="btn small" onClick={() => void disconnect()} title="Disconnect" data-testid="disconnect-button">
               <Icon name="unplug" /> Disconnect
+            </button>
+            <button className="btn ghost icon small" title="Settings" onClick={() => setSettingsOpen(true)} data-testid="open-settings">
+              <Icon name="settings" />
             </button>
           </>
         }

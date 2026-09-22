@@ -136,6 +136,7 @@ export function ConnectScreen() {
   const refreshSchema = useStore((s) => s.refreshSchema)
   const loadConnections = useStore((s) => s.loadConnections)
   const confirm = useStore((s) => s.confirm)
+  const setSettingsOpen = useStore((s) => s.setSettingsOpen)
 
   const [selectedId, setSelectedId] = useState<string | null>(null)
   const [form, setForm] = useState<ConnectionConfig>(() => newConnection('sqlite'))
@@ -338,7 +339,14 @@ export function ConnectScreen() {
 
   return (
     <div className="app-frame">
-      <TitleBar center={<span className="app-title">SQLite SSH</span>} />
+      <TitleBar
+        center={<span className="app-title">SQLite SSH</span>}
+        right={
+          <button className="btn ghost icon small" title="Settings" onClick={() => setSettingsOpen(true)} data-testid="open-settings">
+            <Icon name="settings" />
+          </button>
+        }
+      />
       <div className="connect-screen">
         <aside className="conn-list">
           <div className="conn-list-header">

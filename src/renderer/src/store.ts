@@ -1,5 +1,6 @@
 import { create } from 'zustand'
 import type { AppInfo, ConnectionConfig, SchemaInfo, SessionInfo, TableRef } from '@shared/types'
+import type { AiSettings } from '@shared/ai'
 import { sameTable, tableLabel } from '@shared/connections'
 import { errorMessage } from './lib/util'
 
@@ -37,8 +38,12 @@ interface State {
   inTransaction: boolean
   status: string
   queryCounter: number
+  settings: AiSettings | null
+  settingsOpen: boolean
 
   init(): Promise<void>
+  loadSettings(): Promise<void>
+  setSettingsOpen(open: boolean): void
   confirm(message: string, detail?: string, confirmLabel?: string, destructive?: boolean): Promise<boolean>
   resolveConfirm(ok: boolean): void
   loadConnections(): Promise<void>
@@ -86,6 +91,20 @@ export const useStore = create<State>()((set, get) => ({
   inTransaction: false,
   status: '',
   queryCounter: 0,
+  settings: null,
+  settingsOpen: false,
+
+  async loadSettings() {
+    try {
+      set({ settings: await window.api.settings.get() })
+    } catch (e) {
+      get().toast('error', 'Could not load settings', errorMessage(e))
+    }
+  },
+
+  setSettingsOpen(open) {
+    set({ settingsOpen: open })
+  },
 
   confirm(message, detail, confirmLabel = 'OK', destructive = false) {
     get().confirmRequest?.resolve(false)
@@ -110,6 +129,7 @@ export const useStore = create<State>()((set, get) => ({
       get().toast('error', 'Could not initialise', errorMessage(e))
     }
     await get().loadConnections()
+    await get().loadSettings()
     window.api.session.onClosed((e) => {
       const s = get().session
       if (s && s.sessionId === e.sessionId) {

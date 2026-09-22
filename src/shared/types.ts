@@ -122,7 +122,19 @@ export interface TableMeta extends TableRef {
   rowidAlias: 'rowid' | '_rowid_' | 'oid' | null
   pk: string[]
   comment?: string | null
+  /** Approximate row count when the server can tell cheaply (Postgres statistics). */
+  rowEstimate?: number | null
   error?: string
+}
+
+/** A foreign-key column pair. */
+export interface Relation {
+  schema?: string
+  table: string
+  column: string
+  refSchema?: string
+  refTable: string
+  refColumn: string | null
 }
 
 export interface IndexMeta {
@@ -150,6 +162,13 @@ export interface SchemaInfo {
   views: TableMeta[]
   indexes: IndexMeta[]
   triggers: TriggerMeta[]
+  /** Foreign keys across the whole schema, for join-aware tooling. */
+  relations?: Relation[]
+}
+
+export interface QueryOptions {
+  /** Refuse writes at the database level for this call (SQLite query_only, Postgres read-only transaction). */
+  readOnly?: boolean
 }
 
 export interface IndexDetail {

@@ -10,6 +10,7 @@ import type {
   ConnectProgress,
   FileEntry,
   PendingChange,
+  QueryOptions,
   QueryResponse,
   ReaddirResult,
   RowsRequest,
@@ -428,7 +429,7 @@ export class Session extends EventEmitter {
 
   async schema(includeSystem = false): Promise<SchemaInfo> {
     const res = await this.requireAgent().request('schema', { include_system: includeSystem })
-    return { kind: 'sqlite', tables: res.tables, views: res.views, indexes: res.indexes, triggers: res.triggers }
+    return { kind: 'sqlite', tables: res.tables, views: res.views, indexes: res.indexes, triggers: res.triggers, relations: res.relations ?? [] }
   }
 
   async tableDetails(table: string): Promise<TableDetails> {
@@ -466,8 +467,8 @@ export class Session extends EventEmitter {
     }
   }
 
-  async query(sql: string, params: unknown[] = [], maxRows = 1000): Promise<QueryResponse> {
-    const res = await this.requireAgent().request('query', { sql, params, max_rows: maxRows })
+  async query(sql: string, params: unknown[] = [], maxRows = 1000, options?: QueryOptions): Promise<QueryResponse> {
+    const res = await this.requireAgent().request('query', { sql, params, max_rows: maxRows, read_only: Boolean(options?.readOnly) })
     return { results: res.results, durationMs: res.durationMs, tx: res.tx }
   }
 

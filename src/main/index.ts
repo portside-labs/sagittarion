@@ -6,6 +6,16 @@ import agentSource from './agent/sqlite_agent.py?raw'
 import { ConnectionManager } from './connections/manager'
 import { humanKeyType, KnownHostsStore } from './ssh/hostkeys'
 import { ConnectionStore, noopCodec, type SecretCodec } from './store/connections'
+import { SettingsStore } from './store/settings'
+import { qi, qualify } from './db/pg-values'
+import { cellToPlainText } from '@shared/export'
+import { AI_PRESETS, type AiSettings, type AiSettingsUpdate, type AiTurn } from '@shared/ai'
+import { createProvider, providerConfigFor } from './ai/providers/factory'
+import { ProviderError } from './ai/providers/types'
+import { SchemaIndex } from './ai/schema-index'
+import { askDatabase } from './ai/nl2sql'
+import { EmbeddingCache } from './ai/embeddings'
+import type { DatabaseDriver } from './db/driver'
 import { toCsv, toJson, toSqlInserts } from '@shared/export'
 import type { OpenOptions } from '@shared/api'
 import type { AppInfo, ConnectionConfig, ExportRequest, PendingChange, RowsRequest, SessionInfo, SshConfig, TableRef } from '@shared/types'
@@ -13,8 +23,36 @@ import type { AppInfo, ConnectionConfig, ExportRequest, PendingChange, RowsReque
 const isMac = process.platform === 'darwin'
 let mainWindow: BrowserWindow | null = null
 let connectionStore: ConnectionStore
+let settingsStore: SettingsStore
 let knownHosts: KnownHostsStore
 let manager: ConnectionManager
+let embeddingCache: EmbeddingCache
+/** Schema indexes per session, rebuilt when the schema is refreshed. */
+const schemaIndexes = new Map<string, SchemaIndex>()
+const recentTables = new Map<string, string[]>()
+
+async function providerFor(overrides: AiSettingsUpdate = {}) {
+  const saved = await settingsStore.get()
+  const merged: AiSettings = { ...saved, ...(overrides.provider ? { provider: overrides.provider } : {}) }
+  const preset = AI_PRESETS[merged.provider]
+  const switching = overrides.provider && overrides.provider !== saved.provider
+  merged.baseUrl = overrides.baseUrl ?? (switching ? preset.baseUrl : saved.baseUrl)
+  merged.model = overrides.model ?? (switching ? preset.defaultModel : saved.model)
+  merged.embeddingModel = overrides.embeddingModel ?? (switching ? '' : saved.embeddingModel)
+  const apiKey = typeof overrides.apiKey === 'string' && overrides.apiKey.trim() ? overrides.apiKey : await settingsStore.apiKeyFor(merged.provider)
+  if (preset.needsKey && !apiKey) throw new Error(`Add an API key for ${preset.label} in Settings to ask questions in plain English.`)
+  return { settings: merged, provider: createProvider(providerConfigFor(merged, apiKey)) }
+}
+
+async function distinctValuesFor(driver: DatabaseDriver, kind: 'sqlite' | 'postgres', ref: TableRef, column: string): Promise<string[] | null> {
+  const table = kind === 'postgres' ? qualify(ref) : qi(ref.name)
+  const limit = 21
+  const res = await driver.query(`SELECT DISTINCT ${qi(column)} FROM ${table} WHERE ${qi(column)} IS NOT NULL LIMIT ${limit}`, [], limit, { readOnly: true })
+  const first = res.results[0]
+  if (!first || first.kind !== 'rows') return null
+  if (first.rows.length >= limit) return null
+  return first.rows.map((r) => cellToPlainText(r[0]))
+}
 
 // ---------------------------------------------------------------------------
 // Window
@@ -204,14 +242,21 @@ function registerIpc(): void {
   ipcMain.handle('connections:remove', (_e, id: string) => connectionStore.remove(id))
 
   ipcMain.handle('session:open', (_e, cfg: ConnectionConfig, opts: OpenOptions) => openSession(cfg, opts ?? {}))
-  ipcMain.handle('session:close', (_e, sessionId: string) => manager.close(sessionId))
+  ipcMain.handle('session:close', (_e, sessionId: string) => {
+    schemaIndexes.delete(sessionId)
+    recentTables.delete(sessionId)
+    return manager.close(sessionId)
+  })
 
   ipcMain.handle('db:open', async (_e, sessionId: string, remotePath: string, readOnly: boolean) => {
     const conn = manager.get(sessionId)
     if (conn.config.kind !== 'sqlite' || !conn.driver) throw new Error('Only SQLite connections open files.')
     return (conn.driver as any).open(remotePath, readOnly)
   })
-  ipcMain.handle('db:schema', (_e, sessionId: string) => manager.driver(sessionId).schema())
+  ipcMain.handle('db:schema', (_e, sessionId: string) => {
+    schemaIndexes.delete(sessionId)
+    return manager.driver(sessionId).schema()
+  })
   ipcMain.handle('db:tableDetails', (_e, sessionId: string, ref: TableRef) => manager.driver(sessionId).tableDetails(ref))
   ipcMain.handle('db:rows', (_e, sessionId: string, req: RowsRequest) => manager.driver(sessionId).rows(req))
   ipcMain.handle('db:count', (_e, sessionId: string, ref: TableRef, where?: string) => manager.driver(sessionId).count(ref, where))
@@ -231,6 +276,65 @@ function registerIpc(): void {
       properties: ['openFile', 'showHiddenFiles', 'treatPackageAsDirectory']
     })
     return r.canceled || !r.filePaths[0] ? null : r.filePaths[0]
+  })
+
+  ipcMain.handle('settings:get', () => settingsStore.get())
+  ipcMain.handle('settings:update', (_e, u: AiSettingsUpdate) => settingsStore.update(u))
+  ipcMain.handle('settings:testProvider', async (_e, overrides: AiSettingsUpdate) => {
+    try {
+      const { provider, settings } = await providerFor(overrides)
+      try {
+        const models = await provider.listModels()
+        const known = settings.model && models.includes(settings.model)
+        return {
+          ok: true,
+          message: `Connected. ${models.length} model${models.length === 1 ? '' : 's'} available${settings.model ? (known ? `, including ${settings.model}.` : `; "${settings.model}" is not in the list, check the name.`) : '.'}`
+        }
+      } catch (err) {
+        // Some servers have no model listing; a tiny completion still proves the connection.
+        if (!(err instanceof ProviderError) || err.errorKind === 'auth' || err.errorKind === 'network') throw err
+        const res = await provider.complete({ system: [{ text: 'Reply with the single word OK.' }], messages: [{ role: 'user', content: 'ping' }] })
+        return { ok: true, message: `Connected to ${res.model || settings.model}.` }
+      }
+    } catch (err: any) {
+      return { ok: false, message: err?.message ?? String(err) }
+    }
+  })
+  ipcMain.handle('settings:listModels', async (_e, overrides: AiSettingsUpdate) => {
+    const { provider } = await providerFor(overrides)
+    return provider.listModels()
+  })
+
+  ipcMain.handle('ai:ask', async (_e, sessionId: string, question: string, history: AiTurn[]) => {
+    const conn = manager.get(sessionId)
+    const driver = manager.driver(sessionId)
+    const kind = conn.config.kind
+    const { provider, settings } = await providerFor()
+    let index = schemaIndexes.get(sessionId)
+    if (!index) {
+      index = new SchemaIndex(await driver.schema(), kind)
+      schemaIndexes.set(sessionId, index)
+    }
+    const result = await askDatabase(
+      {
+        kind,
+        serverVersion: conn.driver?.info()?.serverVersion ?? kind,
+        index,
+        provider,
+        settings: { sendSampleValues: settings.sendSampleValues, autoRun: settings.autoRun, schemaBudgetTokens: settings.schemaBudgetTokens, embeddingModel: settings.embeddingModel },
+        runQuery: (sql, maxRows) => driver.query(sql, [], maxRows, { readOnly: true }),
+        distinctValues: (ref, column) => distinctValuesFor(driver, kind, ref, column),
+        embeddingCache,
+        recentTables: recentTables.get(sessionId)
+      },
+      question,
+      Array.isArray(history) ? history : []
+    )
+    if (result.kind === 'query') {
+      const recent = [...new Set([...result.tablesUsed, ...(recentTables.get(sessionId) ?? [])])].slice(0, 12)
+      recentTables.set(sessionId, recent)
+    }
+    return result
   })
 
   ipcMain.handle('export:save', async (_e, req: ExportRequest) => {
@@ -271,7 +375,10 @@ if (!app.requestSingleInstanceLock()) {
 
   app.whenReady().then(() => {
     const userData = app.getPath('userData')
-    connectionStore = new ConnectionStore(path.join(userData, 'connections.json'), makeCodec())
+    const codec = makeCodec()
+    connectionStore = new ConnectionStore(path.join(userData, 'connections.json'), codec)
+    settingsStore = new SettingsStore(path.join(userData, 'settings.json'), codec)
+    embeddingCache = new EmbeddingCache(path.join(userData, 'ai-cache', 'embeddings.json'))
     knownHosts = new KnownHostsStore(path.join(userData, 'known_hosts.json'), path.join(os.homedir(), '.ssh', 'known_hosts'))
     manager = new ConnectionManager({ agentSource, verifyHostKey })
     manager.on('closed', (e: { sessionId: string; reason: string }) => send('session:closed', e))

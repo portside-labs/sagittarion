@@ -40,7 +40,16 @@ const api: Api = {
   dialog: {
     pickPrivateKey: () => ipcRenderer.invoke('dialog:pickPrivateKey')
   },
-  exportData: (req) => ipcRenderer.invoke('export:save', req)
+  exportData: (req) => ipcRenderer.invoke('export:save', req),
+  settings: {
+    get: () => ipcRenderer.invoke('settings:get'),
+    update: (u) => ipcRenderer.invoke('settings:update', u),
+    testProvider: (overrides) => ipcRenderer.invoke('settings:testProvider', overrides ?? {}),
+    listModels: (overrides) => ipcRenderer.invoke('settings:listModels', overrides ?? {})
+  },
+  ai: {
+    ask: (sessionId, question, history) => ipcRenderer.invoke('ai:ask', sessionId, question, history ?? [])
+  }
 }
 
 contextBridge.exposeInMainWorld('api', api)

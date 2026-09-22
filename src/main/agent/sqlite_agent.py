@@ -320,7 +320,7 @@ def op_open(req):
 def op_schema(req):
     include_system = bool(req.get('include_system'))
     items = conn.execute('SELECT type, name, tbl_name, sql FROM sqlite_master ORDER BY lower(name)').fetchall()
-    tables, views, indexes, triggers = [], [], [], []
+    tables, views, indexes, triggers, relations = [], [], [], [], []
     for typ, name, tbl, sql in items:
         if typ in ('table', 'view'):
             if name.startswith('sqlite_') and not include_system:
@@ -331,13 +331,20 @@ def op_schema(req):
                 meta = {'name': name, 'type': typ, 'sql': sql, 'columns': [], 'withoutRowid': True,
                         'rowidAlias': None, 'pk': [], 'error': str(e)}
             (tables if typ == 'table' else views).append(meta)
+            if typ == 'table':
+                try:
+                    for fk in conn.execute('PRAGMA foreign_key_list(%s)' % qi(name)).fetchall():
+                        fk = tuple(fk)
+                        relations.append({'table': name, 'column': fk[3], 'refTable': fk[2], 'refColumn': fk[4]})
+                except sqlite3.Error:
+                    pass
         elif typ == 'index':
             if name.startswith('sqlite_') and not include_system:
                 continue
             indexes.append({'name': name, 'table': tbl, 'sql': sql, 'auto': sql is None})
         elif typ == 'trigger':
             triggers.append({'name': name, 'table': tbl, 'sql': sql})
-    return {'tables': tables, 'views': views, 'indexes': indexes, 'triggers': triggers}
+    return {'tables': tables, 'views': views, 'indexes': indexes, 'triggers': triggers, 'relations': relations}
 
 
 def op_table_details(req):
@@ -444,7 +451,23 @@ def op_query(req):
     sql = req.get('sql') or ''
     params = req.get('params') or []
     max_rows = int(req.get('max_rows') or 1000)
+    read_only = bool(req.get('read_only'))
     statements = split_statements(sql)
+    results = []
+    if read_only:
+        # Hard guarantee for generated queries: SQLite refuses any write while query_only is on.
+        conn.execute('PRAGMA query_only = 1')
+    try:
+        return {'results': run_statements(statements, params, max_rows)}
+    finally:
+        if read_only:
+            try:
+                conn.execute('PRAGMA query_only = 0')
+            except sqlite3.Error:
+                pass
+
+
+def run_statements(statements, params, max_rows):
     results = []
     for stmt in statements:
         t0 = time.time()
@@ -485,7 +508,7 @@ def op_query(req):
             break
         finally:
             cur.close()
-    return {'results': results}
+    return results
 
 
 def key_clause(key):

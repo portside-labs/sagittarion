@@ -75,6 +75,16 @@ async function main() {
   const shot = (name) => page.screenshot({ path: path.join(artifacts, name + '.png') })
 
   try {
+    // ------------------------------------------------------------ settings dialog
+    await page.getByTestId('open-settings').click()
+    await page.getByTestId('settings-dialog').waitFor()
+    await page.getByTestId('send-sample-values').check()
+    await page.getByTestId('settings-save').click()
+    await page.locator('.toast.success', { hasText: 'Settings saved' }).waitFor()
+    await shot('00a-settings')
+    await page.keyboard.press('Escape')
+    await page.waitForFunction(() => !document.querySelector('[data-testid=settings-dialog]'))
+
     // ------------------------------------------------------------ connect
     await page.getByTestId('choose-sqlite').waitFor()
     await shot('00-choose-kind')
@@ -208,6 +218,17 @@ async function main() {
     await page.getByTestId('new-query-tab').click()
     const cm = page.locator('.tab-pane:not([hidden]) .query-tab .cm-content')
     await cm.waitFor()
+    // Without a configured provider the Ask bar explains what is needed and opens Settings.
+    assert((await page.getByTestId('ask-needs-key').count()) === 1, 'ask bar offers to set up a provider')
+    await page.getByTestId('ask-input').fill('how many users are admins')
+    await page.getByTestId('ask-button').click()
+    await page.getByTestId('settings-dialog').waitFor()
+    assert((await page.getByTestId('ai-provider').inputValue()) === 'openai', 'settings default to OpenAI')
+    await page.getByTestId('ai-provider').selectOption('ollama')
+    assert((await page.getByTestId('ai-base-url').inputValue()) === 'http://localhost:11434/v1', 'switching provider applies its preset')
+    await shot('06a-ask-needs-key')
+    await page.keyboard.press('Escape')
+    await page.waitForFunction(() => !document.querySelector('[data-testid=settings-dialog]'))
     await cm.click()
     await page.keyboard.type('SELECT id, name, email, balance FROM users ORDER BY id LIMIT 5;\nSELECT count(*) AS orders FROM orders;')
     await page.keyboard.press(`${mod}+Enter`)

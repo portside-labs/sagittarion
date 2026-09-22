@@ -9,7 +9,9 @@ import type {
   ForeignKeyDetail,
   IndexDetail,
   PendingChange,
+  QueryOptions,
   QueryResponse,
+  Relation,
   RowKey,
   RowsRequest,
   RowsResponse,
@@ -227,7 +229,8 @@ export class PostgresDriver extends EventEmitter implements DatabaseDriver {
     const rels = await this.q(
       `SELECT c.oid::text, n.nspname, c.relname, c.relkind,
               CASE WHEN c.relkind IN ('v', 'm') THEN pg_get_viewdef(c.oid, true) END,
-              obj_description(c.oid, 'pg_class')
+              obj_description(c.oid, 'pg_class'),
+              c.reltuples::float8
        FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
        WHERE ${where}
        ORDER BY n.nspname, c.relname`,
@@ -272,9 +275,10 @@ export class PostgresDriver extends EventEmitter implements DatabaseDriver {
     }
     const out: TableMeta[] = []
     for (const r of rels.rows) {
-      const [oid, schema, name, relkind, viewdef, comment] = r as [string, string, string, string, string | null, string | null]
+      const [oid, schema, name, relkind, viewdef, comment, reltuples] = r as [string, string, string, string, string | null, string | null, unknown]
       const columns = byRel.get(oid) ?? []
       const isView = relkind === 'v' || relkind === 'm'
+      const estimate = toNumber(reltuples)
       const meta: TableMeta & { oid?: string } = {
         oid,
         schema,
@@ -288,7 +292,8 @@ export class PostgresDriver extends EventEmitter implements DatabaseDriver {
           .filter((c) => c.pk > 0)
           .sort((a, b) => a.pk - b.pk)
           .map((c) => c.name),
-        comment
+        comment,
+        rowEstimate: Number.isFinite(estimate) && estimate >= 0 ? Math.round(estimate) : null
       }
       if (isView) {
         meta.sql = `CREATE ${relkind === 'm' ? 'MATERIALIZED VIEW' : 'VIEW'} ${qualify(meta)} AS\n${viewdef ?? ''}`
@@ -301,7 +306,7 @@ export class PostgresDriver extends EventEmitter implements DatabaseDriver {
   }
 
   async schema(): Promise<SchemaInfo> {
-    const [schemasRes, currentRes, relations, indexesRes, triggersRes] = await Promise.all([
+    const [schemasRes, currentRes, relations, indexesRes, triggersRes, fkRes] = await Promise.all([
       this.q(`SELECT n.nspname FROM pg_namespace n WHERE ${SCHEMA_FILTER} ORDER BY (n.nspname <> 'public'), n.nspname`),
       this.q('SELECT current_schema()'),
       this.loadRelations(),
@@ -321,9 +326,30 @@ export class PostgresDriver extends EventEmitter implements DatabaseDriver {
          JOIN pg_namespace n ON n.oid = c.relnamespace
          WHERE NOT t.tgisinternal AND ${SCHEMA_FILTER}
          ORDER BY n.nspname, c.relname, t.tgname`
+      ),
+      this.q(
+        `SELECT n.nspname, c.relname, a.attname, fn.nspname, fc.relname, fa.attname
+         FROM pg_constraint con
+         JOIN pg_class c ON c.oid = con.conrelid
+         JOIN pg_namespace n ON n.oid = c.relnamespace
+         JOIN pg_class fc ON fc.oid = con.confrelid
+         JOIN pg_namespace fn ON fn.oid = fc.relnamespace
+         CROSS JOIN LATERAL unnest(con.conkey, con.confkey) WITH ORDINALITY AS k(attnum, fattnum, ord)
+         JOIN pg_attribute a ON a.attrelid = con.conrelid AND a.attnum = k.attnum
+         JOIN pg_attribute fa ON fa.attrelid = con.confrelid AND fa.attnum = k.fattnum
+         WHERE con.contype = 'f' AND ${SCHEMA_FILTER}
+         ORDER BY n.nspname, c.relname, k.ord`
       )
     ])
     const schemas = schemasRes.rows.map((r) => String(r[0]))
+    const fkRelations: Relation[] = fkRes.rows.map((r) => ({
+      schema: String(r[0]),
+      table: String(r[1]),
+      column: String(r[2]),
+      refSchema: String(r[3]),
+      refTable: String(r[4]),
+      refColumn: r[5] === null ? null : String(r[5])
+    }))
     const defaultSchema = (currentRes.rows[0]?.[0] as string | null) || 'public'
     return {
       kind: 'postgres',
@@ -334,7 +360,8 @@ export class PostgresDriver extends EventEmitter implements DatabaseDriver {
       indexes: indexesRes.rows
         .filter((r) => !r[4])
         .map((r) => ({ schema: String(r[0]), table: String(r[1]), name: String(r[2]), sql: r[3] as string | null, auto: false })),
-      triggers: triggersRes.rows.map((r) => ({ schema: String(r[0]), table: String(r[1]), name: String(r[2]), sql: r[3] as string | null }))
+      triggers: triggersRes.rows.map((r) => ({ schema: String(r[0]), table: String(r[1]), name: String(r[2]), sql: r[3] as string | null })),
+      relations: fkRelations
     }
   }
 
@@ -482,11 +509,27 @@ export class PostgresDriver extends EventEmitter implements DatabaseDriver {
     }
   }
 
-  async query(sql: string, params: unknown[] = [], maxRows = 1000): Promise<QueryResponse> {
+  async query(sql: string, params: unknown[] = [], maxRows = 1000, options?: QueryOptions): Promise<QueryResponse> {
     const client = this.requireClient()
     const statements = splitStatements(sql)
     const results: StatementResult[] = []
     const start = Date.now()
+    const readOnly = Boolean(options?.readOnly)
+    if (readOnly) {
+      if (this.txStatus !== 'I') throw new Error('An explicit transaction is open on this connection. COMMIT or ROLLBACK it before running generated queries.')
+      // Hard guarantee for generated queries: the server refuses writes inside a read-only transaction.
+      await client.query('BEGIN READ ONLY')
+      await client.query("SET LOCAL statement_timeout = '60s'")
+    }
+    try {
+      await this.runStatements(client, statements, params, maxRows, results)
+    } finally {
+      if (readOnly) await client.query('ROLLBACK').catch(() => undefined)
+    }
+    return { results, durationMs: Date.now() - start, tx: this.txStatus !== 'I' }
+  }
+
+  private async runStatements(client: Client, statements: string[], params: unknown[], maxRows: number, results: StatementResult[]): Promise<void> {
     for (const stmt of statements) {
       const t0 = Date.now()
       try {
@@ -527,7 +570,6 @@ export class PostgresDriver extends EventEmitter implements DatabaseDriver {
         break
       }
     }
-    return { results, durationMs: Date.now() - start, tx: this.txStatus !== 'I' }
   }
 
   async cancel(): Promise<void> {

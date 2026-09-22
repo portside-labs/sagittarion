@@ -4,6 +4,7 @@ import { ConnectScreen } from './screens/ConnectScreen'
 import { Workspace } from './screens/Workspace'
 import { Toasts } from './components/Toasts'
 import { ConfirmDialog } from './components/ConfirmDialog'
+import { SettingsDialog } from './components/SettingsDialog'
 
 export default function App() {
   const init = useStore((s) => s.init)
@@ -21,6 +22,7 @@ export default function App() {
   return (
     <>
       {session ? <Workspace key={session.sessionId} /> : <ConnectScreen />}
+      <SettingsDialog />
       <ConfirmDialog />
       <Toasts />
     </>
