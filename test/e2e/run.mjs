@@ -111,6 +111,25 @@ async function main() {
     await page.getByTestId('tree-table-users').waitFor({ timeout: 30000 })
     console.log('connected; schema loaded')
 
+    // Sidebar filter: instant local matches for names, column matches via the server search.
+    await page.getByTestId('tree-filter').fill('ord')
+    await page.getByTestId('tree-table-orders').waitFor()
+    await page.getByTestId('tree-view-order_summary').waitFor()
+    assert((await page.getByTestId('tree-table-users').count()) === 0, 'filter hides tables that do not match')
+    await page.getByTestId('tree-filter').fill('email')
+    await page.locator('.tree-col.hit', { hasText: 'email' }).first().waitFor({ timeout: 10000 })
+    await shot('01a-filter')
+    await page.getByTestId('tree-filter').fill('')
+    await page.getByTestId('tree-table-users').waitFor()
+    // Indexes and triggers are groups of the schema, loaded when opened.
+    await page.getByTestId('tree-group--index').click()
+    await page.getByTestId('tree-index-idx_orders_user').waitFor()
+    await page.getByTestId('tree-group--trigger').click()
+    await page.getByTestId('tree-trigger-orders_touch_user').waitFor()
+    // Expanding a table fetches its columns.
+    await page.getByTestId('tree-table-orders').locator('.tree-toggle').click()
+    await page.locator('.tree-col .col-name', { hasText: 'status' }).first().waitFor()
+
     // ------------------------------------------------------------ table browsing
     await page.getByTestId('tree-table-users').click()
     const grid = page.getByTestId('table-grid')
@@ -293,6 +312,14 @@ async function main() {
       await page.getByTestId('tree-table-users').waitFor({ timeout: 30000 })
       assert((await page.getByTestId('tree-table-analytics.daily_totals').count()) === 1, 'second schema is listed')
       console.log('postgres connected; schema loaded')
+      // Functions are listed per schema and open their definition in a query tab.
+      await page.getByTestId('tree-group-public-function').click()
+      await page.getByTestId('tree-function-order_total').waitFor()
+      await page.getByTestId('tree-function-archive_orders').waitFor()
+      await page.getByTestId('tree-function-order_total').click()
+      await page.locator('.tab-pane:not([hidden]) .query-tab .cm-content').waitFor()
+      assert((await page.locator('.tab-pane:not([hidden]) .query-tab .cm-content').textContent()).includes('CREATE OR REPLACE FUNCTION'), 'function definition opens in a query tab')
+      await shot('08a-postgres-function')
 
       await page.getByTestId('tree-table-users').click()
       const pgGrid = page.getByTestId('table-grid')

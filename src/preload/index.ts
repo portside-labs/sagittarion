@@ -1,5 +1,6 @@
 import { contextBridge, ipcRenderer, type IpcRendererEvent } from 'electron'
 import type { Api, ConnectProgressEvent, SessionClosedEvent } from '@shared/api'
+import type { AiProgressEvent } from '@shared/ai'
 
 function subscribe<T>(channel: string, cb: (payload: T) => void): () => void {
   const handler = (_event: IpcRendererEvent, payload: T) => cb(payload)
@@ -25,7 +26,10 @@ const api: Api = {
   },
   db: {
     open: (sessionId, remotePath, readOnly) => ipcRenderer.invoke('db:open', sessionId, remotePath, readOnly),
-    schema: (sessionId) => ipcRenderer.invoke('db:schema', sessionId),
+    catalog: (sessionId) => ipcRenderer.invoke('db:catalog', sessionId),
+    listObjects: (sessionId, req) => ipcRenderer.invoke('db:listObjects', sessionId, req),
+    searchObjects: (sessionId, query, limit) => ipcRenderer.invoke('db:searchObjects', sessionId, query, limit ?? 100),
+    definition: (sessionId, ref) => ipcRenderer.invoke('db:definition', sessionId, ref),
     tableDetails: (sessionId, ref) => ipcRenderer.invoke('db:tableDetails', sessionId, ref),
     rows: (sessionId, req) => ipcRenderer.invoke('db:rows', sessionId, req),
     count: (sessionId, ref, where) => ipcRenderer.invoke('db:count', sessionId, ref, where),
@@ -48,7 +52,9 @@ const api: Api = {
     listModels: (overrides) => ipcRenderer.invoke('settings:listModels', overrides ?? {})
   },
   ai: {
-    ask: (sessionId, question, history) => ipcRenderer.invoke('ai:ask', sessionId, question, history ?? [])
+    ask: (sessionId, question, history, requestId) => ipcRenderer.invoke('ai:ask', sessionId, question, history ?? [], requestId ?? ''),
+    cancel: (requestId) => ipcRenderer.invoke('ai:cancel', requestId),
+    onProgress: (cb) => subscribe<AiProgressEvent>('ai:progress', cb)
   }
 }
 

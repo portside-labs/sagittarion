@@ -2,6 +2,7 @@ import { app, BrowserWindow, dialog, ipcMain, Menu, safeStorage, shell, type Men
 import { promises as fs } from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
+import crypto from 'node:crypto'
 import agentSource from './agent/sqlite_agent.py?raw'
 import { ConnectionManager } from './connections/manager'
 import { humanKeyType, KnownHostsStore } from './ssh/hostkeys'
@@ -9,16 +10,16 @@ import { ConnectionStore, noopCodec, type SecretCodec } from './store/connection
 import { SettingsStore } from './store/settings'
 import { qi, qualify } from './db/pg-values'
 import { cellToPlainText } from '@shared/export'
-import { AI_PRESETS, type AiSettings, type AiSettingsUpdate, type AiTurn } from '@shared/ai'
+import { AI_PRESETS, type AiProgressEvent, type AiProgressStep, type AiSettings, type AiSettingsUpdate, type AiTurn } from '@shared/ai'
 import { createProvider, providerConfigFor } from './ai/providers/factory'
 import { ProviderError } from './ai/providers/types'
-import { SchemaIndex } from './ai/schema-index'
+import { SchemaIndex, type SchemaSource } from './ai/schema-index'
 import { askDatabase } from './ai/nl2sql'
 import { EmbeddingCache } from './ai/embeddings'
 import type { DatabaseDriver } from './db/driver'
 import { toCsv, toJson, toSqlInserts } from '@shared/export'
 import type { OpenOptions } from '@shared/api'
-import type { AppInfo, ConnectionConfig, ExportRequest, PendingChange, RowsRequest, SessionInfo, SshConfig, TableRef } from '@shared/types'
+import type { AppInfo, ConnectionConfig, ExportRequest, ListObjectsRequest, ObjectRef, PendingChange, RowsRequest, SessionInfo, SshConfig, TableRef } from '@shared/types'
 
 const isMac = process.platform === 'darwin'
 let mainWindow: BrowserWindow | null = null
@@ -27,9 +28,42 @@ let settingsStore: SettingsStore
 let knownHosts: KnownHostsStore
 let manager: ConnectionManager
 let embeddingCache: EmbeddingCache
-/** Schema indexes per session, rebuilt when the schema is refreshed. */
-const schemaIndexes = new Map<string, SchemaIndex>()
+/** Schema indexes per session, rebuilt when the catalog is refreshed. */
+const schemaIndexes = new Map<string, Promise<SchemaIndex>>()
 const recentTables = new Map<string, string[]>()
+/** Running asks, so the renderer can cancel them. */
+const aiRequests = new Map<string, AbortController>()
+
+function schemaSourceFor(driver: DatabaseDriver): SchemaSource {
+  return {
+    async listTables() {
+      const out: Awaited<ReturnType<DatabaseDriver['listObjects']>>['items'] = []
+      let cursor: string | null = null
+      do {
+        const page = await driver.listObjects({ kinds: ['table', 'view'], cursor, limit: 5000 })
+        out.push(...page.items)
+        cursor = page.cursor
+      } while (cursor)
+      return out
+    },
+    tablesMeta: (refs) => driver.tablesMeta(refs),
+    relationsFor: (refs) => driver.relationsFor(refs),
+    searchColumns: async (query, limit) => (await driver.searchObjects(query, limit)).columns
+  }
+}
+
+function schemaIndexFor(sessionId: string, driver: DatabaseDriver, kind: 'sqlite' | 'postgres'): Promise<SchemaIndex> {
+  let pending = schemaIndexes.get(sessionId)
+  if (!pending) {
+    pending = (async () => {
+      const catalog = await driver.catalog()
+      return SchemaIndex.create(schemaSourceFor(driver), kind, catalog.defaultSchema)
+    })()
+    pending.catch(() => schemaIndexes.delete(sessionId))
+    schemaIndexes.set(sessionId, pending)
+  }
+  return pending
+}
 
 async function providerFor(overrides: AiSettingsUpdate = {}) {
   const saved = await settingsStore.get()
@@ -253,10 +287,13 @@ function registerIpc(): void {
     if (conn.config.kind !== 'sqlite' || !conn.driver) throw new Error('Only SQLite connections open files.')
     return (conn.driver as any).open(remotePath, readOnly)
   })
-  ipcMain.handle('db:schema', (_e, sessionId: string) => {
+  ipcMain.handle('db:catalog', (_e, sessionId: string) => {
     schemaIndexes.delete(sessionId)
-    return manager.driver(sessionId).schema()
+    return manager.driver(sessionId).catalog()
   })
+  ipcMain.handle('db:listObjects', (_e, sessionId: string, req: ListObjectsRequest) => manager.driver(sessionId).listObjects(req))
+  ipcMain.handle('db:searchObjects', (_e, sessionId: string, query: string, limit: number) => manager.driver(sessionId).searchObjects(query, limit))
+  ipcMain.handle('db:definition', (_e, sessionId: string, ref: ObjectRef) => manager.driver(sessionId).definition(ref))
   ipcMain.handle('db:tableDetails', (_e, sessionId: string, ref: TableRef) => manager.driver(sessionId).tableDetails(ref))
   ipcMain.handle('db:rows', (_e, sessionId: string, req: RowsRequest) => manager.driver(sessionId).rows(req))
   ipcMain.handle('db:count', (_e, sessionId: string, ref: TableRef, where?: string) => manager.driver(sessionId).count(ref, where))
@@ -305,36 +342,61 @@ function registerIpc(): void {
     return provider.listModels()
   })
 
-  ipcMain.handle('ai:ask', async (_e, sessionId: string, question: string, history: AiTurn[]) => {
+  ipcMain.handle('ai:ask', async (_e, sessionId: string, question: string, history: AiTurn[], requestId: string) => {
     const conn = manager.get(sessionId)
     const driver = manager.driver(sessionId)
     const kind = conn.config.kind
-    const { provider, settings } = await providerFor()
-    let index = schemaIndexes.get(sessionId)
-    if (!index) {
-      index = new SchemaIndex(await driver.schema(), kind)
-      schemaIndexes.set(sessionId, index)
+    const controller = new AbortController()
+    const id = requestId || crypto.randomUUID()
+    aiRequests.set(id, controller)
+    let seq = 0
+    const onProgress = (step: AiProgressStep) => {
+      const event: AiProgressEvent = { ...step, requestId: id, seq: ++seq, ts: Date.now() }
+      send('ai:progress', event)
     }
-    const result = await askDatabase(
-      {
-        kind,
-        serverVersion: conn.driver?.info()?.serverVersion ?? kind,
-        index,
-        provider,
-        settings: { sendSampleValues: settings.sendSampleValues, autoRun: settings.autoRun, schemaBudgetTokens: settings.schemaBudgetTokens, embeddingModel: settings.embeddingModel },
-        runQuery: (sql, maxRows) => driver.query(sql, [], maxRows, { readOnly: true }),
-        distinctValues: (ref, column) => distinctValuesFor(driver, kind, ref, column),
-        embeddingCache,
-        recentTables: recentTables.get(sessionId)
-      },
-      question,
-      Array.isArray(history) ? history : []
-    )
-    if (result.kind === 'query') {
-      const recent = [...new Set([...result.tablesUsed, ...(recentTables.get(sessionId) ?? [])])].slice(0, 12)
-      recentTables.set(sessionId, recent)
+    try {
+      const { provider, settings } = await providerFor()
+      let index: SchemaIndex
+      const cached = schemaIndexes.get(sessionId)
+      if (cached) index = await cached
+      else {
+        onProgress({ stepId: 'index', stage: 'index', status: 'running', message: 'Reading the schema' })
+        try {
+          index = await schemaIndexFor(sessionId, driver, kind)
+          onProgress({ stepId: 'index', stage: 'index', status: 'done', message: 'Reading the schema', detail: `${index.tables.size.toLocaleString('en-US')} tables indexed` })
+        } catch (err) {
+          onProgress({ stepId: 'index', stage: 'index', status: 'error', message: 'Reading the schema', detail: err instanceof Error ? err.message : String(err) })
+          throw err
+        }
+      }
+      const result = await askDatabase(
+        {
+          kind,
+          serverVersion: conn.driver?.info()?.serverVersion ?? kind,
+          index,
+          provider,
+          settings: { sendSampleValues: settings.sendSampleValues, autoRun: settings.autoRun, schemaBudgetTokens: settings.schemaBudgetTokens, embeddingModel: settings.embeddingModel },
+          runQuery: (sql, maxRows) => driver.query(sql, [], maxRows, { readOnly: true }),
+          distinctValues: (ref, column) => distinctValuesFor(driver, kind, ref, column),
+          embeddingCache,
+          recentTables: recentTables.get(sessionId),
+          onProgress,
+          signal: controller.signal
+        },
+        question,
+        Array.isArray(history) ? history : []
+      )
+      if (result.kind === 'query') {
+        const recent = [...new Set([...result.tablesUsed, ...(recentTables.get(sessionId) ?? [])])].slice(0, 12)
+        recentTables.set(sessionId, recent)
+      }
+      return result
+    } finally {
+      aiRequests.delete(id)
     }
-    return result
+  })
+  ipcMain.handle('ai:cancel', (_e, requestId: string) => {
+    aiRequests.get(requestId)?.abort()
   })
 
   ipcMain.handle('export:save', async (_e, req: ExportRequest) => {

@@ -46,7 +46,7 @@ export interface ChatResponse {
   stopReason: string
 }
 
-export type ProviderErrorKind = 'auth' | 'rate_limit' | 'not_found' | 'bad_request' | 'tools_unsupported' | 'network' | 'server' | 'unknown'
+export type ProviderErrorKind = 'auth' | 'rate_limit' | 'not_found' | 'bad_request' | 'tools_unsupported' | 'network' | 'server' | 'cancelled' | 'unknown'
 
 export class ProviderError extends Error {
   readonly status?: number
@@ -63,9 +63,13 @@ export interface LlmProvider {
   readonly kind: string
   readonly model: string
   readonly supportsEmbeddings: boolean
-  complete(req: ChatRequest): Promise<ChatResponse>
-  embed(texts: string[]): Promise<number[][]>
+  complete(req: ChatRequest, signal?: AbortSignal): Promise<ChatResponse>
+  embed(texts: string[], signal?: AbortSignal): Promise<number[][]>
   listModels(): Promise<string[]>
+}
+
+export function throwIfAborted(signal?: AbortSignal): void {
+  if (signal?.aborted) throw new ProviderError('Cancelled.', 'cancelled')
 }
 
 export interface ProviderConfig {
@@ -121,12 +125,16 @@ export function parseJsonObject(text: string): Record<string, unknown> | null {
   return null
 }
 
-export async function fetchWithTimeout(fetchImpl: typeof fetch, url: string, init: RequestInit, timeoutMs: number): Promise<Response> {
+export async function fetchWithTimeout(fetchImpl: typeof fetch, url: string, init: RequestInit, timeoutMs: number, signal?: AbortSignal): Promise<Response> {
+  throwIfAborted(signal)
   const controller = new AbortController()
   const timer = setTimeout(() => controller.abort(), timeoutMs)
+  const onAbort = () => controller.abort()
+  signal?.addEventListener('abort', onAbort, { once: true })
   try {
     return await fetchImpl(url, { ...init, signal: controller.signal })
   } catch (err: any) {
+    if (signal?.aborted) throw new ProviderError('Cancelled.', 'cancelled')
     if (err?.name === 'AbortError') throw new ProviderError(`The provider did not answer within ${Math.round(timeoutMs / 1000)}s.`, 'network')
     const msg = String(err?.cause?.code ?? err?.message ?? err)
     const host = (() => {
@@ -140,6 +148,7 @@ export async function fetchWithTimeout(fetchImpl: typeof fetch, url: string, ini
     throw new ProviderError(`Could not reach ${host} (${msg}).${hint}`, 'network')
   } finally {
     clearTimeout(timer)
+    signal?.removeEventListener('abort', onAbort)
   }
 }
 

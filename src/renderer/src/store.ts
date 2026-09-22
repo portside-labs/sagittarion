@@ -1,8 +1,9 @@
 import { create } from 'zustand'
-import type { AppInfo, ConnectionConfig, SchemaInfo, SessionInfo, TableRef } from '@shared/types'
+import type { AppInfo, Catalog, ConnectionConfig, ObjectKind, ObjectRef, SearchResult, SessionInfo, TableRef } from '@shared/types'
 import type { AiSettings } from '@shared/ai'
-import { sameTable, tableLabel } from '@shared/connections'
+import { sameTable, tableKey, tableLabel } from '@shared/connections'
 import { errorMessage } from './lib/util'
+import { appendNames, emptyNames, groupKey, type GroupState, type NameIndex, type TableState } from './lib/tree'
 
 export type Tab =
   | { id: string; kind: 'table'; schema?: string; table: string; title: string }
@@ -23,13 +24,31 @@ export interface ConfirmRequest {
   resolve: (ok: boolean) => void
 }
 
+export interface SearchState {
+  query: string
+  result: SearchResult | null
+  loading: boolean
+}
+
+/** How many table detail records the sidebar keeps around. */
+const TABLE_CACHE_LIMIT = 300
+const NAMES_PAGE = 4000
+
 interface State {
   appInfo: AppInfo | null
   connections: ConnectionConfig[]
   session: SessionInfo | null
-  schema: SchemaInfo | null
-  schemaError: string | null
-  schemaLoading: boolean
+  /** Schema names and counts; the rest of the tree loads on demand. */
+  catalog: Catalog | null
+  catalogError: string | null
+  catalogLoading: boolean
+  /** Every table and view name, streamed in pages right after the catalog. */
+  names: NameIndex
+  /** Lazily loaded index, trigger and function lists, keyed by groupKey. */
+  groups: Record<string, GroupState>
+  /** Column details for expanded or opened tables, keyed by tableKey. */
+  tables: Record<string, TableState>
+  search: SearchState
   tabs: Tab[]
   activeTabId: string | null
   dirtyTabs: Record<string, boolean>
@@ -48,7 +67,13 @@ interface State {
   resolveConfirm(ok: boolean): void
   loadConnections(): Promise<void>
   setSession(s: SessionInfo | null): void
+  /** Reload the catalog and restart the name stream; drops every cached list. */
   refreshSchema(): Promise<void>
+  loadNames(sessionId: string, epoch: number): Promise<void>
+  loadGroup(schema: string | undefined, kind: ObjectKind, more?: boolean): Promise<void>
+  loadTable(ref: TableRef): Promise<void>
+  runSearch(query: string): Promise<void>
+  openDefinition(ref: ObjectRef): Promise<void>
   openTable(ref: TableRef): void
   newQueryTab(sql?: string, title?: string): void
   closeTab(id: string): Promise<void>
@@ -63,11 +88,19 @@ interface State {
 
 let initialized = false
 let toastSeq = 0
+let namesEpoch = 0
+
+const emptySearch: SearchState = { query: '', result: null, loading: false }
 
 const emptySession = {
   session: null,
-  schema: null,
-  schemaError: null,
+  catalog: null,
+  catalogError: null,
+  catalogLoading: false,
+  names: emptyNames(),
+  groups: {} as Record<string, GroupState>,
+  tables: {} as Record<string, TableState>,
+  search: emptySearch,
   tabs: [] as Tab[],
   activeTabId: null,
   dirtyTabs: {} as Record<string, boolean>,
@@ -79,18 +112,9 @@ const emptySession = {
 export const useStore = create<State>()((set, get) => ({
   appInfo: null,
   connections: [],
-  session: null,
-  schema: null,
-  schemaError: null,
-  schemaLoading: false,
-  tabs: [],
-  activeTabId: null,
-  dirtyTabs: {},
+  ...emptySession,
   toasts: [],
   confirmRequest: null,
-  inTransaction: false,
-  status: '',
-  queryCounter: 0,
   settings: null,
   settingsOpen: false,
 
@@ -155,18 +179,110 @@ export const useStore = create<State>()((set, get) => ({
   async refreshSchema() {
     const session = get().session
     if (!session) return
-    set({ schemaLoading: true, schemaError: null })
+    const epoch = ++namesEpoch
+    set({ catalogLoading: true, catalogError: null, groups: {}, tables: {}, search: emptySearch })
     try {
-      const schema = await window.api.db.schema(session.sessionId)
-      if (get().session?.sessionId !== session.sessionId) return
-      set({ schema, schemaLoading: false })
+      const catalog = await window.api.db.catalog(session.sessionId)
+      if (get().session?.sessionId !== session.sessionId || epoch !== namesEpoch) return
+      set({ catalog, catalogLoading: false, names: emptyNames(epoch, catalog.totalTables) })
+      void get().loadNames(session.sessionId, epoch)
     } catch (e) {
-      set({ schemaError: errorMessage(e), schemaLoading: false })
+      set({ catalogError: errorMessage(e), catalogLoading: false })
+    }
+  },
+
+  async loadNames(sessionId, epoch) {
+    let cursor: string | null = null
+    try {
+      do {
+        const page = await window.api.db.listObjects(sessionId, { kinds: ['table', 'view'], cursor, limit: NAMES_PAGE })
+        const cur = get()
+        if (cur.session?.sessionId !== sessionId || cur.names.epoch !== epoch) return
+        cursor = page.cursor
+        set({ names: appendNames(cur.names, page.items, cursor === null) })
+      } while (cursor)
+    } catch (e) {
+      const cur = get()
+      if (cur.session?.sessionId !== sessionId || cur.names.epoch !== epoch) return
+      cur.toast('error', 'Could not list tables', errorMessage(e))
+      set({ names: { ...cur.names, complete: true } })
+    }
+  },
+
+  async loadGroup(schema, kind, more = false) {
+    const session = get().session
+    if (!session) return
+    const key = groupKey(schema ?? '', kind)
+    const existing = get().groups[key]
+    if (existing?.loading) return
+    if (existing && !more) return
+    if (more && !existing?.cursor) return
+    set({ groups: { ...get().groups, [key]: { items: existing?.items ?? [], cursor: existing?.cursor ?? null, loading: true, error: null } } })
+    try {
+      const page = await window.api.db.listObjects(session.sessionId, { schema, kinds: [kind], cursor: more ? existing!.cursor : null, limit: 1000 })
+      if (get().session?.sessionId !== session.sessionId) return
+      const prev = get().groups[key]
+      if (!prev) return
+      set({ groups: { ...get().groups, [key]: { items: more ? [...prev.items, ...page.items] : page.items, cursor: page.cursor, loading: false, error: null } } })
+    } catch (e) {
+      if (get().session?.sessionId !== session.sessionId) return
+      set({ groups: { ...get().groups, [key]: { items: existing?.items ?? [], cursor: null, loading: false, error: errorMessage(e) } } })
+    }
+  },
+
+  async loadTable(ref) {
+    const session = get().session
+    if (!session) return
+    const key = tableKey(ref)
+    if (get().tables[key]) return
+    set({ tables: { ...get().tables, [key]: { status: 'loading' } } })
+    try {
+      const details = await window.api.db.tableDetails(session.sessionId, ref)
+      if (get().session?.sessionId !== session.sessionId) return
+      const next: Record<string, TableState> = { ...get().tables, [key]: { status: 'ready', details } }
+      const keys = Object.keys(next)
+      if (keys.length > TABLE_CACHE_LIMIT) for (const k of keys.slice(0, keys.length - TABLE_CACHE_LIMIT)) if (k !== key) delete next[k]
+      set({ tables: next })
+    } catch (e) {
+      if (get().session?.sessionId !== session.sessionId) return
+      set({ tables: { ...get().tables, [key]: { status: 'error', error: errorMessage(e) } } })
+    }
+  },
+
+  async runSearch(query) {
+    const session = get().session
+    const q = query.trim()
+    if (!session || q.length < 2) {
+      if (get().search.query !== q || get().search.result) set({ search: { query: q, result: null, loading: false } })
+      return
+    }
+    if (get().search.query === q && (get().search.result || get().search.loading)) return
+    set({ search: { query: q, result: get().search.result, loading: true } })
+    try {
+      const result = await window.api.db.searchObjects(session.sessionId, q, 200)
+      if (get().session?.sessionId !== session.sessionId || get().search.query !== q) return
+      set({ search: { query: q, result, loading: false } })
+    } catch (e) {
+      if (get().search.query !== q) return
+      set({ search: { query: q, result: null, loading: false } })
+      get().toast('error', 'Search failed', errorMessage(e))
+    }
+  },
+
+  async openDefinition(ref) {
+    const session = get().session
+    if (!session) return
+    try {
+      const def = await window.api.db.definition(session.sessionId, ref)
+      const sql = def.sql?.trim()
+      get().newQueryTab(sql ? (sql.endsWith(';') ? sql : `${sql};`) : `-- No definition available for ${ref.name}`, ref.name)
+    } catch (e) {
+      get().toast('error', `Could not load ${ref.name}`, errorMessage(e))
     }
   },
 
   openTable(ref) {
-    const { tabs, schema } = get()
+    const { tabs, catalog } = get()
     const existing = tabs.find((t) => t.kind === 'table' && sameTable({ schema: t.schema, name: t.table }, ref))
     if (existing) {
       set({ activeTabId: existing.id })
@@ -177,7 +293,7 @@ export const useStore = create<State>()((set, get) => ({
       kind: 'table',
       schema: ref.schema,
       table: ref.name,
-      title: tableLabel(ref, schema?.defaultSchema)
+      title: tableLabel(ref, catalog?.defaultSchema)
     }
     set({ tabs: [...tabs, tab], activeTabId: tab.id })
   },

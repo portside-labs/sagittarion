@@ -65,6 +65,27 @@ What the Postgres backend does differently:
 - *Open read-only* sets `default_transaction_read_only` for the session.
 - Requires PostgreSQL 12 or newer.
 
+## Browsing large databases
+
+The sidebar never loads a whole schema. Connecting fetches only schema names
+and object counts, then streams table and view names in the background; with
+23 schemas and a hundred thousand tables that is a few megabytes of names
+rather than the columns and definitions of everything. Each schema is a node
+with Tables, Views, Functions, Indexes and Triggers underneath. Columns load
+when a table is expanded, index, trigger and function lists when their group is
+opened (in pages of a thousand, with a *Load more* row), and definitions when
+an object is clicked. The tree is virtualized, so a schema with five thousand
+tables costs a few dozen DOM nodes however far it is expanded.
+
+The filter box matches names locally and instantly; after a short pause the
+server is asked as well, which adds indexes, triggers, functions and columns
+that match, with column hits shown under their table. Small databases behave as
+before: every schema and view group opens up front.
+
+Functions and procedures (Postgres) show their signature on hover, a badge for
+procedures, aggregates and trigger functions, and open `pg_get_functiondef`
+output in a query tab.
+
 ## Ask in plain English
 
 Every query tab has an *Ask* box. Type a question such as "top 10 customers by
@@ -88,6 +109,12 @@ Follow-up questions work: the last few question/SQL pairs in the same tab are
 sent along, so "now only for 2025" refines the previous query. *New topic*
 clears that history.
 
+While a question is being answered the Ask bar shows each step as it happens:
+which tables were chosen and why, each request to the model with its token
+counts, every tool the model called and what it got back, the `EXPLAIN` check
+and any repair round. A *Cancel* button stops the run. When it finishes, the
+steps collapse into a one-line summary next to the result that expands on click.
+
 ### Providers
 
 Settings lets you pick any standard provider and bring your own key: OpenAI,
@@ -108,6 +135,10 @@ decides per question what the model needs to see:
   roughly a tenth of the tokens of the `CREATE TABLE` text. Tables with more
   than 60 columns are shortened to keys, foreign keys and columns matching the
   question, with a note that `describe_table` has the rest.
+- The index is built from object names, which are cheap even for a hundred
+  thousand tables; columns and foreign keys are fetched only for the tables a
+  question selects, and cached for the session. Schemas of up to a few hundred
+  tables are loaded whole up front.
 - If the whole compact schema fits the budget chosen in Settings (default about
   8k tokens), it is sent every time. A stable schema block is cache-friendly:
   with Anthropic it is marked for prompt caching, and OpenAI caches long
@@ -208,7 +239,7 @@ src/main/agent/      sqlite_agent.py – runs on the remote host
 src/main/store/      saved connections (secrets encrypted with safeStorage)
 src/preload/         contextBridge API exposed as window.api
 src/shared/          types shared by main and renderer, export helpers
-src/renderer/        React UI (connection screen, workspace, grid, editor)
+src/renderer/        React UI (connection screen, workspace, grid, editor); lib/tree.ts drives the virtualized sidebar
 test/mock-ssh/       an ssh2-based SSH server used by the tests and for dev
 test/docker/         Dockerfiles for real-OpenSSH tests
 test/e2e/            Playwright end-to-end test driving the built app

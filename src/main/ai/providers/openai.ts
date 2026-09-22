@@ -65,7 +65,7 @@ export class OpenAiCompatibleProvider implements LlmProvider {
     return h
   }
 
-  async complete(req: ChatRequest): Promise<ChatResponse> {
+  async complete(req: ChatRequest, signal?: AbortSignal): Promise<ChatResponse> {
     if (!this.model) throw new ProviderError('No model is configured. Pick one in Settings.', 'bad_request')
     const body: Record<string, unknown> = { model: this.model, messages: mapMessages(req) }
     if (req.tools?.length) {
@@ -74,7 +74,7 @@ export class OpenAiCompatibleProvider implements LlmProvider {
         body.tool_choice = typeof req.toolChoice === 'string' ? req.toolChoice : { type: 'function', function: { name: req.toolChoice.name } }
       }
     }
-    const res = await fetchWithTimeout(this.fetchImpl, joinUrl(this.cfg.baseUrl, '/chat/completions'), { method: 'POST', headers: this.headers(), body: JSON.stringify(body) }, this.cfg.timeoutMs ?? 90_000)
+    const res = await fetchWithTimeout(this.fetchImpl, joinUrl(this.cfg.baseUrl, '/chat/completions'), { method: 'POST', headers: this.headers(), body: JSON.stringify(body) }, this.cfg.timeoutMs ?? 90_000, signal)
     if (!res.ok) throw classifyHttpError(res.status, await readErrorBody(res))
     const json: any = await res.json()
     const choice = json?.choices?.[0]
@@ -96,13 +96,14 @@ export class OpenAiCompatibleProvider implements LlmProvider {
     }
   }
 
-  async embed(texts: string[]): Promise<number[][]> {
+  async embed(texts: string[], signal?: AbortSignal): Promise<number[][]> {
     if (!this.cfg.embeddingModel) throw new ProviderError('No embedding model is configured.', 'bad_request')
     const res = await fetchWithTimeout(
       this.fetchImpl,
       joinUrl(this.cfg.baseUrl, '/embeddings'),
       { method: 'POST', headers: this.headers(), body: JSON.stringify({ model: this.cfg.embeddingModel, input: texts }) },
-      this.cfg.timeoutMs ?? 90_000
+      this.cfg.timeoutMs ?? 90_000,
+      signal
     )
     if (!res.ok) throw classifyHttpError(res.status, await readErrorBody(res))
     const json: any = await res.json()

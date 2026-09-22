@@ -7,6 +7,8 @@ DROP TABLE IF EXISTS settings;
 DROP TABLE IF EXISTS no_pk;
 DROP TABLE IF EXISTS "weird name";
 DROP FUNCTION IF EXISTS touch_updated_at();
+DROP FUNCTION IF EXISTS order_total(bigint);
+DROP PROCEDURE IF EXISTS archive_orders(date);
 
 CREATE TABLE users (
   id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
@@ -67,6 +69,16 @@ $$ LANGUAGE plpgsql;
 
 CREATE TRIGGER users_touch BEFORE UPDATE ON users
   FOR EACH ROW EXECUTE FUNCTION touch_updated_at();
+
+CREATE FUNCTION order_total(order_id bigint) RETURNS numeric LANGUAGE sql STABLE AS $$
+  SELECT total::numeric FROM orders WHERE id = order_id
+$$;
+
+CREATE PROCEDURE archive_orders(before date) LANGUAGE plpgsql AS $$
+BEGIN
+  DELETE FROM orders WHERE placed_at < before;
+END
+$$;
 
 CREATE SCHEMA analytics;
 CREATE TABLE analytics.daily_totals (

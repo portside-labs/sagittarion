@@ -282,6 +282,136 @@ describe.skipIf(!enabled)('PostgreSQL driver', () => {
     await d.close()
   })
 
+  it('reports a catalog with per-schema counts and lists objects in pages', async () => {
+    const d = driver()
+    await d.connect()
+    const catalog = await d.catalog()
+    expect(catalog.kind).toBe('postgres')
+    expect(catalog.defaultSchema).toBe('public')
+    expect(catalog.schemas.map((s) => s.name)).toEqual(['public', 'analytics'])
+    const pub = catalog.schemas[0].counts
+    expect(pub).toMatchObject({ table: 5, view: 1, trigger: 1, function: 3 })
+    expect(pub.index).toBeGreaterThanOrEqual(3)
+    expect(catalog.schemas[1].counts).toMatchObject({ table: 1, view: 0 })
+    expect(catalog.totalTables).toBe(7)
+
+    // Keyset paging over tables and views, in schema then name order.
+    const first = await d.listObjects({ kinds: ['table', 'view'], limit: 3 })
+    expect(first.items.length).toBe(3)
+    expect(first.cursor).not.toBeNull()
+    const all = [...first.items]
+    let cursor = first.cursor
+    while (cursor) {
+      const page = await d.listObjects({ kinds: ['table', 'view'], limit: 3, cursor })
+      all.push(...page.items)
+      cursor = page.cursor
+    }
+    expect(all.map((o) => `${o.schema}.${o.name}`)).toEqual(['analytics.daily_totals', 'public.no_pk', 'public.order_summary', 'public.orders', 'public.settings', 'public.users', 'public.weird name'])
+    const orders = all.find((o) => o.name === 'orders')!
+    expect(orders).toMatchObject({ kind: 'table', subtype: 'table' })
+    expect(orders.columnCount).toBeGreaterThan(3)
+    expect(all.find((o) => o.name === 'order_summary')).toMatchObject({ kind: 'view', subtype: 'view' })
+
+    const onlyAnalytics = await d.listObjects({ schema: 'analytics', kinds: ['table', 'view'] })
+    expect(onlyAnalytics.items.map((o) => o.name)).toEqual(['daily_totals'])
+    expect(onlyAnalytics.cursor).toBeNull()
+
+    const fns = await d.listObjects({ schema: 'public', kinds: ['function'] })
+    const byName = Object.fromEntries(fns.items.map((f) => [f.name, f]))
+    expect(byName.order_total).toMatchObject({ kind: 'function', subtype: 'function', args: 'order_id bigint', returns: 'numeric', language: 'sql' })
+    expect(byName.archive_orders).toMatchObject({ subtype: 'procedure', language: 'plpgsql' })
+    expect(byName.touch_updated_at).toMatchObject({ subtype: 'trigger-function' })
+
+    const idx = await d.listObjects({ schema: 'public', kinds: ['index'] })
+    expect(idx.items.map((i) => i.name)).toEqual(expect.arrayContaining(['idx_orders_user', 'idx_orders_status_placed', 'users_email_key']))
+    expect(idx.items.every((i) => i.table)).toBe(true)
+    expect(idx.items.some((i) => i.name === 'users_pkey')).toBe(false)
+    const trg = await d.listObjects({ schema: 'public', kinds: ['trigger'] })
+    expect(trg.items).toEqual([expect.objectContaining({ kind: 'trigger', name: 'users_touch', table: 'users' })])
+    await expect(d.listObjects({ kinds: ['table', 'index'] })).rejects.toThrow(/tables and views together/)
+    await d.close()
+  })
+
+  it('searches names and columns and fetches definitions on demand', async () => {
+    const d = driver()
+    await d.connect()
+    const res = await d.searchObjects('order')
+    const found = new Map(res.objects.map((o) => [`${o.kind}:${o.name}`, o]))
+    expect(found.has('table:orders')).toBe(true)
+    expect(found.has('view:order_summary')).toBe(true)
+    expect(found.has('function:order_total')).toBe(true)
+    expect(found.has('function:archive_orders')).toBe(true)
+    expect(found.has('index:idx_orders_user')).toBe(true)
+    expect(res.objects[0].name.startsWith('order')).toBe(true) // prefix matches rank first
+    const placed = await d.searchObjects('placed')
+    expect(placed.columns).toEqual([expect.objectContaining({ schema: 'public', table: 'orders', column: 'placed_at', tableKind: 'table' })])
+    expect(placed.objects.map((o) => o.name)).toContain('idx_orders_status_placed')
+    expect((await d.searchObjects('%')).objects.length).toBe(0)
+
+    expect((await d.definition({ kind: 'index', schema: 'public', name: 'idx_orders_user' })).sql).toMatch(/^CREATE INDEX idx_orders_user/)
+    expect((await d.definition({ kind: 'trigger', schema: 'public', name: 'users_touch' })).sql).toMatch(/^CREATE TRIGGER users_touch/)
+    expect((await d.definition({ kind: 'function', schema: 'public', name: 'order_total' })).sql).toMatch(/^CREATE OR REPLACE FUNCTION public\.order_total/)
+    expect((await d.definition({ kind: 'function', schema: 'public', name: 'archive_orders' })).sql).toMatch(/^CREATE OR REPLACE PROCEDURE/)
+    expect((await d.definition({ kind: 'view', schema: 'public', name: 'order_summary' })).sql).toMatch(/^CREATE VIEW/)
+    const fn = found.get('function:order_total')!
+    expect((await d.definition({ kind: 'function', schema: 'public', name: 'order_total', id: fn.id })).sql).toContain('order_total')
+
+    const metas = await d.tablesMeta([{ schema: 'public', name: 'users' }, { schema: 'analytics', name: 'daily_totals' }, { name: 'orders' }])
+    expect(metas.map((m) => `${m.schema}.${m.name}`).sort()).toEqual(['analytics.daily_totals', 'public.orders', 'public.users'])
+    expect(metas.find((m) => m.name === 'users')!.columns.length).toBeGreaterThan(3)
+    expect(await d.relationsFor([{ name: 'users' }])).toEqual([{ schema: 'public', table: 'orders', column: 'user_id', refSchema: 'public', refTable: 'users', refColumn: 'id' }])
+    expect(await d.relationsFor([{ schema: 'analytics', name: 'daily_totals' }])).toEqual([])
+    await d.close()
+  })
+
+  it('stays fast on a database with thousands of tables', async () => {
+    const d = driver()
+    await d.connect()
+    // Batches keep each transaction's lock count small; one giant DO block runs out of shared memory.
+    const ddl: string[] = []
+    for (let s = 1; s <= 3; s++) {
+      ddl.push(`CREATE SCHEMA big_${s}`)
+      for (let start = 1; start <= 1000; start += 250) {
+        ddl.push(`DO $$ BEGIN FOR i IN ${start}..${start + 249} LOOP EXECUTE format('CREATE TABLE big_${s}.t_%s (id int PRIMARY KEY, value_%s int)', i, i); END LOOP; END $$`)
+      }
+    }
+    const created = await d.query(ddl.join(';\n'))
+    expect(created.results.map((r) => (r.kind === 'error' ? `error: ${r.message}` : r.kind))).toEqual(ddl.map(() => 'exec'))
+    try {
+      let t0 = Date.now()
+      const catalog = await d.catalog()
+      const catalogMs = Date.now() - t0
+      expect(catalog.schemas.map((s) => s.name)).toEqual(expect.arrayContaining(['big_1', 'big_2', 'big_3']))
+      expect(catalog.schemas.find((s) => s.name === 'big_2')!.counts.table).toBe(1000)
+      t0 = Date.now()
+      const items = []
+      let cursor: string | null = null
+      let pages = 0
+      do {
+        const page = await d.listObjects({ kinds: ['table', 'view'], cursor, limit: 1000 })
+        items.push(...page.items)
+        cursor = page.cursor
+        pages++
+      } while (cursor)
+      const listMs = Date.now() - t0
+      expect(pages).toBeGreaterThanOrEqual(4)
+      expect(items.filter((o) => o.schema?.startsWith('big_')).length).toBe(3000)
+      t0 = Date.now()
+      const found = await d.searchObjects('t_99', 50)
+      const searchMs = Date.now() - t0
+      expect(found.objects.filter((o) => o.kind === 'table').length).toBe(33) // t_99 and t_990..t_999 in each schema
+      const byColumn = await d.searchObjects('value_99', 50)
+      expect(byColumn.columns.some((c) => c.column === 'value_99' && c.table === 't_99')).toBe(true)
+      expect(byColumn.objects.length).toBe(0)
+      expect(catalogMs).toBeLessThan(5000)
+      expect(listMs).toBeLessThan(5000)
+      expect(searchMs).toBeLessThan(5000)
+    } finally {
+      await d.query('DROP SCHEMA big_1 CASCADE; DROP SCHEMA big_2 CASCADE; DROP SCHEMA big_3 CASCADE')
+      await d.close()
+    }
+  }, 180_000)
+
   it('gives friendly errors for bad credentials and databases', async () => {
     await expect(driver({ password: 'wrong' }).connect()).rejects.toThrow(/Password authentication failed for user "test"/)
     await expect(driver({ database: 'nope' }).connect()).rejects.toThrow(/Database "nope" does not exist/)

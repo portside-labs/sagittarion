@@ -1,176 +1,226 @@
-import { useMemo, useState, type ReactNode } from 'react'
-import type { IndexMeta, TableMeta, TriggerMeta } from '@shared/types'
-import { sameTable, tableLabel } from '@shared/connections'
+import { useDeferredValue, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from 'react'
+import type { ObjectKind, ObjectSummary } from '@shared/types'
+import { tableKey } from '@shared/connections'
 import { useStore } from '@/store'
 import { Icon, type IconName } from './Icons'
+import { buildRows, KIND_LABELS, ROW_HEIGHT, type TreeRow } from '@/lib/tree'
 
-type SectionKey = 'tables' | 'views' | 'indexes' | 'triggers'
+const ICONS: Record<ObjectKind, IconName> = { table: 'table', view: 'view', function: 'function', index: 'index', trigger: 'trigger' }
+/** Databases up to this many tables open every schema and view group up front. */
+const AUTO_EXPAND_TABLES = 2000
+
+function functionMeta(o: ObjectSummary): string {
+  if (o.subtype === 'procedure') return 'procedure'
+  if (o.subtype === 'aggregate') return 'aggregate'
+  if (o.subtype === 'window') return 'window'
+  if (o.subtype === 'trigger-function') return 'trigger'
+  return o.returns ?? ''
+}
 
 export function Sidebar({ width }: { width: number }) {
-  const schema = useStore((s) => s.schema)
-  const schemaError = useStore((s) => s.schemaError)
-  const schemaLoading = useStore((s) => s.schemaLoading)
+  const session = useStore((s) => s.session)
+  const catalog = useStore((s) => s.catalog)
+  const catalogError = useStore((s) => s.catalogError)
+  const catalogLoading = useStore((s) => s.catalogLoading)
+  const names = useStore((s) => s.names)
+  const groups = useStore((s) => s.groups)
+  const tables = useStore((s) => s.tables)
+  const search = useStore((s) => s.search)
   const refreshSchema = useStore((s) => s.refreshSchema)
+  const loadGroup = useStore((s) => s.loadGroup)
+  const loadTable = useStore((s) => s.loadTable)
+  const runSearch = useStore((s) => s.runSearch)
   const openTable = useStore((s) => s.openTable)
-  const newQueryTab = useStore((s) => s.newQueryTab)
+  const openDefinition = useStore((s) => s.openDefinition)
   const tabs = useStore((s) => s.tabs)
   const activeTabId = useStore((s) => s.activeTabId)
 
   const [filter, setFilter] = useState('')
+  const deferredFilter = useDeferredValue(filter)
   const [expanded, setExpanded] = useState<Record<string, boolean>>({})
-  const [collapsed, setCollapsed] = useState<Record<string, boolean>>({ indexes: true, triggers: true })
+
+  // A new session means new keys; forget what was open.
+  useEffect(() => {
+    setExpanded({})
+    setFilter('')
+  }, [session?.sessionId])
+
+  // The server search adds indexes, functions, unloaded tables and column matches to the local filter.
+  useEffect(() => {
+    const q = deferredFilter.trim()
+    const t = setTimeout(() => void runSearch(q), 150)
+    return () => clearTimeout(t)
+  }, [deferredFilter, runSearch])
 
   const activeTab = tabs.find((t) => t.id === activeTabId)
-  const activeRef = activeTab?.kind === 'table' ? { schema: activeTab.schema, name: activeTab.table } : null
-  const q = filter.trim().toLowerCase()
-  const match = (name: string) => !q || name.toLowerCase().includes(q)
-  const defaultSchema = schema?.defaultSchema
+  const activeTable = activeTab?.kind === 'table' ? tableKey({ schema: activeTab.schema, name: activeTab.table }) : null
+  const autoExpand = (catalog?.totalTables ?? 0) <= AUTO_EXPAND_TABLES
+  const defaultSchema = catalog?.defaultSchema
 
-  const lists = useMemo(() => {
-    if (!schema) return null
-    const tableMatch = (t: TableMeta) => match(t.name) || (t.schema ? match(`${t.schema}.${t.name}`) : false) || (q.length > 0 && t.columns.some((c) => c.name.toLowerCase().includes(q)))
-    return {
-      tables: schema.tables.filter(tableMatch),
-      views: schema.views.filter(tableMatch),
-      indexes: schema.indexes.filter((i) => match(i.name) || match(i.table)),
-      triggers: schema.triggers.filter((t) => match(t.name) || match(t.table))
+  const rows = useMemo<TreeRow[]>(
+    () => (catalog ? buildRows({ catalog, names, groups, tables, expanded, filter: deferredFilter, search: search.result, searching: search.loading, activeTable, autoExpand }) : []),
+    [catalog, names, groups, tables, expanded, deferredFilter, search, activeTable, autoExpand]
+  )
+
+  const toggle = (row: TreeRow) => {
+    if (row.type === 'schema' || row.type === 'group') {
+      const next = !row.open
+      setExpanded((x) => ({ ...x, [row.key]: next }))
+      if (row.type === 'group' && next && row.kind !== 'table' && row.kind !== 'view' && !groups[row.key]) void loadGroup(row.schema, row.kind)
+    } else if (row.type === 'object' && row.hasChildren) {
+      const next = !row.open
+      setExpanded((x) => ({ ...x, [row.key]: next }))
+      if (next) void loadTable({ schema: row.obj.schema, name: row.obj.name })
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [schema, q])
-
-  const isCollapsed = (key: string) => Boolean(collapsed[key])
-  const toggleCollapsed = (key: string) => setCollapsed((c) => ({ ...c, [key]: !c[key] }))
-
-  const renderTable = (t: TableMeta, icon: IconName) => {
-    const key = `${t.schema ?? ''}.${t.name}`
-    const isOpen = expanded[key] || (q.length > 0 && !match(t.name))
-    const ref = { schema: t.schema, name: t.name }
-    return (
-      <div key={key}>
-        <div
-          className={`tree-item ${activeRef && sameTable(activeRef, ref) ? 'active' : ''}`}
-          onClick={() => openTable(ref)}
-          title={tableLabel(ref, defaultSchema)}
-          data-testid={`tree-${icon}-${t.schema && t.schema !== defaultSchema ? `${t.schema}.` : ''}${t.name}`}
-        >
-          <button
-            className="tree-toggle"
-            onClick={(e) => {
-              e.stopPropagation()
-              setExpanded((x) => ({ ...x, [key]: !isOpen }))
-            }}
-            tabIndex={-1}
-          >
-            <Icon name={isOpen ? 'chevron-down' : 'chevron-right'} size={12} />
-          </button>
-          <Icon className="tree-icon" name={icon} />
-          <span className="tree-name">{t.name}</span>
-          <span className="tree-meta">{t.columns.length}</span>
-        </div>
-        {isOpen ? (
-          <div className="tree-children">
-            {t.columns.map((c) => (
-              <div key={c.cid} className="tree-col" title={`${c.name} ${c.type}${c.notnull ? ' NOT NULL' : ''}${c.pk ? ' PRIMARY KEY' : ''}${c.extra ? ` ${c.extra}` : ''}`}>
-                {c.pk ? <Icon className="tree-icon" name="key" size={11} /> : <span style={{ width: 11 }} />}
-                <span className="col-name">{c.name}</span>
-                <span className="col-type">{c.type || '—'}</span>
-              </div>
-            ))}
-          </div>
-        ) : null}
-      </div>
-    )
   }
 
-  const section = (key: string, label: string, count: number, body: ReactNode) => (
-    <div className="tree-section" key={key}>
-      <div className="tree-section-header" onClick={() => toggleCollapsed(key)}>
-        <Icon name={isCollapsed(key) ? 'chevron-right' : 'chevron-down'} size={11} />
-        <span>{label}</span>
-        <span className="count">{count}</span>
-      </div>
-      {!isCollapsed(key) ? body : null}
-    </div>
-  )
+  const activate = (row: TreeRow) => {
+    if (row.type === 'object') {
+      const o = row.obj
+      if (o.kind === 'table' || o.kind === 'view') openTable({ schema: o.schema, name: o.name })
+      else void openDefinition({ kind: o.kind, schema: o.schema, name: o.name, id: o.id })
+    } else if (row.type === 'more') {
+      void loadGroup(row.schema, row.kind, true)
+    } else {
+      toggle(row)
+    }
+  }
 
-  const tablesAndViews = (tables: TableMeta[], views: TableMeta[], keyPrefix = '') => (
-    <>
-      {section(`${keyPrefix}tables`, 'Tables', tables.length, tables.length ? tables.map((t) => renderTable(t, 'table')) : <div className="tree-empty">No tables</div>)}
-      {section(`${keyPrefix}views`, 'Views', views.length, views.length ? views.map((v) => renderTable(v, 'view')) : <div className="tree-empty">No views</div>)}
-    </>
-  )
+  const testId = (o: ObjectSummary) => `tree-${o.kind}-${o.schema && o.schema !== defaultSchema ? `${o.schema}.` : ''}${o.name}`
 
-  const renderIndex = (i: IndexMeta) => (
-    <div key={`${i.schema ?? ''}.${i.name}`} className="tree-item" title={i.sql ?? ''} onClick={() => newQueryTab(i.sql ? i.sql + ';' : `-- ${i.name} is an automatic index`, i.name)}>
-      <span className="tree-toggle placeholder" />
-      <Icon className="tree-icon" name="index" />
-      <span className="tree-name">{i.name}</span>
-      <span className="tree-meta">{tableLabel({ schema: i.schema, name: i.table }, defaultSchema)}</span>
-    </div>
-  )
-  const renderTrigger = (t: TriggerMeta) => (
-    <div key={`${t.schema ?? ''}.${t.name}`} className="tree-item" title={t.sql ?? ''} onClick={() => newQueryTab((t.sql ?? '') + ';', t.name)}>
-      <span className="tree-toggle placeholder" />
-      <Icon className="tree-icon" name="trigger" />
-      <span className="tree-name">{t.name}</span>
-      <span className="tree-meta">{tableLabel({ schema: t.schema, name: t.table }, defaultSchema)}</span>
-    </div>
-  )
-
-  // Postgres databases with more than one schema get a schema level in the tree.
-  const groupBySchema = schema?.kind === 'postgres' && (schema.schemas?.length ?? 0) > 1
-  let body: ReactNode = null
-  if (lists && schema) {
-    if (groupBySchema) {
-      const names = schema.schemas ?? []
-      body = names.map((name) => {
-        const tables = lists.tables.filter((t) => t.schema === name)
-        const views = lists.views.filter((v) => v.schema === name)
-        if (q && tables.length === 0 && views.length === 0) return null
-        const key = `schema:${name}`
-        const open = !isCollapsed(key)
+  const renderRow = (row: TreeRow): ReactNode => {
+    const indent = { paddingLeft: 4 + row.depth * 14 }
+    switch (row.type) {
+      case 'schema':
         return (
-          <div className="tree-schema" key={key}>
-            <div className="tree-item" onClick={() => toggleCollapsed(key)} title={`Schema ${name}`}>
-              <button className="tree-toggle" tabIndex={-1}>
-                <Icon name={open ? 'chevron-down' : 'chevron-right'} size={12} />
-              </button>
-              <Icon className="tree-icon" name="database" />
-              <span className="tree-name">{name}</span>
-              <span className="tree-meta">{tables.length + views.length}</span>
-            </div>
-            {open ? <div className="tree-schema-body">{tablesAndViews(tables, views, `${name}:`)}</div> : null}
+          <div key={row.key} className="tree-item tree-row" style={indent} onClick={() => toggle(row)} title={`Schema ${row.schema}`} data-testid={`tree-schema-${row.schema}`}>
+            <button className="tree-toggle" tabIndex={-1}>
+              <Icon name={row.open ? 'chevron-down' : 'chevron-right'} size={12} />
+            </button>
+            <Icon className="tree-icon" name="database" />
+            <span className="tree-name">{row.schema}</span>
+            <span className="tree-meta">{row.count.toLocaleString()}</span>
           </div>
         )
-      })
-    } else {
-      body = tablesAndViews(lists.tables, lists.views)
+      case 'group':
+        return (
+          <div key={row.key} className="tree-section-header tree-row" style={indent} onClick={() => toggle(row)} data-testid={`tree-group-${row.scope}-${row.kind}`}>
+            <Icon name={row.open ? 'chevron-down' : 'chevron-right'} size={11} />
+            <span>{KIND_LABELS[row.kind]}</span>
+            <span className="count">{row.count.toLocaleString()}</span>
+            {row.loading ? <span className="spinner tiny" /> : null}
+          </div>
+        )
+      case 'object': {
+        const o = row.obj
+        const isTable = o.kind === 'table' || o.kind === 'view'
+        const meta = isTable ? (o.columnCount ?? '') : o.kind === 'function' ? functionMeta(o) : (o.table ?? '')
+        const title = o.kind === 'function' ? `${o.name}(${o.args ?? ''})${o.returns ? ` → ${o.returns}` : ''}${o.language ? ` [${o.language}]` : ''}` : `${o.schema ? `${o.schema}.` : ''}${o.name}${o.comment ? ` — ${o.comment}` : ''}`
+        return (
+          <div key={row.key} className={`tree-item tree-row ${row.active ? 'active' : ''}`} style={indent} onClick={() => activate(row)} title={title} data-testid={testId(o)}>
+            {row.hasChildren ? (
+              <button
+                className="tree-toggle"
+                onClick={(e) => {
+                  e.stopPropagation()
+                  toggle(row)
+                }}
+                tabIndex={-1}
+              >
+                <Icon name={row.open ? 'chevron-down' : 'chevron-right'} size={12} />
+              </button>
+            ) : (
+              <span className="tree-toggle placeholder" />
+            )}
+            <Icon className="tree-icon" name={ICONS[o.kind]} />
+            <span className="tree-name">{o.name}</span>
+            <span className="tree-meta">{meta}</span>
+          </div>
+        )
+      }
+      case 'column': {
+        const c = row.col
+        return (
+          <div key={row.key} className={`tree-col tree-row ${row.hit ? 'hit' : ''}`} style={indent} title={`${c.name} ${c.type}${c.notnull ? ' NOT NULL' : ''}${c.pk ? ' PRIMARY KEY' : ''}${c.extra ? ` ${c.extra}` : ''}`}>
+            {c.pk ? <Icon className="tree-icon" name="key" size={11} /> : <span style={{ width: 11, flex: '0 0 auto' }} />}
+            <span className="col-name">{c.name}</span>
+            <span className="col-type">{c.type || '—'}</span>
+          </div>
+        )
+      }
+      case 'more':
+        return (
+          <div key={row.key} className="tree-item tree-row more" style={indent} onClick={() => activate(row)} data-testid={`tree-more-${row.scope}-${row.kind}`}>
+            <span className="tree-toggle placeholder" />
+            <Icon className="tree-icon" name="chevron-down" size={12} />
+            <span className="tree-name">Load more</span>
+            <span className="tree-meta">{row.remaining.toLocaleString()} left</span>
+          </div>
+        )
+      case 'info':
+        return (
+          <div key={row.key} className="tree-empty tree-row" style={indent}>
+            {row.spinner ? <span className="spinner tiny" /> : null}
+            <span>{row.text}</span>
+          </div>
+        )
     }
   }
+
+  const progress = names.total > 0 && !names.complete ? Math.min(99, Math.round((names.loaded / names.total) * 100)) : null
 
   return (
     <aside className="sidebar" style={{ width }}>
       <div className="sidebar-header">
         <div className="search">
           <Icon className="icon" name="search" size={13} />
-          <input className="text" placeholder="Filter objects" value={filter} onChange={(e) => setFilter(e.target.value)} spellCheck={false} />
+          <input className="text" placeholder="Filter objects" value={filter} onChange={(e) => setFilter(e.target.value)} spellCheck={false} data-testid="tree-filter" />
+          {filter ? (
+            <button className="btn ghost icon small clear" title="Clear filter" onClick={() => setFilter('')}>
+              <Icon name="x" size={11} />
+            </button>
+          ) : null}
         </div>
-        <button className="btn ghost icon small" title="Refresh schema" onClick={() => void refreshSchema()} disabled={schemaLoading}>
-          {schemaLoading ? <span className="spinner" /> : <Icon name="refresh" />}
+        <button className="btn ghost icon small" title="Refresh schema" onClick={() => void refreshSchema()} disabled={catalogLoading}>
+          {catalogLoading ? <span className="spinner" /> : <Icon name="refresh" />}
         </button>
       </div>
-      <div className="tree">
-        {schemaError ? <div className="sidebar-error">{schemaError}</div> : null}
-        {!lists ? (
-          !schemaError ? <div className="tree-empty">Loading schema…</div> : null
-        ) : (
-          <>
-            {body}
-            {section('indexes', 'Indexes', lists.indexes.length, lists.indexes.length ? lists.indexes.map(renderIndex) : <div className="tree-empty">No indexes</div>)}
-            {section('triggers', 'Triggers', lists.triggers.length, lists.triggers.length ? lists.triggers.map(renderTrigger) : <div className="tree-empty">No triggers</div>)}
-          </>
-        )}
-      </div>
+      {progress !== null ? (
+        <div className="names-progress" title={`Loading table names: ${names.loaded.toLocaleString()} of ${names.total.toLocaleString()}`} data-testid="names-progress">
+          <div className="bar" style={{ width: `${progress}%` }} />
+        </div>
+      ) : null}
+      {catalogError ? <div className="sidebar-error">{catalogError}</div> : null}
+      {!catalog ? <div className="tree">{!catalogError ? <div className="tree-empty">Loading schema…</div> : null}</div> : <VirtualList rows={rows} render={renderRow} />}
     </aside>
+  )
+}
+
+/** Draws only the rows in view, so a schema with thousands of tables costs a few dozen DOM nodes. */
+function VirtualList({ rows, render }: { rows: TreeRow[]; render: (row: TreeRow) => ReactNode }) {
+  const ref = useRef<HTMLDivElement>(null)
+  const [scrollTop, setScrollTop] = useState(0)
+  const [height, setHeight] = useState(800)
+
+  useLayoutEffect(() => {
+    const el = ref.current
+    if (!el) return
+    const update = () => setHeight(el.clientHeight || 800)
+    update()
+    const ro = new ResizeObserver(update)
+    ro.observe(el)
+    return () => ro.disconnect()
+  }, [])
+
+  const total = rows.length * ROW_HEIGHT
+  const start = Math.max(0, Math.floor(scrollTop / ROW_HEIGHT) - 8)
+  const end = Math.min(rows.length, Math.ceil((scrollTop + height) / ROW_HEIGHT) + 8)
+
+  return (
+    <div ref={ref} className="tree vtree" onScroll={(e) => setScrollTop(e.currentTarget.scrollTop)} data-testid="tree">
+      <div style={{ height: total, position: 'relative' }}>
+        <div style={{ position: 'absolute', top: start * ROW_HEIGHT, left: 0, right: 0 }}>{rows.slice(start, end).map(render)}</div>
+      </div>
+    </div>
   )
 }

@@ -166,6 +166,95 @@ export interface SchemaInfo {
   relations?: Relation[]
 }
 
+// ---------------------------------------------------------------------------
+// Catalog: the lazily loaded view of a schema used by the sidebar and the AI
+// ---------------------------------------------------------------------------
+
+export type ObjectKind = 'table' | 'view' | 'function' | 'index' | 'trigger'
+
+/** Display order of object groups inside a schema. */
+export const OBJECT_KINDS: ObjectKind[] = ['table', 'view', 'function', 'index', 'trigger']
+
+export type ObjectCounts = Record<ObjectKind, number>
+
+export interface SchemaSummary {
+  name: string
+  counts: ObjectCounts
+}
+
+/** Cheap first look at a database: schema names and how many objects each holds. */
+export interface Catalog {
+  kind: DatabaseKind
+  defaultSchema?: string
+  /** Empty for SQLite, which has a single implicit schema. */
+  schemas: SchemaSummary[]
+  totalObjects: number
+  totalTables: number
+}
+
+/** One row of a lazily loaded object list: names only, no columns or definitions. */
+export interface ObjectSummary {
+  /** Stable identifier (Postgres oid, SQLite name), unique within its kind. */
+  id: string
+  kind: ObjectKind
+  schema?: string
+  name: string
+  /** Finer kind: table | partitioned | foreign | view | matview | function | procedure | aggregate | window | trigger-function. */
+  subtype?: string
+  /** Index and trigger: the table they belong to. */
+  table?: string
+  /** Function: identity arguments, return type and language. */
+  args?: string
+  returns?: string | null
+  language?: string
+  columnCount?: number | null
+  rowEstimate?: number | null
+  comment?: string | null
+}
+
+export interface ListObjectsRequest {
+  /** Restrict to one schema; omitted means every schema. */
+  schema?: string
+  /** Kinds of one family: table and view together, or a single index, trigger or function kind. */
+  kinds: ObjectKind[]
+  /** Opaque cursor from the previous page. */
+  cursor?: string | null
+  limit?: number
+}
+
+export interface ObjectPage {
+  items: ObjectSummary[]
+  /** Cursor for the next page, or null when this was the last one. */
+  cursor: string | null
+}
+
+export interface ObjectRef {
+  kind: ObjectKind
+  schema?: string
+  name: string
+  id?: string
+}
+
+export interface ObjectDefinition extends ObjectRef {
+  sql: string | null
+}
+
+export interface ColumnHit {
+  schema?: string
+  table: string
+  tableKind: 'table' | 'view'
+  tableId?: string
+  column: string
+  type: string
+}
+
+export interface SearchResult {
+  query: string
+  objects: ObjectSummary[]
+  columns: ColumnHit[]
+  truncated: boolean
+}
+
 export interface QueryOptions {
   /** Refuse writes at the database level for this call (SQLite query_only, Postgres read-only transaction). */
   readOnly?: boolean

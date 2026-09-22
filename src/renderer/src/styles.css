@@ -1952,3 +1952,130 @@ table.struct {
 .ask-result .spacer {
   flex: 1;
 }
+
+
+/* ---- virtualized schema tree ---- */
+.vtree {
+  padding: 0 6px 12px;
+}
+.vtree .tree-row {
+  box-sizing: border-box;
+  height: 24px;
+}
+.vtree .tree-item,
+.vtree .tree-col {
+  height: 24px;
+  margin: 0;
+}
+.vtree .tree-section-header {
+  height: 24px;
+  padding-top: 0;
+  padding-bottom: 0;
+}
+.vtree .tree-col.hit .col-name {
+  color: var(--accent);
+  font-weight: 600;
+}
+.vtree .tree-item.more .tree-name {
+  color: var(--accent);
+}
+.vtree .tree-empty {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 0 6px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.sidebar-header .search {
+  position: relative;
+}
+.sidebar-header .search .clear {
+  position: absolute;
+  right: 2px;
+  top: 50%;
+  transform: translateY(-50%);
+}
+.names-progress {
+  height: 2px;
+  margin: 0 8px;
+  background: var(--border);
+  border-radius: 2px;
+  overflow: hidden;
+}
+.names-progress .bar {
+  height: 100%;
+  background: var(--accent);
+  transition: width 200ms ease;
+}
+.spinner.tiny {
+  width: 10px;
+  height: 10px;
+  border-width: 1.5px;
+  flex: 0 0 auto;
+}
+
+/* ---- AI activity feed ---- */
+.ask-activity {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 6px 10px;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg-panel);
+  font-size: 12px;
+}
+.ask-activity-summary {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  align-self: flex-start;
+  border: none;
+  background: transparent;
+  color: var(--text-muted);
+  padding: 2px 4px;
+  cursor: pointer;
+  font: inherit;
+  font-size: 11px;
+}
+.ask-activity-summary:hover {
+  color: var(--text);
+}
+.ask-step {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 20px;
+  padding: 0 4px;
+  white-space: nowrap;
+}
+.ask-step .ask-step-message {
+  color: var(--text);
+}
+.ask-step.running .ask-step-message {
+  color: var(--text-muted);
+}
+.ask-step .ask-step-detail {
+  color: var(--text-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.ask-step.error .ask-step-detail {
+  color: var(--danger);
+}
+.ask-step .ask-step-time {
+  margin-left: auto;
+  color: var(--text-faint);
+  font-family: var(--mono);
+  font-size: 11px;
+}
+.ask-step .step-ok {
+  color: var(--ok);
+}
+.ask-step .step-fail {
+  color: var(--danger);
+}
+.ask-step.controls .spacer {
+  flex: 1;
+}

@@ -161,4 +161,25 @@ export interface AiClarification {
   usage: AiUsage
 }
 
-export type AiResult = AiQueryResult | AiClarification
+export interface AiCancelled {
+  kind: 'cancelled'
+  usage: AiUsage
+}
+
+export type AiResult = AiQueryResult | AiClarification | AiCancelled
+
+export type AiStage = 'index' | 'retrieve' | 'sample' | 'request' | 'tool' | 'check' | 'repair' | 'done' | 'error' | 'cancelled'
+
+/** One step of an ask, streamed to the renderer while the model works. A step is reported twice: running, then done or error. */
+export interface AiProgressEvent {
+  requestId: string
+  seq: number
+  stepId: string
+  stage: AiStage
+  status: 'running' | 'done' | 'error'
+  message: string
+  detail?: string
+  ts: number
+}
+
+export type AiProgressStep = Omit<AiProgressEvent, 'requestId' | 'seq' | 'ts'>

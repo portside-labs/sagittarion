@@ -5,6 +5,7 @@ export type IconName =
   | 'view'
   | 'index'
   | 'trigger'
+  | 'function'
   | 'key'
   | 'chevron-right'
   | 'chevron-down'
@@ -56,6 +57,13 @@ const paths: Record<IconName, ReactNode> = {
     </>
   ),
   trigger: <path d="M13 2L4 14h7l-1 8 9-12h-7l1-8z" />,
+  function: (
+    <>
+      <path d="M15 4c-2.2 0-3.4 1.2-3.8 3.4L9.6 17.2C9.2 19.3 8 20 6 20" />
+      <path d="M7 10h8" />
+      <path d="M14 14l4 6M18 14l-4 6" />
+    </>
+  ),
   key: (
     <>
       <circle cx="8" cy="15" r="4" />

@@ -2,12 +2,21 @@ import { EventEmitter } from 'node:events'
 import { Client, type ClientConfig, type FieldDef } from 'pg'
 import Cursor from 'pg-cursor'
 import type {
+  Catalog,
   CellValue,
+  ColumnHit,
   ColumnInfo,
   ConnectProgress,
   DatabaseInfo,
   ForeignKeyDetail,
   IndexDetail,
+  ListObjectsRequest,
+  ObjectCounts,
+  ObjectDefinition,
+  ObjectKind,
+  ObjectPage,
+  ObjectRef,
+  ObjectSummary,
   PendingChange,
   QueryOptions,
   QueryResponse,
@@ -16,6 +25,7 @@ import type {
   RowsRequest,
   RowsResponse,
   SchemaInfo,
+  SearchResult,
   SslMode,
   StatementResult,
   TableDetails,
@@ -26,6 +36,7 @@ import { formatBytes } from '@shared/export'
 import type { DatabaseDriver } from './driver'
 import { encodeParam, pgTypes, qi, qualify } from './pg-values'
 import { isRowReturning, splitStatements } from './sql-split'
+import { decodeCursor, emptyCounts, encodeCursor, familyOf } from './catalog'
 
 export interface PostgresDriverOptions {
   host: string
@@ -47,6 +58,39 @@ export interface PostgresDriverOptions {
 
 const SCHEMA_FILTER = `n.nspname NOT IN ('pg_catalog', 'information_schema') AND n.nspname NOT LIKE 'pg\\_toast%' AND n.nspname NOT LIKE 'pg\\_temp%'`
 const RELKINDS = `('r', 'p', 'v', 'm', 'f')`
+const RELKIND_SUBTYPE: Record<string, string> = { r: 'table', p: 'partitioned', f: 'foreign', v: 'view', m: 'matview' }
+const FUNCTION_SELECT = `SELECT p.oid::text, n.nspname, p.proname, p.prokind::text, pg_get_function_identity_arguments(p.oid), pg_get_function_result(p.oid), l.lanname, d.description
+       FROM pg_proc p
+       JOIN pg_namespace n ON n.oid = p.pronamespace
+       JOIN pg_language l ON l.oid = p.prolang
+       LEFT JOIN pg_description d ON d.objoid = p.oid AND d.classoid = 'pg_proc'::regclass`
+
+function likePattern(q: string, prefix = false): string {
+  const escaped = q.replace(/[\\%_]/g, (m) => `\\${m}`)
+  return prefix ? `${escaped}%` : `%${escaped}%`
+}
+
+function functionSummary(r: unknown[]): ObjectSummary {
+  const prokind = String(r[3])
+  const returns = (r[5] as string | null) ?? null
+  const subtype = prokind === 'p' ? 'procedure' : prokind === 'a' ? 'aggregate' : prokind === 'w' ? 'window' : returns === 'trigger' ? 'trigger-function' : 'function'
+  return { id: String(r[0]), kind: 'function', schema: String(r[1]), name: String(r[2]), subtype, args: String(r[4] ?? ''), returns, language: String(r[6] ?? ''), comment: (r[7] as string | null) ?? null }
+}
+
+function relationSummary(r: unknown[]): ObjectSummary {
+  const relkind = String(r[3])
+  const est = toNumber(r[5])
+  return {
+    id: String(r[0]),
+    kind: relkind === 'v' || relkind === 'm' ? 'view' : 'table',
+    schema: String(r[1]),
+    name: String(r[2]),
+    subtype: RELKIND_SUBTYPE[relkind] ?? 'table',
+    columnCount: r[4] === null || r[4] === undefined ? null : Number(r[4]),
+    rowEstimate: Number.isFinite(est) && est >= 0 ? Math.round(est) : null,
+    comment: (r[6] as string | null) ?? null
+  }
+}
 const FK_ACTIONS: Record<string, string> = { a: 'NO ACTION', r: 'RESTRICT', c: 'CASCADE', n: 'SET NULL', d: 'SET DEFAULT' }
 
 type Row = any[]
@@ -303,6 +347,249 @@ export class PostgresDriver extends EventEmitter implements DatabaseDriver {
       out.push(meta)
     }
     return out
+  }
+
+
+  // ---------------------------------------------------------------------
+  // Catalog: names first, details on demand
+  // ---------------------------------------------------------------------
+
+  private defaultSchemaCache: string | null = null
+
+  private async defaultSchemaName(): Promise<string> {
+    if (!this.defaultSchemaCache) {
+      const res = await this.q('SELECT current_schema()')
+      this.defaultSchemaCache = (res.rows[0]?.[0] as string | null) || 'public'
+    }
+    return this.defaultSchemaCache
+  }
+
+  async catalog(): Promise<Catalog> {
+    const [schemasRes, currentRes, rels, idx, trg, fns] = await Promise.all([
+      this.q(`SELECT n.nspname FROM pg_namespace n WHERE ${SCHEMA_FILTER} ORDER BY (n.nspname <> 'public'), n.nspname`),
+      this.q('SELECT current_schema()'),
+      this.q(
+        `SELECT n.nspname, count(*) FILTER (WHERE c.relkind IN ('r', 'p', 'f'))::int, count(*) FILTER (WHERE c.relkind IN ('v', 'm'))::int
+         FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+         WHERE c.relkind IN ${RELKINDS} AND ${SCHEMA_FILTER} GROUP BY n.nspname`
+      ),
+      this.q(
+        `SELECT n.nspname, count(*)::int FROM pg_index x JOIN pg_class t ON t.oid = x.indrelid JOIN pg_namespace n ON n.oid = t.relnamespace
+         WHERE NOT x.indisprimary AND ${SCHEMA_FILTER} GROUP BY n.nspname`
+      ),
+      this.q(
+        `SELECT n.nspname, count(*)::int FROM pg_trigger t JOIN pg_class c ON c.oid = t.tgrelid JOIN pg_namespace n ON n.oid = c.relnamespace
+         WHERE NOT t.tgisinternal AND ${SCHEMA_FILTER} GROUP BY n.nspname`
+      ),
+      this.q(`SELECT n.nspname, count(*)::int FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace WHERE ${SCHEMA_FILTER} GROUP BY n.nspname`)
+    ])
+    const counts = new Map<string, ObjectCounts>()
+    for (const r of schemasRes.rows) counts.set(String(r[0]), emptyCounts())
+    for (const r of rels.rows) {
+      const c = counts.get(String(r[0]))
+      if (c) {
+        c.table += Number(r[1])
+        c.view += Number(r[2])
+      }
+    }
+    const add = (rows: Row[], kind: ObjectKind) => {
+      for (const r of rows) {
+        const c = counts.get(String(r[0]))
+        if (c) c[kind] += Number(r[1])
+      }
+    }
+    add(idx.rows, 'index')
+    add(trg.rows, 'trigger')
+    add(fns.rows, 'function')
+    this.defaultSchemaCache = (currentRes.rows[0]?.[0] as string | null) || 'public'
+    const schemas = [...counts.entries()].map(([name, c]) => ({ name, counts: c }))
+    let totalObjects = 0
+    let totalTables = 0
+    for (const s of schemas) {
+      totalTables += s.counts.table + s.counts.view
+      totalObjects += s.counts.table + s.counts.view + s.counts.function + s.counts.index + s.counts.trigger
+    }
+    return { kind: 'postgres', defaultSchema: this.defaultSchemaCache, schemas, totalObjects, totalTables }
+  }
+
+  async listObjects(req: ListObjectsRequest): Promise<ObjectPage> {
+    const family = familyOf(req.kinds)
+    const limit = Math.min(Math.max(req.limit ?? 2000, 1), 20000)
+    const after = decodeCursor<string[]>(req.cursor)
+    const params: unknown[] = []
+    const p = (v: unknown) => {
+      params.push(v)
+      return `$${params.length}`
+    }
+    const conds: string[] = [SCHEMA_FILTER]
+    if (req.schema) conds.push(`n.nspname = ${p(req.schema)}`)
+    let sql: string
+    let map: (r: Row) => ObjectSummary
+    let keyOf: (o: ObjectSummary) => string[]
+    if (family === 'relation') {
+      const kinds = new Set(req.kinds)
+      const relkinds = [...(kinds.has('table') ? ['r', 'p', 'f'] : []), ...(kinds.has('view') ? ['v', 'm'] : [])]
+      conds.push(`c.relkind IN (${relkinds.map((k) => `'${k}'`).join(', ')})`)
+      if (after) conds.push(`(n.nspname, c.relname) > (${p(after[0])}, ${p(after[1])})`)
+      sql = `SELECT c.oid::text, n.nspname, c.relname, c.relkind::text, c.relnatts::int, c.reltuples::float8, d.description
+             FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+             LEFT JOIN pg_description d ON d.objoid = c.oid AND d.classoid = 'pg_class'::regclass AND d.objsubid = 0
+             WHERE ${conds.join(' AND ')} ORDER BY n.nspname, c.relname LIMIT ${p(limit + 1)}`
+      map = relationSummary
+      keyOf = (o) => [o.schema!, o.name]
+    } else if (family === 'index') {
+      conds.push('NOT x.indisprimary')
+      if (after) conds.push(`(n.nspname, t.relname, i.relname) > (${p(after[0])}, ${p(after[1])}, ${p(after[2])})`)
+      sql = `SELECT i.oid::text, n.nspname, i.relname, t.relname
+             FROM pg_index x JOIN pg_class i ON i.oid = x.indexrelid JOIN pg_class t ON t.oid = x.indrelid JOIN pg_namespace n ON n.oid = t.relnamespace
+             WHERE ${conds.join(' AND ')} ORDER BY n.nspname, t.relname, i.relname LIMIT ${p(limit + 1)}`
+      map = (r) => ({ id: String(r[0]), kind: 'index', schema: String(r[1]), name: String(r[2]), table: String(r[3]) })
+      keyOf = (o) => [o.schema!, o.table!, o.name]
+    } else if (family === 'trigger') {
+      conds.push('NOT t.tgisinternal')
+      if (after) conds.push(`(n.nspname, c.relname, t.tgname) > (${p(after[0])}, ${p(after[1])}, ${p(after[2])})`)
+      sql = `SELECT t.oid::text, n.nspname, t.tgname, c.relname
+             FROM pg_trigger t JOIN pg_class c ON c.oid = t.tgrelid JOIN pg_namespace n ON n.oid = c.relnamespace
+             WHERE ${conds.join(' AND ')} ORDER BY n.nspname, c.relname, t.tgname LIMIT ${p(limit + 1)}`
+      map = (r) => ({ id: String(r[0]), kind: 'trigger', schema: String(r[1]), name: String(r[2]), table: String(r[3]) })
+      keyOf = (o) => [o.schema!, o.table!, o.name]
+    } else {
+      if (after) conds.push(`(n.nspname, p.proname, p.oid) > (${p(after[0])}, ${p(after[1])}, ${p(after[2])}::oid)`)
+      sql = `${FUNCTION_SELECT} WHERE ${conds.join(' AND ')} ORDER BY n.nspname, p.proname, p.oid LIMIT ${p(limit + 1)}`
+      map = functionSummary
+      keyOf = (o) => [o.schema!, o.name, o.id]
+    }
+    const res = await this.q(sql, params)
+    const items = res.rows.slice(0, limit).map(map)
+    const more = res.rows.length > limit
+    return { items, cursor: more && items.length ? encodeCursor(keyOf(items[items.length - 1])) : null }
+  }
+
+  async searchObjects(query: string, limit = 100): Promise<SearchResult> {
+    const q = query.trim()
+    if (!q) return { query, objects: [], columns: [], truncated: false }
+    const lim = Math.min(Math.max(limit, 1), 500)
+    const params = [likePattern(q), likePattern(q, true), lim + 1]
+    const [rels, idx, trg, fns, cols] = await Promise.all([
+      this.q(
+        `SELECT c.oid::text, n.nspname, c.relname, c.relkind::text, c.relnatts::int, c.reltuples::float8, NULL
+         FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+         WHERE c.relkind IN ${RELKINDS} AND ${SCHEMA_FILTER} AND c.relname ILIKE $1
+         ORDER BY (c.relname ILIKE $2) DESC, n.nspname, c.relname LIMIT $3`,
+        params
+      ),
+      this.q(
+        `SELECT i.oid::text, n.nspname, i.relname, t.relname
+         FROM pg_index x JOIN pg_class i ON i.oid = x.indexrelid JOIN pg_class t ON t.oid = x.indrelid JOIN pg_namespace n ON n.oid = t.relnamespace
+         WHERE NOT x.indisprimary AND ${SCHEMA_FILTER} AND i.relname ILIKE $1
+         ORDER BY (i.relname ILIKE $2) DESC, n.nspname, i.relname LIMIT $3`,
+        params
+      ),
+      this.q(
+        `SELECT t.oid::text, n.nspname, t.tgname, c.relname
+         FROM pg_trigger t JOIN pg_class c ON c.oid = t.tgrelid JOIN pg_namespace n ON n.oid = c.relnamespace
+         WHERE NOT t.tgisinternal AND ${SCHEMA_FILTER} AND t.tgname ILIKE $1
+         ORDER BY (t.tgname ILIKE $2) DESC, n.nspname, t.tgname LIMIT $3`,
+        params
+      ),
+      this.q(`${FUNCTION_SELECT} WHERE ${SCHEMA_FILTER} AND p.proname ILIKE $1 ORDER BY (p.proname ILIKE $2) DESC, n.nspname, p.proname LIMIT $3`, params),
+      this.q(
+        `SELECT n.nspname, c.relname, c.relkind::text, c.oid::text, a.attname, format_type(a.atttypid, a.atttypmod)
+         FROM pg_attribute a JOIN pg_class c ON c.oid = a.attrelid JOIN pg_namespace n ON n.oid = c.relnamespace
+         WHERE a.attnum > 0 AND NOT a.attisdropped AND c.relkind IN ${RELKINDS} AND ${SCHEMA_FILTER} AND a.attname ILIKE $1
+         ORDER BY (a.attname ILIKE $2) DESC, n.nspname, c.relname, a.attnum LIMIT $3`,
+        params
+      )
+    ])
+    const objects: ObjectSummary[] = [
+      ...rels.rows.slice(0, lim).map(relationSummary),
+      ...fns.rows.slice(0, lim).map(functionSummary),
+      ...idx.rows.slice(0, lim).map<ObjectSummary>((r) => ({ id: String(r[0]), kind: 'index', schema: String(r[1]), name: String(r[2]), table: String(r[3]) })),
+      ...trg.rows.slice(0, lim).map<ObjectSummary>((r) => ({ id: String(r[0]), kind: 'trigger', schema: String(r[1]), name: String(r[2]), table: String(r[3]) }))
+    ]
+    const columns: ColumnHit[] = cols.rows.slice(0, lim).map((r) => {
+      const relkind = String(r[2])
+      return { schema: String(r[0]), table: String(r[1]), tableKind: relkind === 'v' || relkind === 'm' ? 'view' : 'table', tableId: String(r[3]), column: String(r[4]), type: String(r[5]) }
+    })
+    const truncated = [rels, idx, trg, fns, cols].some((res) => res.rows.length > lim)
+    return { query, objects, columns, truncated }
+  }
+
+  async definition(ref: ObjectRef): Promise<ObjectDefinition> {
+    const schema = ref.schema ?? (await this.defaultSchemaName())
+    if (ref.kind === 'table' || ref.kind === 'view') {
+      const meta = await this.loadRelation({ schema, name: ref.name })
+      return { ...ref, schema, sql: meta.sql }
+    }
+    if (ref.kind === 'index') {
+      const res = ref.id
+        ? await this.q('SELECT pg_get_indexdef($1::oid)', [ref.id])
+        : await this.q('SELECT pg_get_indexdef(i.oid) FROM pg_class i JOIN pg_namespace n ON n.oid = i.relnamespace WHERE n.nspname = $1 AND i.relname = $2', [schema, ref.name])
+      return { ...ref, schema, sql: (res.rows[0]?.[0] as string | null) ?? null }
+    }
+    if (ref.kind === 'trigger') {
+      const res = ref.id
+        ? await this.q('SELECT pg_get_triggerdef($1::oid, true)', [ref.id])
+        : await this.q(
+            `SELECT pg_get_triggerdef(t.oid, true) FROM pg_trigger t JOIN pg_class c ON c.oid = t.tgrelid JOIN pg_namespace n ON n.oid = c.relnamespace
+             WHERE n.nspname = $1 AND t.tgname = $2 AND NOT t.tgisinternal ORDER BY c.relname LIMIT 1`,
+            [schema, ref.name]
+          )
+      return { ...ref, schema, sql: (res.rows[0]?.[0] as string | null) ?? null }
+    }
+    try {
+      const res = ref.id
+        ? await this.q('SELECT pg_get_functiondef($1::oid)', [ref.id])
+        : await this.q('SELECT pg_get_functiondef(p.oid) FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace WHERE n.nspname = $1 AND p.proname = $2 ORDER BY p.oid LIMIT 1', [schema, ref.name])
+      return { ...ref, schema, sql: (res.rows[0]?.[0] as string | null) ?? null }
+    } catch (err) {
+      // Aggregates have no CREATE FUNCTION form.
+      return { ...ref, schema, sql: `-- Definition unavailable: ${pgErrorMessage(err)}` }
+    }
+  }
+
+  async tablesMeta(refs: TableRef[]): Promise<TableMeta[]> {
+    if (!refs.length) return []
+    const def = await this.defaultSchemaName()
+    const out: TableMeta[] = []
+    for (let i = 0; i < refs.length; i += 200) {
+      const batch = refs.slice(i, i + 200)
+      const params: unknown[] = []
+      const tuples = batch.map((r) => {
+        params.push(r.schema ?? def, r.name)
+        return `($${params.length - 1}, $${params.length})`
+      })
+      out.push(...(await this.loadRelations(`(n.nspname, c.relname) IN (${tuples.join(', ')})`, params)).map(stripOid))
+    }
+    return out
+  }
+
+  async relationsFor(refs: TableRef[]): Promise<Relation[]> {
+    if (!refs.length) return []
+    const def = await this.defaultSchemaName()
+    const params: unknown[] = []
+    const tuples = refs.slice(0, 500).map((r) => {
+      params.push(r.schema ?? def, r.name)
+      return `($${params.length - 1}, $${params.length})`
+    })
+    const oids = await this.q(`SELECT c.oid::text FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE (n.nspname, c.relname) IN (${tuples.join(', ')})`, params)
+    const ids = oids.rows.map((r) => String(r[0]))
+    if (!ids.length) return []
+    const res = await this.q(
+      `SELECT n.nspname, c.relname, a.attname, fn.nspname, fc.relname, fa.attname
+       FROM pg_constraint con
+       JOIN pg_class c ON c.oid = con.conrelid
+       JOIN pg_namespace n ON n.oid = c.relnamespace
+       JOIN pg_class fc ON fc.oid = con.confrelid
+       JOIN pg_namespace fn ON fn.oid = fc.relnamespace
+       CROSS JOIN LATERAL unnest(con.conkey, con.confkey) WITH ORDINALITY AS k(attnum, fattnum, ord)
+       JOIN pg_attribute a ON a.attrelid = con.conrelid AND a.attnum = k.attnum
+       JOIN pg_attribute fa ON fa.attrelid = con.confrelid AND fa.attnum = k.fattnum
+       WHERE con.contype = 'f' AND (con.conrelid = ANY($1::oid[]) OR con.confrelid = ANY($1::oid[]))
+       ORDER BY n.nspname, c.relname, con.oid, k.ord`,
+      [ids]
+    )
+    return res.rows.map((r) => ({ schema: String(r[0]), table: String(r[1]), column: String(r[2]), refSchema: String(r[3]), refTable: String(r[4]), refColumn: r[5] === null ? null : String(r[5]) }))
   }
 
   async schema(): Promise<SchemaInfo> {

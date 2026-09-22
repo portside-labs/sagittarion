@@ -1,6 +1,8 @@
 import { describe, expect, it } from 'vitest'
 import type { ColumnInfo, QueryResponse, Relation, SchemaInfo, TableMeta, TableRef } from '../src/shared/types'
-import { SchemaIndex, compactType, estimateTokens, tokenize } from '../src/main/ai/schema-index'
+import { SchemaIndex, compactType, estimateTokens, tokenize, type SchemaSource } from '../src/main/ai/schema-index'
+import { relationsFromSchema, searchSchema, summarizeTable, tablesFromSchema } from '../src/main/db/catalog'
+import type { AiProgressStep } from '../src/shared/ai'
 import { checkReadOnlySql, explainStatement } from '../src/main/ai/guard'
 import { askDatabase, type AskDeps } from '../src/main/ai/nl2sql'
 import { OpenAiCompatibleProvider } from '../src/main/ai/providers/openai'
@@ -60,30 +62,30 @@ describe('schema index', () => {
     expect(compactType('numeric(12,2)')).toBe('numeric')
   })
 
-  it('renders one compact line per table with keys, foreign keys, samples and row estimates', () => {
-    const index = new SchemaIndex(shopSchema(), 'sqlite')
+  it('renders one compact line per table with keys, foreign keys, samples and row estimates', async () => {
+    const index = SchemaIndex.fromSchema(shopSchema(), 'sqlite')
     index.samples.set('orders', { status: ['paid', 'pending', 'refunded'] })
     const line = index.lineFor('orders')
     expect(line).toBe('orders(id int pk, user_id int fk->users.id, status text {paid|pending|refunded}, total numeric, placed_at timestamp) ~250k rows')
     expect(index.lineFor('users')).toContain('~12k rows')
-    expect(index.describe('orders')).toContain('referenced by: order_items.order_id, invoices.order_id')
+    expect(await index.describe('orders')).toContain('referenced by: order_items.order_id, invoices.order_id')
     expect(index.tables.get('orders')!.neighbors).toEqual(new Set(['users', 'order_items', 'invoices']))
   })
 
-  it('sends the whole schema when it fits the budget', () => {
-    const index = new SchemaIndex(shopSchema(), 'sqlite')
-    const sel = index.select('how many users are on the pro plan', 8000)
+  it('sends the whole schema when it fits the budget', async () => {
+    const index = SchemaIndex.fromSchema(shopSchema(), 'sqlite')
+    const sel = await index.select('how many users are on the pro plan', 8000)
     expect(sel.mode).toBe('all')
     expect(sel.keys.length).toBe(7)
     expect(sel.tokens).toBe(index.totalTokens)
     expect(estimateTokens(index.render(sel, 'x'))).toBeLessThanOrEqual(8000)
   })
 
-  it('retrieves the relevant tables from a huge schema and expands along foreign keys', () => {
-    const index = new SchemaIndex(shopSchema(300), 'sqlite')
+  it('retrieves the relevant tables from a huge schema and expands along foreign keys', async () => {
+    const index = SchemaIndex.fromSchema(shopSchema(300), 'sqlite')
     expect(index.tables.size).toBe(307)
     expect(index.totalTokens).toBeGreaterThan(4000)
-    const sel = index.select('total invoice amount per customer email for paid invoices', 4000)
+    const sel = await index.select('total invoice amount per customer email for paid invoices', 4000)
     expect(sel.mode).toBe('retrieved')
     expect(sel.tokens).toBeLessThanOrEqual(4000)
     expect(sel.keys).toEqual(expect.arrayContaining(['invoices', 'users', 'orders']))
@@ -93,24 +95,24 @@ describe('schema index', () => {
     expect(rendered.split('\n')).toEqual([...rendered.split('\n')].sort()) // stable order for caching
   })
 
-  it('adapts the number of tables to the budget and boosts recently used tables', () => {
-    const index = new SchemaIndex(shopSchema(300), 'sqlite')
+  it('adapts the number of tables to the budget and boosts recently used tables', async () => {
+    const index = SchemaIndex.fromSchema(shopSchema(300), 'sqlite')
     // A question matching hundreds of tables fills whatever budget it is given.
-    const small = index.select('misc values and notes updated', 600)
-    const large = index.select('misc values and notes updated', 3000)
+    const small = await index.select('misc values and notes updated', 600)
+    const large = await index.select('misc values and notes updated', 3000)
     expect(small.tokens).toBeLessThanOrEqual(600)
     expect(large.tokens).toBeLessThanOrEqual(3000)
     expect(small.keys.length).toBeLessThan(large.keys.length)
     expect(large.keys.length).toBeGreaterThan(20)
     // A specific question stays focused: the matches, their neighbours, and no padding with unrelated tables.
-    const focused = index.select('products in each category', 3000)
+    const focused = await index.select('products in each category', 3000)
     expect(focused.keys).toEqual(expect.arrayContaining(['products', 'categories', 'order_items']))
     expect(focused.keys.some((k) => k.startsWith('misc_'))).toBe(false)
     // Recently used tables are kept in view for follow-up questions.
-    const boosted = index.select('anything at all really', 600, { recentKeys: ['audit_log'] })
+    const boosted = await index.select('anything at all really', 600, { recentKeys: ['audit_log'] })
     expect(boosted.keys).toContain('audit_log')
     // With no match at all, the most connected tables are the best guess.
-    const hubs = index.select('zzz qqq', 400)
+    const hubs = await index.select('zzz qqq', 400)
     expect(hubs.keys).toContain('orders')
   })
 
@@ -125,7 +127,7 @@ describe('schema index', () => {
       triggers: [],
       relations: [{ schema: 'public', table: 'wide', column: 'account_id', refSchema: 'public', refTable: 'accounts', refColumn: 'id' }]
     }
-    const index = new SchemaIndex(schema, 'postgres')
+    const index = SchemaIndex.fromSchema(schema, 'postgres')
     expect([...index.tables.keys()]).toEqual(['wide', 'accounts', 'analytics.events'])
     const short = index.lineFor('wide', { full: false, matchTerms: tokenize('churn risk') })
     expect(short).toContain('account_id int fk->accounts.id')
@@ -137,8 +139,60 @@ describe('schema index', () => {
     expect(index.find('public.accounts')?.key).toBe('accounts')
   })
 
+  it('loads columns and keys only for the tables a question needs', async () => {
+    const schema = shopSchema(3000)
+    const calls = { meta: [] as string[], rel: [] as string[], search: [] as string[] }
+    const source: SchemaSource = {
+      listTables: async () => [...schema.tables, ...schema.views].map(summarizeTable),
+      tablesMeta: async (refs) => {
+        calls.meta.push(...refs.map((r) => r.name))
+        return tablesFromSchema(schema, refs)
+      },
+      relationsFor: async (refs) => {
+        calls.rel.push(...refs.map((r) => r.name))
+        return relationsFromSchema(schema, refs)
+      },
+      searchColumns: async (q, limit) => {
+        calls.search.push(q)
+        return searchSchema(schema, q, limit).columns
+      }
+    }
+    const index = await SchemaIndex.create(source, 'sqlite', undefined)
+    expect(index.tables.size).toBe(3007)
+    expect(calls.meta).toEqual([]) // nothing is described up front on a big schema
+    expect(index.totalTokens).toBeGreaterThan(50_000)
+    const sel = await index.select('paid invoices per customer email', 3000)
+    expect(sel.mode).toBe('retrieved')
+    expect(sel.keys).toEqual(expect.arrayContaining(['invoices', 'orders', 'users']))
+    expect(calls.meta.length).toBeLessThan(200)
+    expect(calls.meta).toEqual(expect.arrayContaining(['invoices', 'orders', 'users']))
+    expect(calls.rel).toContain('invoices')
+    expect(index.lineFor('invoices')).toContain('order_id int fk->orders.id')
+    // Once columns are known they count towards ranking.
+    expect(index.rank('email')[0]?.key).toBe('users')
+    // search_schema falls through to the database's column search for words that are not table names.
+    const lines = await index.search('sku', 5)
+    expect(calls.search).toContain('sku')
+    expect(lines.some((l) => l.startsWith('products('))).toBe(true)
+    expect(await index.describe('categories')).toContain('referenced by: products.category_id')
+  })
+
+  it('preloads small schemas whole through a source', async () => {
+    const schema = shopSchema()
+    const source: SchemaSource = {
+      listTables: async () => [...schema.tables, ...schema.views].map(summarizeTable),
+      tablesMeta: async (refs) => tablesFromSchema(schema, refs),
+      relationsFor: async (refs) => relationsFromSchema(schema, refs)
+    }
+    const index = await SchemaIndex.create(source, 'sqlite', undefined)
+    expect([...index.tables.values()].every((t) => t.meta && t.relationsLoaded)).toBe(true)
+    const sel = await index.select('anything', 8000)
+    expect(sel.mode).toBe('all')
+    expect(index.lineFor('orders')).toContain('user_id int fk->users.id')
+  })
+
   it('fuses embeddings with keyword search when vectors are available', () => {
-    const index = new SchemaIndex(shopSchema(50), 'sqlite')
+    const index = SchemaIndex.fromSchema(shopSchema(50), 'sqlite')
     const vectors = new Map<string, number[]>()
     for (const key of index.tables.keys()) vectors.set(key, key === 'audit_log' ? [1, 0] : [0, 1])
     index.setEmbeddings(vectors)
@@ -184,7 +238,8 @@ function fakeProvider(script: Script, opts: { supportsEmbeddings?: boolean } = {
     model: 'fake-1',
     supportsEmbeddings: opts.supportsEmbeddings ?? false,
     requests,
-    async complete(req) {
+    async complete(req, signal) {
+      if (signal?.aborted) throw new ProviderError('Cancelled.', 'cancelled')
       requests.push(structuredClone(req))
       return script(req, requests.length)
     },
@@ -207,7 +262,7 @@ function propose(args: Record<string, unknown>, id = 'call_1'): ChatResponse {
 
 function deps(provider: LlmProvider, overrides: Partial<AskDeps> = {}): AskDeps & { ran: string[] } {
   const ran: string[] = []
-  const index = new SchemaIndex(shopSchema(), 'sqlite')
+  const index = SchemaIndex.fromSchema(shopSchema(), 'sqlite')
   return {
     kind: 'sqlite',
     serverVersion: '3.45.1',
@@ -354,7 +409,7 @@ describe('ask orchestrator', () => {
 
   it('retrieves a subset and uses embeddings when the schema is larger than the budget', async () => {
     const provider = fakeProvider(() => propose({ sql: 'SELECT count(*) FROM invoices', explanation: 'x', tables_used: ['invoices'] }), { supportsEmbeddings: true })
-    const index = new SchemaIndex(shopSchema(300), 'sqlite')
+    const index = SchemaIndex.fromSchema(shopSchema(300), 'sqlite')
     const d = deps(provider, { index, settings: { sendSampleValues: false, autoRun: true, schemaBudgetTokens: 4000, embeddingModel: 'fake-embed' } })
     const res = await askDatabase(d, 'how many invoices were paid')
     expect(res.kind).toBe('query')
@@ -364,6 +419,37 @@ describe('ask orchestrator', () => {
     expect(res.context.schemaTokens).toBeLessThanOrEqual(4000)
     expect(provider.requests[0].system[1].text).toMatch(/## Schema excerpt \(\d+ of 307 tables/)
     expect(provider.requests[0].system[1].text).toContain('invoices(')
+  })
+
+  it('reports each step while it works', async () => {
+    const provider = fakeProvider((_req, call) =>
+      call === 1 ? reply({ toolCalls: [{ id: 'c1', name: 'describe_table', args: { table: 'orders' } }] }) : propose({ sql: 'SELECT count(*) FROM orders', explanation: 'x', tables_used: ['orders'] })
+    )
+    const steps: AiProgressStep[] = []
+    const d = deps(provider, { onProgress: (s) => steps.push(s) })
+    const res = await askDatabase(d, 'how many orders')
+    expect(res.kind).toBe('query')
+    const finished = steps.filter((s) => s.status !== 'running')
+    expect(finished.map((s) => s.stage)).toEqual(['retrieve', 'request', 'tool', 'request', 'check', 'done'])
+    expect(finished[0].detail).toMatch(/all 7 tables/)
+    expect(finished[2].message).toContain('describe orders')
+    expect(finished[2].detail).toBe('5 columns')
+    expect(finished[4].detail).toBe('EXPLAIN passed')
+    for (const s of steps.filter((x) => x.status === 'running')) expect(finished.some((f) => f.stepId === s.stepId)).toBe(true)
+  })
+
+  it('stops when cancelled and says so', async () => {
+    const controller = new AbortController()
+    const provider = fakeProvider(() => {
+      controller.abort()
+      return reply({ toolCalls: [{ id: 'c1', name: 'search_schema', args: { query: 'invoice' } }] })
+    })
+    const steps: AiProgressStep[] = []
+    const d = deps(provider, { onProgress: (s) => steps.push(s), signal: controller.signal })
+    const res = await askDatabase(d, 'how many invoices')
+    expect(res.kind).toBe('cancelled')
+    expect(provider.requests.length).toBe(1)
+    expect(steps[steps.length - 1]).toMatchObject({ stage: 'cancelled', status: 'done' })
   })
 
   it('handles empty input without calling the provider', async () => {
