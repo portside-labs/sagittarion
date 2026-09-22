@@ -6,6 +6,8 @@ export type IconName =
   | 'index'
   | 'trigger'
   | 'function'
+  | 'grip'
+  | 'layout'
   | 'key'
   | 'chevron-right'
   | 'chevron-down'
@@ -57,6 +59,22 @@ const paths: Record<IconName, ReactNode> = {
     </>
   ),
   trigger: <path d="M13 2L4 14h7l-1 8 9-12h-7l1-8z" />,
+  grip: (
+    <>
+      <circle cx="9" cy="6" r="1.4" fill="currentColor" stroke="none" />
+      <circle cx="15" cy="6" r="1.4" fill="currentColor" stroke="none" />
+      <circle cx="9" cy="12" r="1.4" fill="currentColor" stroke="none" />
+      <circle cx="15" cy="12" r="1.4" fill="currentColor" stroke="none" />
+      <circle cx="9" cy="18" r="1.4" fill="currentColor" stroke="none" />
+      <circle cx="15" cy="18" r="1.4" fill="currentColor" stroke="none" />
+    </>
+  ),
+  layout: (
+    <>
+      <rect x="3" y="3" width="18" height="18" rx="2" />
+      <path d="M3 12h18M14 3v18" />
+    </>
+  ),
   function: (
     <>
       <path d="M15 4c-2.2 0-3.4 1.2-3.8 3.4L9.6 17.2C9.2 19.3 8 20 6 20" />

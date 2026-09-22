@@ -237,8 +237,9 @@ async function main() {
     await page.getByTestId('new-query-tab').click()
     const cm = page.locator('.tab-pane:not([hidden]) .query-tab .cm-content')
     await cm.waitFor()
-    // Without a configured provider the Ask bar explains what is needed and opens Settings.
-    assert((await page.getByTestId('ask-needs-key').count()) === 1, 'ask bar offers to set up a provider')
+    // The chat beside the editor: without a configured provider it offers Settings, and it collapses out of the way.
+    await page.getByTestId('ask-panel').waitFor()
+    assert((await page.getByTestId('ask-needs-key').count()) === 1, 'chat offers to set up a provider')
     await page.getByTestId('ask-input').fill('how many users are admins')
     await page.getByTestId('ask-button').click()
     await page.getByTestId('settings-dialog').waitFor()
@@ -248,6 +249,43 @@ async function main() {
     await shot('06a-ask-needs-key')
     await page.keyboard.press('Escape')
     await page.waitForFunction(() => !document.querySelector('[data-testid=settings-dialog]'))
+    await page.getByTestId('ask-collapse').click()
+    await page.waitForFunction(() => !document.querySelector('[data-testid=ask-panel]'))
+    await page.getByTestId('ask-strip').waitFor()
+    await shot('06b-ask-collapsed')
+    await page.getByTestId('ask-strip').click()
+    await page.getByTestId('ask-panel').waitFor()
+    await page.getByTestId('ask-toggle').click()
+    await page.waitForFunction(() => !document.querySelector('[data-testid=ask-panel]'))
+    await page.getByTestId('ask-toggle').click()
+    await page.getByTestId('ask-input').waitFor()
+    // Panes rearrange by dragging their headers: drop the chat on the left edge of the editor.
+    const boxOf = async (id) => await page.getByTestId(id).boundingBox()
+    let [askBox, editorBox] = [await boxOf('ask-panel'), await boxOf('pane-editor')]
+    assert(askBox.x > editorBox.x, 'chat starts to the right of the editor')
+    await page.getByTestId('ask-header').dragTo(page.getByTestId('pane-editor'), { targetPosition: { x: 12, y: 80 } })
+    await page.waitForFunction(() => {
+      const a = document.querySelector('[data-testid=ask-panel]').getBoundingClientRect()
+      const e = document.querySelector('[data-testid=pane-editor]').getBoundingClientRect()
+      return a.x < e.x
+    })
+    await shot('06c-ask-moved')
+    // Drop the results on the top edge of the editor, then reset.
+    await page.getByTestId('results-header').dragTo(page.getByTestId('pane-editor'), { targetPosition: { x: 200, y: 8 } })
+    await page.waitForFunction(() => {
+      const r = document.querySelector('[data-testid=pane-results]').getBoundingClientRect()
+      const e = document.querySelector('[data-testid=pane-editor]').getBoundingClientRect()
+      return r.y < e.y
+    })
+    await page.getByTestId('layout-reset').click()
+    await page.waitForFunction(() => {
+      const a = document.querySelector('[data-testid=ask-panel]').getBoundingClientRect()
+      const e = document.querySelector('[data-testid=pane-editor]').getBoundingClientRect()
+      const r = document.querySelector('[data-testid=pane-results]').getBoundingClientRect()
+      return a.x > e.x && r.y > e.y
+    })
+    ;[askBox, editorBox] = [await boxOf('ask-panel'), await boxOf('pane-editor')]
+    assert(askBox.x > editorBox.x, 'reset puts the chat back to the right')
     await cm.click()
     await page.keyboard.type('SELECT id, name, email, balance FROM users ORDER BY id LIMIT 5;\nSELECT count(*) AS orders FROM orders;')
     await page.keyboard.press(`${mod}+Enter`)

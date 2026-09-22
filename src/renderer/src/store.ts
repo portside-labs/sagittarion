@@ -4,6 +4,7 @@ import type { AiSettings } from '@shared/ai'
 import { sameTable, tableKey, tableLabel } from '@shared/connections'
 import { errorMessage } from './lib/util'
 import { appendNames, emptyNames, groupKey, type GroupState, type NameIndex, type TableState } from './lib/tree'
+import { defaultLayout, isValidLayout, type LayoutNode } from './lib/layout'
 
 export type Tab =
   | { id: string; kind: 'table'; schema?: string; table: string; title: string }
@@ -59,7 +60,12 @@ interface State {
   queryCounter: number
   settings: AiSettings | null
   settingsOpen: boolean
+  /** Arrangement of the editor, chat and results panes in query tabs. */
+  queryLayout: LayoutNode
+  chatOpen: boolean
 
+  setQueryLayout(layout: LayoutNode): void
+  setChatOpen(open: boolean): void
   init(): Promise<void>
   loadSettings(): Promise<void>
   setSettingsOpen(open: boolean): void
@@ -90,6 +96,18 @@ let initialized = false
 let toastSeq = 0
 let namesEpoch = 0
 
+const LAYOUT_KEY = 'queryLayout.v2'
+
+function loadLayout(): LayoutNode {
+  try {
+    const parsed = JSON.parse(localStorage.getItem(LAYOUT_KEY) ?? 'null')
+    if (isValidLayout(parsed)) return parsed
+  } catch {
+    /* fall through */
+  }
+  return defaultLayout()
+}
+
 const emptySearch: SearchState = { query: '', result: null, loading: false }
 
 const emptySession = {
@@ -117,6 +135,26 @@ export const useStore = create<State>()((set, get) => ({
   confirmRequest: null,
   settings: null,
   settingsOpen: false,
+  queryLayout: loadLayout(),
+  chatOpen: localStorage.getItem('askPanelOpen') !== 'false',
+
+  setQueryLayout(layout) {
+    set({ queryLayout: layout })
+    try {
+      localStorage.setItem(LAYOUT_KEY, JSON.stringify(layout))
+    } catch {
+      /* storage is optional */
+    }
+  },
+
+  setChatOpen(open) {
+    set({ chatOpen: open })
+    try {
+      localStorage.setItem('askPanelOpen', String(open))
+    } catch {
+      /* storage is optional */
+    }
+  },
 
   async loadSettings() {
     try {

@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react'
 import type { ConnectionConfig, DatabaseKind, PostgresConfig, SshConfig, SslMode } from '@shared/types'
 import { KIND_LABELS } from '@shared/types'
+import { DbLogo } from '@/components/DbLogo'
 import { describeTarget, newConnection, normalizeConnection, parsePostgresUrl } from '@shared/connections'
 import { useStore } from '@/store'
 import { TitleBar } from '@/components/TitleBar'
@@ -371,7 +372,9 @@ export function ConnectScreen() {
                     <div className="conn-sub">{describeTarget(c)}</div>
                     <div className="conn-sub">{c.kind === 'postgres' ? (c.pg?.tunnel ? `via ssh ${c.ssh.username}@${c.ssh.host}` : KIND_LABELS.postgres) : c.remotePath}</div>
                   </div>
-                  <span className={`kind-badge ${c.kind}`}>{c.kind === 'postgres' ? 'PG' : 'SQLite'}</span>
+                  <span className={`conn-kind ${c.kind}`}>
+                    <DbLogo kind={c.kind} size={20} />
+                  </span>
                   <button className="btn ghost icon small conn-delete" title="Delete" onClick={(e) => void remove(c, e)}>
                     <Icon name="trash" />
                   </button>
@@ -400,15 +403,15 @@ export function ConnectScreen() {
                 <p className="lede">What kind of database do you want to connect to?</p>
                 <div className="kind-chooser">
                   <button type="button" className="kind-card sqlite" onClick={() => chooseKind('sqlite')} data-testid="choose-sqlite">
-                    <span className="kind-icon">
-                      <Icon name="file" size={18} />
+                    <span className="kind-icon sqlite">
+                      <DbLogo kind="sqlite" size={34} />
                     </span>
                     <span className="kind-title">SQLite over SSH</span>
                     <span className="kind-desc">A .db or .sqlite file on a server you can reach with SSH. Queries run on that host; the file never leaves it.</span>
                   </button>
                   <button type="button" className="kind-card postgres" onClick={() => chooseKind('postgres')} data-testid="choose-postgres">
-                    <span className="kind-icon">
-                      <Icon name="database" size={18} />
+                    <span className="kind-icon postgres">
+                      <DbLogo kind="postgres" size={36} />
                     </span>
                     <span className="kind-title">PostgreSQL</span>
                     <span className="kind-desc">A PostgreSQL server reached directly over the network, or through an SSH tunnel when it only listens locally.</span>
@@ -418,7 +421,7 @@ export function ConnectScreen() {
             ) : (
               <>
                 <h1>
-                  <Icon name="database" size={20} />
+                  <DbLogo kind={form.kind} size={22} className="title-logo" />
                   {selectedId ? form.name || 'Connection' : 'New connection'}
                   <span className={`kind-badge ${form.kind}`}>{KIND_LABELS[form.kind]}</span>
                 </h1>
@@ -438,6 +441,7 @@ export function ConnectScreen() {
                     <div className="segmented">
                       {(['sqlite', 'postgres'] as const).map((k) => (
                         <button key={k} type="button" className={form.kind === k ? 'active' : ''} onClick={() => chooseKind(k)}>
+                          <DbLogo kind={k} size={14} />
                           {KIND_LABELS[k]}
                         </button>
                       ))}

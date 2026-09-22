@@ -127,10 +127,13 @@ export interface AiSettingsUpdate {
   schemaBudgetTokens?: number
 }
 
-/** One earlier exchange in the same query tab, sent back so follow-up questions make sense. */
+/** One earlier exchange in the same chat, sent back so follow-up questions make sense. */
 export interface AiTurn {
   question: string
-  sql: string
+  /** The query that answered it, when there was one. */
+  sql?: string
+  /** What the model said instead, e.g. a request for clarification. */
+  answer?: string
 }
 
 export interface AiUsage {

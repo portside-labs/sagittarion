@@ -88,10 +88,18 @@ output in a query tab.
 
 ## Ask in plain English
 
-Every query tab has an *Ask* box. Type a question such as "top 10 customers by
-revenue last quarter", "orders that have no invoice" or "average time from
-signup to first purchase per plan", and the app asks a language model of your
-choice to write the SQL. The generated query is checked before it runs:
+Every query tab has an *Ask* chat beside the editor, above the results. Type
+a question such as "top 10 customers by revenue last quarter", "orders that
+have no invoice" or "average time from signup to first purchase per plan", and
+the app asks a language model of your choice to write the SQL. The query lands
+in the editor and the chat explains it. When the model needs more detail it
+asks in the chat and you reply there. The editor, chat and results are panes
+you can resize by dragging the bars between them and rearrange by dragging a
+pane's header onto an edge of another pane (or onto its middle to swap); a
+label on the highlight says what the drop will do. The chat also collapses to a
+thin strip on the right when you want the whole width for SQL; the layout
+button in the toolbar restores the default, editor above results with the chat
+down the right side. The generated query is checked before it runs:
 
 1. **Read-only by construction.** Only a single `SELECT` (or `WITH ... SELECT`)
    is accepted, and the statement is executed under SQLite's `query_only`
@@ -105,15 +113,15 @@ choice to write the SQL. The generated query is checked before it runs:
    of the schema it saw and how many tokens the request cost. Turn off *Run
    generated queries automatically* in Settings to review the SQL before it runs.
 
-Follow-up questions work: the last few question/SQL pairs in the same tab are
-sent along, so "now only for 2025" refines the previous query. *New topic*
-clears that history.
+Follow-up questions work: the last few exchanges in the same chat, including
+any clarification the model asked for, are sent along, so "now only for 2025"
+refines the previous query. The refresh button in the chat header starts over.
 
-While a question is being answered the Ask bar shows each step as it happens:
+While a question is being answered the chat shows each step as it happens:
 which tables were chosen and why, each request to the model with its token
 counts, every tool the model called and what it got back, the `EXPLAIN` check
 and any repair round. A *Cancel* button stops the run. When it finishes, the
-steps collapse into a one-line summary next to the result that expands on click.
+steps collapse into a one-line summary under the answer that expands on click.
 
 ### Providers
 
@@ -289,3 +297,7 @@ the UI without a real host.
   `Session`).
 - Export covers the rows currently loaded, not whole tables.
 - One connection per window.
+
+## License
+
+MIT. See [LICENSE](LICENSE).

@@ -393,6 +393,11 @@ describe('ask orchestrator', () => {
     const msgs = provider.requests[0].messages
     expect(msgs.map((m) => m.role)).toEqual(['user', 'assistant', 'user'])
     expect(msgs[1].role === 'assistant' ? msgs[1].content : '').toContain('SELECT sum(total) FROM orders')
+    // A clarification exchange is replayed as the model's own words.
+    const again = fakeProvider(() => propose({ sql: 'SELECT count(*) FROM orders', explanation: 'x', tables_used: ['orders'] }))
+    await askDatabase(deps(again), '2025', [{ question: 'sales for that year', answer: 'Which year do you mean?' }])
+    const replay = again.requests[0].messages
+    expect(replay.map((m) => (m.role === 'assistant' ? m.content : m.role))).toEqual(['user', 'Which year do you mean?', 'user'])
   })
 
   it('falls back to JSON answers when the model cannot call tools', async () => {

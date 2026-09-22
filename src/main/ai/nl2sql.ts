@@ -195,9 +195,9 @@ async function run(deps: AskDeps, question: string, history: AiTurn[], usage: Ai
 
   let toolsEnabled = true
   const messages: ChatMessage[] = []
-  for (const turn of history.slice(-4)) {
+  for (const turn of history.slice(-6)) {
     messages.push({ role: 'user', content: turn.question })
-    messages.push({ role: 'assistant', content: `SQL used:\n${turn.sql}` })
+    messages.push({ role: 'assistant', content: turn.sql ? `SQL used:\n${turn.sql}` : (turn.answer ?? '(no answer)') })
   }
   messages.push({ role: 'user', content: question })
 
