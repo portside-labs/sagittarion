@@ -14,10 +14,19 @@ export function floatText(value: string): string {
   return value
 }
 
+export function formatBytes(n: number): string {
+  if (!Number.isFinite(n)) return '?'
+  if (n < 1024) return `${n} B`
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`
+  if (n < 1024 * 1024 * 1024) return `${(n / 1024 / 1024).toFixed(1)} MB`
+  return `${(n / 1024 / 1024 / 1024).toFixed(2)} GB`
+}
+
 /** Plain-text rendering used for CSV export and clipboard copy. NULL becomes an empty string. */
 export function cellToPlainText(v: CellValue): string {
   if (v === null) return ''
   if (typeof v === 'string') return v
+  if (typeof v === 'boolean') return v ? 'true' : 'false'
   if (typeof v === 'number') return String(v)
   if (isTagged(v)) {
     if (v.$type === 'int') return v.value
@@ -29,6 +38,7 @@ export function cellToPlainText(v: CellValue): string {
 
 export function sqlLiteral(v: CellValue): string {
   if (v === null) return 'NULL'
+  if (typeof v === 'boolean') return v ? 'TRUE' : 'FALSE'
   if (typeof v === 'number') return Number.isFinite(v) ? String(v) : 'NULL'
   if (typeof v === 'string') return '\'' + v.replace(/'/g, '\'\'') + '\''
   if (isTagged(v)) {

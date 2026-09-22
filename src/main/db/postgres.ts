@@ -1,0 +1,647 @@
+import { EventEmitter } from 'node:events'
+import { Client, type ClientConfig, type FieldDef } from 'pg'
+import Cursor from 'pg-cursor'
+import type {
+  CellValue,
+  ColumnInfo,
+  ConnectProgress,
+  DatabaseInfo,
+  ForeignKeyDetail,
+  IndexDetail,
+  PendingChange,
+  QueryResponse,
+  RowKey,
+  RowsRequest,
+  RowsResponse,
+  SchemaInfo,
+  SslMode,
+  StatementResult,
+  TableDetails,
+  TableMeta,
+  TableRef
+} from '@shared/types'
+import { formatBytes } from '@shared/export'
+import type { DatabaseDriver } from './driver'
+import { encodeParam, pgTypes, qi, qualify } from './pg-values'
+import { isRowReturning, splitStatements } from './sql-split'
+
+export interface PostgresDriverOptions {
+  host: string
+  port: number
+  database: string
+  user: string
+  password?: string
+  sslMode: SslMode
+  /** Host name to verify the certificate against when connecting through a tunnel. */
+  servername?: string
+  readOnly: boolean
+  /** The server as the user knows it (differs from host/port when tunnelled). */
+  displayHost: string
+  displayPort: number
+  /** "user@host" of the SSH tunnel, if any. */
+  tunnel?: string | null
+  onProgress?: (p: ConnectProgress) => void
+}
+
+const SCHEMA_FILTER = `n.nspname NOT IN ('pg_catalog', 'information_schema') AND n.nspname NOT LIKE 'pg\\_toast%' AND n.nspname NOT LIKE 'pg\\_temp%'`
+const RELKINDS = `('r', 'p', 'v', 'm', 'f')`
+const FK_ACTIONS: Record<string, string> = { a: 'NO ACTION', r: 'RESTRICT', c: 'CASCADE', n: 'SET NULL', d: 'SET DEFAULT' }
+
+type Row = any[]
+
+function sslAttempts(mode: SslMode, servername?: string): (false | Record<string, unknown>)[] {
+  const verify = { rejectUnauthorized: true, ...(servername ? { servername } : {}) }
+  const noVerify = { rejectUnauthorized: false, ...(servername ? { servername } : {}) }
+  switch (mode) {
+    case 'disable':
+      return [false]
+    case 'require':
+      return [noVerify]
+    case 'verify-full':
+      return [verify]
+    default:
+      return [noVerify, false]
+  }
+}
+
+function isNoSslError(err: any): boolean {
+  return /does not support SSL/i.test(String(err?.message ?? ''))
+}
+
+export function pgErrorMessage(err: any): string {
+  let msg = String(err?.message ?? err)
+  if (err?.position) msg += ` (at character ${err.position})`
+  if (err?.detail) msg += `\n${err.detail}`
+  if (err?.hint) msg += `\nHint: ${err.hint}`
+  return msg
+}
+
+export function friendlyPgError(err: any, o: PostgresDriverOptions): Error {
+  const msg = String(err?.message ?? err)
+  const code = err?.code
+  const where = `${o.displayHost}:${o.displayPort}`
+  if (code === '28P01') return new Error(`Password authentication failed for user "${o.user}".`)
+  if (code === '28000') return new Error(`Authentication failed for user "${o.user}": ${msg}`)
+  if (code === '3D000') return new Error(`Database "${o.database}" does not exist on ${where}.`)
+  if (/ECONNREFUSED/.test(msg)) {
+    return new Error(
+      o.tunnel
+        ? `Nothing is listening on ${where} as seen from the SSH host. Check the database host and port used inside the tunnel.`
+        : `Connection refused at ${where}. Is PostgreSQL listening there and accepting TCP connections?`
+    )
+  }
+  if (/ENOTFOUND|EAI_AGAIN/.test(msg)) return new Error(`Host not found: ${o.displayHost}`)
+  if (/ETIMEDOUT|timeout/i.test(msg)) return new Error(`Timed out connecting to ${where}.`)
+  if (/EHOSTUNREACH|ENETUNREACH/.test(msg)) return new Error(`${o.displayHost} is unreachable.`)
+  if (isNoSslError(err)) return new Error('The server does not support SSL. Set SSL mode to "prefer" or "disable".')
+  if (/self[- ]signed|certificate|CERT_|unable to verify|altnames/i.test(msg)) {
+    return new Error(`Certificate verification failed: ${msg}. Use SSL mode "require" to connect without verifying the certificate.`)
+  }
+  if (/no pg_hba.conf entry/i.test(msg)) return new Error(`The server rejected the connection: ${msg}`)
+  return new Error(pgErrorMessage(err))
+}
+
+/** Direct connection to a PostgreSQL server (optionally through a local tunnel port). */
+export class PostgresDriver extends EventEmitter implements DatabaseDriver {
+  readonly kind = 'postgres' as const
+  private readonly opts: PostgresDriverOptions
+  private client: Client | null = null
+  private clientConfig: ClientConfig | null = null
+  private txStatus: 'I' | 'T' | 'E' = 'I'
+  private dbInfo: DatabaseInfo | null = null
+  private readonly typeNames = new Map<number, string>()
+  private closed = false
+
+  constructor(opts: PostgresDriverOptions) {
+    super()
+    this.opts = opts
+  }
+
+  // ---------------------------------------------------------------------
+  // Connection
+  // ---------------------------------------------------------------------
+
+  async connect(): Promise<DatabaseInfo> {
+    const o = this.opts
+    o.onProgress?.({ stage: 'connecting', message: `Connecting to PostgreSQL at ${o.displayHost}:${o.displayPort}…` })
+    const base: ClientConfig = {
+      host: o.host,
+      port: o.port,
+      database: o.database,
+      user: o.user,
+      password: o.password ?? '',
+      connectionTimeoutMillis: 20_000,
+      application_name: 'SQLite SSH',
+      keepAlive: true,
+      types: pgTypes as any
+    }
+    let lastErr: any = null
+    for (const ssl of sslAttempts(o.sslMode, o.servername)) {
+      const client = new Client({ ...base, ssl: ssl as any })
+      try {
+        await client.connect()
+        this.client = client
+        this.clientConfig = { ...base, ssl: ssl as any }
+        break
+      } catch (err) {
+        lastErr = err
+        await client.end().catch(() => undefined)
+        if (!(o.sslMode === 'prefer' && ssl !== false && isNoSslError(err))) throw friendlyPgError(err, o)
+      }
+    }
+    if (!this.client) throw friendlyPgError(lastErr, o)
+    const client = this.client
+    client.on('error', (err: Error) => this.handleClosed(`Connection error: ${err.message}`))
+    client.on('end', () => this.handleClosed('The server closed the connection'))
+    const connection: any = (client as any).connection
+    connection?.on?.('readyForQuery', (msg: any) => {
+      if (msg?.status === 'I' || msg?.status === 'T' || msg?.status === 'E') this.txStatus = msg.status
+    })
+    if (o.readOnly) await client.query('SET default_transaction_read_only = on')
+    o.onProgress?.({ stage: 'opening', message: `Reading database details…` })
+    this.dbInfo = await this.loadInfo()
+    return this.dbInfo
+  }
+
+  private handleClosed(reason: string): void {
+    if (this.closed) return
+    this.closed = true
+    this.emit('closed', reason)
+  }
+
+  private requireClient(): Client {
+    if (!this.client || this.closed) throw new Error('Not connected to PostgreSQL. Reconnect to continue.')
+    return this.client
+  }
+
+  private async q(text: string, values: unknown[] = []): Promise<{ rows: Row[]; fields: FieldDef[]; rowCount: number | null }> {
+    const res = await this.requireClient().query({ text, values, rowMode: 'array', types: pgTypes as any })
+    return { rows: res.rows as Row[], fields: res.fields, rowCount: res.rowCount }
+  }
+
+  private async loadInfo(): Promise<DatabaseInfo> {
+    const o = this.opts
+    const { rows } = await this.q(
+      `SELECT current_database(), current_user, current_setting('server_version'), pg_encoding_to_char(d.encoding)
+       FROM pg_database d WHERE d.datname = current_database()`
+    )
+    const [database, user, version, encoding] = rows[0] ?? [o.database, o.user, '?', '?']
+    const details: { label: string; value: string }[] = [{ label: 'user', value: String(user) }]
+    try {
+      const size = await this.q('SELECT pg_database_size(current_database())')
+      const v = size.rows[0]?.[0]
+      const n = typeof v === 'number' ? v : typeof v === 'object' && v && '$type' in v ? Number((v as any).value) : Number(v)
+      if (Number.isFinite(n)) details.push({ label: 'size', value: formatBytes(n) })
+    } catch {
+      /* no permission */
+    }
+    details.push({ label: 'encoding', value: String(encoding) })
+    let ssl = 'off'
+    try {
+      const r = await this.q('SELECT ssl FROM pg_stat_ssl WHERE pid = pg_backend_pid()')
+      ssl = r.rows[0]?.[0] ? 'on' : 'off'
+    } catch {
+      /* view unavailable */
+    }
+    details.push({ label: 'ssl', value: ssl })
+    if (o.tunnel) details.push({ label: 'tunnel', value: `via ${o.tunnel}` })
+    return {
+      kind: 'postgres',
+      label: `${database} on ${o.displayHost}${o.displayPort !== 5432 ? `:${o.displayPort}` : ''}`,
+      serverVersion: `PostgreSQL ${version}`,
+      readonly: o.readOnly,
+      details
+    }
+  }
+
+  info(): DatabaseInfo | null {
+    return this.dbInfo
+  }
+
+  // ---------------------------------------------------------------------
+  // Schema
+  // ---------------------------------------------------------------------
+
+  private async loadRelations(extraWhere = '', params: unknown[] = []): Promise<TableMeta[]> {
+    const where = `c.relkind IN ${RELKINDS} AND ${SCHEMA_FILTER}${extraWhere ? ` AND ${extraWhere}` : ''}`
+    const rels = await this.q(
+      `SELECT c.oid::text, n.nspname, c.relname, c.relkind,
+              CASE WHEN c.relkind IN ('v', 'm') THEN pg_get_viewdef(c.oid, true) END,
+              obj_description(c.oid, 'pg_class')
+       FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+       WHERE ${where}
+       ORDER BY n.nspname, c.relname`,
+      params
+    )
+    const cols = await this.q(
+      `SELECT a.attrelid::text, a.attnum, a.attname, format_type(a.atttypid, a.atttypmod), a.attnotnull,
+              pg_get_expr(d.adbin, d.adrelid), a.attidentity::text, a.attgenerated::text,
+              COALESCE((SELECT k.ord::int
+                        FROM pg_index i, unnest(i.indkey::int2[]) WITH ORDINALITY AS k(attnum, ord)
+                        WHERE i.indrelid = a.attrelid AND i.indisprimary AND k.attnum = a.attnum
+                        LIMIT 1), 0)
+       FROM pg_attribute a
+       JOIN pg_class c ON c.oid = a.attrelid
+       JOIN pg_namespace n ON n.oid = c.relnamespace
+       LEFT JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum
+       WHERE a.attnum > 0 AND NOT a.attisdropped AND ${where}
+       ORDER BY a.attrelid, a.attnum`,
+      params
+    )
+    const byRel = new Map<string, ColumnInfo[]>()
+    for (const r of cols.rows) {
+      const [reloid, attnum, name, type, notnull, dflt, identity, generated, pk] = r as [string, number, string, string, boolean, string | null, string, string, number]
+      const list = byRel.get(reloid) ?? []
+      let extra: string | undefined
+      let hidden = 0
+      let dfltOut: string | null = dflt
+      if (generated === 's') {
+        extra = 'generated'
+        hidden = 3
+        dfltOut = null
+      } else if (identity === 'a') {
+        extra = 'identity (always)'
+        hidden = 3
+        dfltOut = null
+      } else if (identity === 'd') {
+        extra = 'identity (by default)'
+        dfltOut = null
+      }
+      list.push({ cid: attnum - 1, name, type, notnull: Boolean(notnull), dflt: dfltOut, pk: Number(pk) || 0, hidden, extra })
+      byRel.set(reloid, list)
+    }
+    const out: TableMeta[] = []
+    for (const r of rels.rows) {
+      const [oid, schema, name, relkind, viewdef, comment] = r as [string, string, string, string, string | null, string | null]
+      const columns = byRel.get(oid) ?? []
+      const isView = relkind === 'v' || relkind === 'm'
+      const meta: TableMeta & { oid?: string } = {
+        oid,
+        schema,
+        name,
+        type: isView ? 'view' : 'table',
+        sql: null,
+        columns,
+        withoutRowid: true,
+        rowidAlias: null,
+        pk: columns
+          .filter((c) => c.pk > 0)
+          .sort((a, b) => a.pk - b.pk)
+          .map((c) => c.name),
+        comment
+      }
+      if (isView) {
+        meta.sql = `CREATE ${relkind === 'm' ? 'MATERIALIZED VIEW' : 'VIEW'} ${qualify(meta)} AS\n${viewdef ?? ''}`
+      } else {
+        meta.sql = synthesizeCreate(meta, relkind)
+      }
+      out.push(meta)
+    }
+    return out
+  }
+
+  async schema(): Promise<SchemaInfo> {
+    const [schemasRes, currentRes, relations, indexesRes, triggersRes] = await Promise.all([
+      this.q(`SELECT n.nspname FROM pg_namespace n WHERE ${SCHEMA_FILTER} ORDER BY (n.nspname <> 'public'), n.nspname`),
+      this.q('SELECT current_schema()'),
+      this.loadRelations(),
+      this.q(
+        `SELECT n.nspname, t.relname, i.relname, pg_get_indexdef(x.indexrelid), x.indisprimary
+         FROM pg_index x
+         JOIN pg_class i ON i.oid = x.indexrelid
+         JOIN pg_class t ON t.oid = x.indrelid
+         JOIN pg_namespace n ON n.oid = t.relnamespace
+         WHERE ${SCHEMA_FILTER}
+         ORDER BY n.nspname, t.relname, i.relname`
+      ),
+      this.q(
+        `SELECT n.nspname, c.relname, t.tgname, pg_get_triggerdef(t.oid, true)
+         FROM pg_trigger t
+         JOIN pg_class c ON c.oid = t.tgrelid
+         JOIN pg_namespace n ON n.oid = c.relnamespace
+         WHERE NOT t.tgisinternal AND ${SCHEMA_FILTER}
+         ORDER BY n.nspname, c.relname, t.tgname`
+      )
+    ])
+    const schemas = schemasRes.rows.map((r) => String(r[0]))
+    const defaultSchema = (currentRes.rows[0]?.[0] as string | null) || 'public'
+    return {
+      kind: 'postgres',
+      defaultSchema,
+      schemas,
+      tables: relations.filter((t) => t.type === 'table').map(stripOid),
+      views: relations.filter((t) => t.type === 'view').map(stripOid),
+      indexes: indexesRes.rows
+        .filter((r) => !r[4])
+        .map((r) => ({ schema: String(r[0]), table: String(r[1]), name: String(r[2]), sql: r[3] as string | null, auto: false })),
+      triggers: triggersRes.rows.map((r) => ({ schema: String(r[0]), table: String(r[1]), name: String(r[2]), sql: r[3] as string | null }))
+    }
+  }
+
+  private async loadRelation(ref: TableRef): Promise<TableMeta & { oid?: string }> {
+    const list = await this.loadRelations('n.nspname = $1 AND c.relname = $2', [ref.schema ?? 'public', ref.name])
+    const meta = list[0]
+    if (!meta) throw new Error(`No such table or view: ${ref.schema ? `${ref.schema}.` : ''}${ref.name}`)
+    return meta
+  }
+
+  async tableDetails(ref: TableRef): Promise<TableDetails> {
+    const meta = await this.loadRelation(ref)
+    const oid = meta.oid!
+    const [idx, fks, trg] = await Promise.all([
+      this.q(
+        `SELECT i.relname, x.indisunique, x.indisprimary, (x.indpred IS NOT NULL), pg_get_indexdef(x.indexrelid),
+                (SELECT json_agg(a.attname ORDER BY k.ord)
+                 FROM unnest(x.indkey::int2[]) WITH ORDINALITY AS k(attnum, ord)
+                 LEFT JOIN pg_attribute a ON a.attrelid = x.indrelid AND a.attnum = k.attnum),
+                EXISTS (SELECT 1 FROM pg_constraint con WHERE con.conindid = x.indexrelid AND con.contype = 'u')
+         FROM pg_index x JOIN pg_class i ON i.oid = x.indexrelid
+         WHERE x.indrelid = $1::oid
+         ORDER BY x.indisprimary DESC, i.relname`,
+        [oid]
+      ),
+      this.q(
+        `SELECT con.conname, con.confrelid::regclass::text, con.confupdtype::text, con.confdeltype::text,
+                (SELECT json_agg(a.attname ORDER BY k.ord) FROM unnest(con.conkey) WITH ORDINALITY AS k(attnum, ord)
+                 JOIN pg_attribute a ON a.attrelid = con.conrelid AND a.attnum = k.attnum),
+                (SELECT json_agg(a.attname ORDER BY k.ord) FROM unnest(con.confkey) WITH ORDINALITY AS k(attnum, ord)
+                 JOIN pg_attribute a ON a.attrelid = con.confrelid AND a.attnum = k.attnum)
+         FROM pg_constraint con
+         WHERE con.conrelid = $1::oid AND con.contype = 'f'
+         ORDER BY con.conname`,
+        [oid]
+      ),
+      this.q(
+        `SELECT t.tgname, pg_get_triggerdef(t.oid, true) FROM pg_trigger t
+         WHERE t.tgrelid = $1::oid AND NOT t.tgisinternal ORDER BY t.tgname`,
+        [oid]
+      )
+    ])
+    const indexes: IndexDetail[] = idx.rows.map((r) => ({
+      name: String(r[0]),
+      unique: Boolean(r[1]),
+      origin: r[2] ? 'pk' : r[6] ? 'u' : 'c',
+      partial: Boolean(r[3]),
+      sql: r[4] as string | null,
+      columns: parseJsonArray(r[5])
+    }))
+    const foreignKeys: ForeignKeyDetail[] = []
+    fks.rows.forEach((r, id) => {
+      const from = parseJsonArray(r[4])
+      const to = parseJsonArray(r[5])
+      from.forEach((col, seq) => {
+        foreignKeys.push({
+          id,
+          seq,
+          table: String(r[1]),
+          from: String(col),
+          to: to[seq] ?? null,
+          onUpdate: FK_ACTIONS[String(r[2])] ?? String(r[2]),
+          onDelete: FK_ACTIONS[String(r[3])] ?? String(r[3])
+        })
+      })
+    })
+    return {
+      ...stripOid(meta),
+      indexes,
+      foreignKeys,
+      triggers: trg.rows.map((r) => ({ name: String(r[0]), sql: r[1] as string | null }))
+    }
+  }
+
+  // ---------------------------------------------------------------------
+  // Rows
+  // ---------------------------------------------------------------------
+
+  async count(ref: TableRef, where?: string): Promise<number> {
+    const w = where?.trim()
+    const { rows } = await this.q(`SELECT count(*) FROM ${qualify(ref)}${w ? ` WHERE ${w}` : ''}`)
+    return toNumber(rows[0]?.[0])
+  }
+
+  async rows(req: RowsRequest): Promise<RowsResponse> {
+    const ref: TableRef = { schema: req.schema, name: req.table }
+    const meta = await this.loadRelation(ref)
+    const cols = meta.columns
+    const where = req.where?.trim()
+    let sql = `SELECT ${cols.map((c) => qi(c.name)).join(', ')} FROM ${qualify(ref)}`
+    if (where) sql += ` WHERE ${where}`
+    if (req.orderBy) {
+      if (!cols.some((c) => c.name === req.orderBy)) throw new Error(`Cannot sort by unknown column ${req.orderBy}`)
+      sql += ` ORDER BY ${qi(req.orderBy)} ${req.orderDir === 'desc' ? 'DESC' : 'ASC'}`
+    }
+    sql += ' LIMIT $1 OFFSET $2'
+    const t0 = Date.now()
+    const limit = Math.max(1, Math.min(req.limit || 200, 100_000))
+    const offset = Math.max(0, req.offset || 0)
+    const res = await this.q(sql, [limit, offset])
+    let total: number | null = null
+    if (req.withCount) total = await this.count(ref, where)
+    return {
+      table: req.table,
+      schema: req.schema,
+      columns: cols.map((c) => ({ name: c.name, declType: c.type, pk: c.pk, notnull: c.notnull, dflt: c.dflt, hidden: c.hidden })),
+      rows: res.rows as CellValue[][],
+      rowids: null,
+      rowidAlias: null,
+      pk: meta.pk,
+      isView: meta.type === 'view',
+      total,
+      sql,
+      durationMs: Date.now() - t0,
+      tx: this.txStatus !== 'I'
+    }
+  }
+
+  // ---------------------------------------------------------------------
+  // Queries
+  // ---------------------------------------------------------------------
+
+  private runCursor(stmt: string, maxRows: number): Promise<{ rows: Row[]; fields: FieldDef[]; rowCount: number | null }> {
+    const client = this.requireClient()
+    return new Promise((resolve, reject) => {
+      const cursor = client.query(new Cursor(stmt, [], { rowMode: 'array', types: pgTypes as any }))
+      cursor.read(maxRows + 1, (err: any, rows: any[], result: any) => {
+        if (err) {
+          reject(err)
+          return
+        }
+        cursor.close(() => resolve({ rows, fields: result?.fields ?? [], rowCount: result?.rowCount ?? null }))
+      })
+    })
+  }
+
+  private async resolveTypeNames(fields: FieldDef[]): Promise<void> {
+    const missing = [...new Set(fields.map((f) => f.dataTypeID).filter((oid) => !this.typeNames.has(oid)))]
+    if (!missing.length) return
+    try {
+      const { rows } = await this.q('SELECT o.oid, format_type(o.oid, NULL) FROM unnest($1::oid[]) AS o(oid)', [missing.map(String)])
+      for (const r of rows) this.typeNames.set(Number(r[0]), String(r[1]))
+    } catch {
+      for (const oid of missing) this.typeNames.set(oid, '')
+    }
+  }
+
+  async query(sql: string, params: unknown[] = [], maxRows = 1000): Promise<QueryResponse> {
+    const client = this.requireClient()
+    const statements = splitStatements(sql)
+    const results: StatementResult[] = []
+    const start = Date.now()
+    for (const stmt of statements) {
+      const t0 = Date.now()
+      try {
+        let rows: Row[]
+        let fields: FieldDef[]
+        let rowCount: number | null
+        if (params.length && statements.length === 1) {
+          const res = await client.query({ text: stmt, values: params.map((p) => encodeParam(p as CellValue)), rowMode: 'array', types: pgTypes as any })
+          rows = res.rows
+          fields = res.fields
+          rowCount = res.rowCount
+        } else if (isRowReturning(stmt)) {
+          ;({ rows, fields, rowCount } = await this.runCursor(stmt, maxRows))
+        } else {
+          const res = await client.query({ text: stmt, rowMode: 'array', types: pgTypes as any })
+          rows = res.rows
+          fields = res.fields
+          rowCount = res.rowCount
+        }
+        if (fields && fields.length) {
+          await this.resolveTypeNames(fields)
+          const truncated = rows.length > maxRows
+          const kept = truncated ? rows.slice(0, maxRows) : rows
+          results.push({
+            kind: 'rows',
+            sql: stmt,
+            columns: fields.map((f) => ({ name: f.name, declType: this.typeNames.get(f.dataTypeID) || undefined })),
+            rows: kept as CellValue[][],
+            rowCount: kept.length,
+            truncated,
+            durationMs: Date.now() - t0
+          })
+        } else {
+          results.push({ kind: 'exec', sql: stmt, changes: rowCount ?? 0, lastRowId: null, durationMs: Date.now() - t0 })
+        }
+      } catch (err) {
+        results.push({ kind: 'error', sql: stmt, message: pgErrorMessage(err), durationMs: Date.now() - t0 })
+        break
+      }
+    }
+    return { results, durationMs: Date.now() - start, tx: this.txStatus !== 'I' }
+  }
+
+  async cancel(): Promise<void> {
+    const client = this.client
+    if (!client || !this.clientConfig || this.closed) return
+    const pid = (client as any).processID
+    if (!pid) return
+    const helper = new Client(this.clientConfig)
+    try {
+      await helper.connect()
+      await helper.query('SELECT pg_cancel_backend($1)', [pid])
+    } finally {
+      await helper.end().catch(() => undefined)
+    }
+  }
+
+  // ---------------------------------------------------------------------
+  // Edits
+  // ---------------------------------------------------------------------
+
+  async apply(changes: PendingChange[]): Promise<number> {
+    if (!changes.length) return 0
+    const client = this.requireClient()
+    if (this.txStatus !== 'I') throw new Error('A transaction is already open on this connection. COMMIT or ROLLBACK it first.')
+    await client.query('BEGIN')
+    let index = 0
+    try {
+      for (index = 0; index < changes.length; index++) {
+        const ch = changes[index]
+        const target = qualify({ schema: ch.schema, name: ch.table })
+        if (ch.type === 'update') {
+          const cols = Object.keys(ch.values)
+          if (!cols.length) continue
+          const values = cols.map((c) => encodeParam(ch.values[c]))
+          const sets = cols.map((c, i) => `${qi(c)} = $${i + 1}`)
+          const key = keyClause(ch.key, values.length)
+          const res = await client.query({ text: `UPDATE ${target} SET ${sets.join(', ')} WHERE ${key.where}`, values: [...values, ...key.params] })
+          if (res.rowCount !== 1) throw new Error(`UPDATE matched ${res.rowCount} rows instead of exactly 1`)
+        } else if (ch.type === 'delete') {
+          const key = keyClause(ch.key, 0)
+          const res = await client.query({ text: `DELETE FROM ${target} WHERE ${key.where}`, values: key.params })
+          if (res.rowCount !== 1) throw new Error(`DELETE matched ${res.rowCount} rows instead of exactly 1`)
+        } else {
+          const cols = Object.keys(ch.values)
+          if (cols.length) {
+            await client.query({
+              text: `INSERT INTO ${target} (${cols.map(qi).join(', ')}) VALUES (${cols.map((_, i) => `$${i + 1}`).join(', ')})`,
+              values: cols.map((c) => encodeParam(ch.values[c]))
+            })
+          } else {
+            await client.query(`INSERT INTO ${target} DEFAULT VALUES`)
+          }
+        }
+      }
+      await client.query('COMMIT')
+    } catch (err) {
+      await client.query('ROLLBACK').catch(() => undefined)
+      throw new Error(`${pgErrorMessage(err)} (change ${index + 1} of ${changes.length}). All changes were rolled back.`)
+    }
+    return changes.length
+  }
+
+  async close(): Promise<void> {
+    this.closed = true
+    const client = this.client
+    this.client = null
+    if (client) await client.end().catch(() => undefined)
+  }
+}
+
+function keyClause(key: RowKey, offset: number): { where: string; params: unknown[] } {
+  if ('pk' in key) {
+    const cols = Object.keys(key.pk)
+    if (!cols.length) throw new Error('Row has no primary key; it cannot be addressed safely')
+    return {
+      where: cols.map((c, i) => `${qi(c)} IS NOT DISTINCT FROM $${offset + i + 1}`).join(' AND '),
+      params: cols.map((c) => encodeParam(key.pk[c]))
+    }
+  }
+  throw new Error('PostgreSQL rows must be addressed by primary key')
+}
+
+function stripOid(meta: TableMeta & { oid?: string }): TableMeta {
+  const { oid: _oid, ...rest } = meta
+  return rest
+}
+
+function parseJsonArray(v: unknown): (string | null)[] {
+  if (v === null || v === undefined) return []
+  try {
+    const parsed = typeof v === 'string' ? JSON.parse(v) : v
+    return Array.isArray(parsed) ? parsed.map((x) => (x === null ? null : String(x))) : []
+  } catch {
+    return []
+  }
+}
+
+function toNumber(v: unknown): number {
+  if (typeof v === 'number') return v
+  if (v && typeof v === 'object' && '$type' in (v as any)) return Number((v as any).value)
+  return Number(v)
+}
+
+function synthesizeCreate(meta: TableMeta, relkind: string): string {
+  const lines = meta.columns.map((c) => {
+    let line = `  ${qi(c.name)} ${c.type}`
+    if (c.notnull) line += ' NOT NULL'
+    if (c.extra === 'generated') line += ` GENERATED ALWAYS AS (${c.dflt ?? '…'}) STORED`
+    else if (c.extra === 'identity (always)') line += ' GENERATED ALWAYS AS IDENTITY'
+    else if (c.extra === 'identity (by default)') line += ' GENERATED BY DEFAULT AS IDENTITY'
+    else if (c.dflt) line += ` DEFAULT ${c.dflt}`
+    return line
+  })
+  if (meta.pk.length) lines.push(`  PRIMARY KEY (${meta.pk.map(qi).join(', ')})`)
+  const kind = relkind === 'f' ? 'FOREIGN TABLE' : 'TABLE'
+  return `CREATE ${kind} ${qualify(meta)} (\n${lines.join(',\n')}\n)${relkind === 'p' ? ' PARTITION BY …' : ''};`
+}

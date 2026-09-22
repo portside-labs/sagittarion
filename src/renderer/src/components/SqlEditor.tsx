@@ -2,7 +2,7 @@ import { forwardRef, useEffect, useImperativeHandle, useRef } from 'react'
 import { Compartment, EditorState, Prec } from '@codemirror/state'
 import { EditorView, keymap, placeholder as cmPlaceholder } from '@codemirror/view'
 import { indentWithTab } from '@codemirror/commands'
-import { sql, SQLite } from '@codemirror/lang-sql'
+import { PostgreSQL, sql, SQLite } from '@codemirror/lang-sql'
 import { oneDark } from '@codemirror/theme-one-dark'
 import { basicSetup } from 'codemirror'
 
@@ -17,7 +17,9 @@ interface Props {
   initialValue?: string
   onChange?: (value: string) => void
   onRun?: () => void
-  schema?: Record<string, string[]>
+  schema?: Record<string, any>
+  defaultSchema?: string
+  dialect?: 'sqlite' | 'postgres'
   readOnly?: boolean
   placeholder?: string
   className?: string
@@ -40,7 +42,7 @@ const appTheme = EditorView.theme(
 )
 
 export const SqlEditor = forwardRef<SqlEditorHandle, Props>(function SqlEditor(
-  { initialValue = '', onChange, onRun, schema, readOnly = false, placeholder, className },
+  { initialValue = '', onChange, onRun, schema, defaultSchema, dialect = 'sqlite', readOnly = false, placeholder, className },
   ref
 ) {
   const host = useRef<HTMLDivElement>(null)
@@ -52,7 +54,8 @@ export const SqlEditor = forwardRef<SqlEditorHandle, Props>(function SqlEditor(
   onRunRef.current = onRun
   onChangeRef.current = onChange
 
-  const langExt = (s?: Record<string, string[]>) => sql({ dialect: SQLite, schema: s, upperCaseKeywords: true })
+  const langExt = (s?: Record<string, any>) =>
+    sql({ dialect: dialect === 'postgres' ? PostgreSQL : SQLite, schema: s, defaultSchema, upperCaseKeywords: true })
   const roExt = (ro: boolean) => [EditorState.readOnly.of(ro), EditorView.editable.of(!ro)]
 
   useEffect(() => {
@@ -95,7 +98,8 @@ export const SqlEditor = forwardRef<SqlEditorHandle, Props>(function SqlEditor(
 
   useEffect(() => {
     view.current?.dispatch({ effects: schemaComp.current.reconfigure(langExt(schema)) })
-  }, [schema])
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [schema, defaultSchema, dialect])
 
   useEffect(() => {
     view.current?.dispatch({ effects: roComp.current.reconfigure(roExt(readOnly)) })

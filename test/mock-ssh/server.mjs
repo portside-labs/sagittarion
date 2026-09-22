@@ -7,6 +7,7 @@ const { Server, utils } = ssh2
 import { spawn, spawnSync } from 'node:child_process'
 import { generateKeyPairSync, timingSafeEqual } from 'node:crypto'
 import fs from 'node:fs'
+import net from 'node:net'
 import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -90,6 +91,27 @@ export async function startMockServer(options = {}) {
     })
 
     client.on('ready', () => {
+      client.on('tcpip', (accept, reject, info) => {
+        const socket = net.connect(info.destPort, info.destIP)
+        let stream = null
+        socket.once('connect', () => {
+          stream = accept()
+          socket.pipe(stream).pipe(socket)
+          stream.on('close', () => socket.destroy())
+          socket.on('close', () => stream.close())
+          stream.on('error', () => socket.destroy())
+        })
+        socket.on('error', (err) => {
+          log('forward error', err.message)
+          if (!stream) {
+            try {
+              reject()
+            } catch {
+              /* already handled */
+            }
+          }
+        })
+      })
       client.on('session', (acceptSession) => {
         const session = acceptSession()
         session.on('pty', (accept, reject) => reject && reject())

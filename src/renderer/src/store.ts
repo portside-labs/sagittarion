@@ -1,9 +1,10 @@
 import { create } from 'zustand'
-import type { AppInfo, ConnectionConfig, SchemaInfo, SessionInfo } from '@shared/types'
+import type { AppInfo, ConnectionConfig, SchemaInfo, SessionInfo, TableRef } from '@shared/types'
+import { sameTable, tableLabel } from '@shared/connections'
 import { errorMessage } from './lib/util'
 
 export type Tab =
-  | { id: string; kind: 'table'; table: string; title: string }
+  | { id: string; kind: 'table'; schema?: string; table: string; title: string }
   | { id: string; kind: 'query'; title: string; initialSql: string }
 
 export interface Toast {
@@ -43,7 +44,7 @@ interface State {
   loadConnections(): Promise<void>
   setSession(s: SessionInfo | null): void
   refreshSchema(): Promise<void>
-  openTable(name: string): void
+  openTable(ref: TableRef): void
   newQueryTab(sql?: string, title?: string): void
   closeTab(id: string): Promise<void>
   setActiveTab(id: string): void
@@ -57,6 +58,18 @@ interface State {
 
 let initialized = false
 let toastSeq = 0
+
+const emptySession = {
+  session: null,
+  schema: null,
+  schemaError: null,
+  tabs: [] as Tab[],
+  activeTabId: null,
+  dirtyTabs: {} as Record<string, boolean>,
+  inTransaction: false,
+  status: '',
+  queryCounter: 0
+}
 
 export const useStore = create<State>()((set, get) => ({
   appInfo: null,
@@ -97,11 +110,11 @@ export const useStore = create<State>()((set, get) => ({
       get().toast('error', 'Could not initialise', errorMessage(e))
     }
     await get().loadConnections()
-    window.api.ssh.onClosed((e) => {
+    window.api.session.onClosed((e) => {
       const s = get().session
       if (s && s.sessionId === e.sessionId) {
         get().toast('error', 'Connection closed', e.reason)
-        set({ session: null, schema: null, tabs: [], activeTabId: null, dirtyTabs: {}, inTransaction: false, status: '' })
+        set({ ...emptySession })
         void get().loadConnections()
       }
     })
@@ -116,17 +129,7 @@ export const useStore = create<State>()((set, get) => ({
   },
 
   setSession(session) {
-    set({
-      session,
-      schema: null,
-      schemaError: null,
-      tabs: [],
-      activeTabId: null,
-      dirtyTabs: {},
-      inTransaction: false,
-      status: '',
-      queryCounter: 0
-    })
+    set({ ...emptySession, session })
   },
 
   async refreshSchema() {
@@ -142,14 +145,20 @@ export const useStore = create<State>()((set, get) => ({
     }
   },
 
-  openTable(name) {
-    const { tabs } = get()
-    const existing = tabs.find((t) => t.kind === 'table' && t.table === name)
+  openTable(ref) {
+    const { tabs, schema } = get()
+    const existing = tabs.find((t) => t.kind === 'table' && sameTable({ schema: t.schema, name: t.table }, ref))
     if (existing) {
       set({ activeTabId: existing.id })
       return
     }
-    const tab: Tab = { id: crypto.randomUUID(), kind: 'table', table: name, title: name }
+    const tab: Tab = {
+      id: crypto.randomUUID(),
+      kind: 'table',
+      schema: ref.schema,
+      table: ref.name,
+      title: tableLabel(ref, schema?.defaultSchema)
+    }
     set({ tabs: [...tabs, tab], activeTabId: tab.id })
   },
 
@@ -194,11 +203,11 @@ export const useStore = create<State>()((set, get) => ({
       if (!ok) return
     }
     try {
-      await window.api.ssh.disconnect(session.sessionId)
+      await window.api.session.close(session.sessionId)
     } catch {
       /* already gone */
     }
-    set({ session: null, schema: null, tabs: [], activeTabId: null, dirtyTabs: {}, inTransaction: false, status: '' })
+    set({ ...emptySession })
     await get().loadConnections()
   },
 

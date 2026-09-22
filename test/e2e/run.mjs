@@ -11,6 +11,8 @@ import { fileURLToPath } from 'node:url'
 import ssh2 from 'ssh2'
 const { utils } = ssh2
 import { ensureSampleDb, startMockServer } from '../mock-ssh/server.mjs'
+import { loadFixture } from '../pg-server.mjs'
+import pg from 'pg'
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..')
 const artifacts = path.join(root, 'test', 'e2e', 'artifacts')
@@ -74,6 +76,9 @@ async function main() {
 
   try {
     // ------------------------------------------------------------ connect
+    await page.getByTestId('choose-sqlite').waitFor()
+    await shot('00-choose-kind')
+    await page.getByTestId('choose-sqlite').click()
     await page.getByPlaceholder('Production analytics').fill('E2E mock host')
     await page.getByPlaceholder('db.example.com').fill(server.host)
     await page.locator('input[type=number]').fill(String(server.port))
@@ -184,7 +189,7 @@ async function main() {
     await page.getByTestId('apply-button').click()
     await page.getByTestId('confirm-dialog').waitFor()
     await afterReload(() => page.getByTestId('confirm-ok').click())
-    await page.locator('.toast.success').waitFor({ timeout: 20000 })
+    await page.locator('.toast.success', { hasText: 'Applied 4 changes' }).waitFor({ timeout: 20000 })
     assert((await grid.locator('td[data-r="0"][data-c="1"]').textContent()) === 'Edited via GUI', 'grid shows the applied edit')
     assert(sqlite(db, 'SELECT name FROM users WHERE id = 1') === 'Edited via GUI', 'update reached the database file')
     assert(sqlite(db, 'SELECT email IS NULL FROM users WHERE id = 2') === '1', 'NULL reached the database file')
@@ -247,6 +252,77 @@ async function main() {
     await page.getByTestId('connect-button').waitFor()
     assert((await page.locator('.conn-item').count()) === 1, 'connection was saved')
     await shot('07-back-to-connections')
+
+    // ------------------------------------------------------------ PostgreSQL (when a server is available)
+    if (process.env.PG_URL) {
+      const pgUrl = process.env.PG_URL
+      await loadFixture(pgUrl)
+      const u = new URL(pgUrl)
+      await page.getByTestId('new-connection').click()
+      await page.getByTestId('choose-postgres').click()
+      await page.getByTestId('conn-name').fill('E2E Postgres')
+      await page.getByTestId('pg-host').fill(u.hostname)
+      await page.getByTestId('pg-port').fill(u.port || '5432')
+      await page.getByTestId('pg-database').fill(u.pathname.replace(/^\//, ''))
+      await page.getByTestId('pg-user').fill(decodeURIComponent(u.username))
+      await page.getByTestId('pg-password').fill(decodeURIComponent(u.password))
+      await page.getByTestId('pg-ssl').selectOption('disable')
+      await shot('08-postgres-connect')
+      await page.getByTestId('connect-button').click()
+      await page.getByTestId('tree-table-users').waitFor({ timeout: 30000 })
+      assert((await page.getByTestId('tree-table-analytics.daily_totals').count()) === 1, 'second schema is listed')
+      console.log('postgres connected; schema loaded')
+
+      await page.getByTestId('tree-table-users').click()
+      const pgGrid = page.getByTestId('table-grid')
+      await pgGrid.locator('tbody tr').first().waitFor({ timeout: 20000 })
+      assert((await pgGrid.locator('tbody tr').count()) === 60, 'postgres users grid shows 60 rows')
+      assert((await page.getByTestId('pager-label').textContent()).includes('1–60 of 60'), 'postgres pager label')
+      const pgTab = page.locator('.tab-pane:not([hidden]) .table-tab')
+      const afterPgReload = async (fn) => {
+        const before = Number(await pgTab.getAttribute('data-loads'))
+        await fn()
+        await page.waitForFunction(
+          (b) => Number(document.querySelector('.tab-pane:not([hidden]) .table-tab')?.getAttribute('data-loads')) > b,
+          before,
+          { timeout: 20000 }
+        )
+      }
+      await afterPgReload(() => pgGrid.locator('thead th', { hasText: 'id' }).first().click())
+      // name is column index 1
+      await pgGrid.locator('td[data-r="0"][data-c="1"]').dblclick()
+      await pgGrid.locator('textarea.cell-editor').fill('Edited PG via GUI')
+      await pgGrid.locator('textarea.cell-editor').press('Enter')
+      await pgGrid.locator('td[data-r="0"][data-c="1"].cell-dirty').waitFor()
+      await shot('09-postgres-table')
+      await page.getByTestId('apply-button').click()
+      await page.getByTestId('confirm-dialog').waitFor()
+      await afterPgReload(() => page.getByTestId('confirm-ok').click())
+      await page.locator('.toast.success', { hasText: 'Applied 1 change' }).waitFor({ timeout: 20000 })
+      const check = new pg.Client({ connectionString: pgUrl })
+      await check.connect()
+      const r = await check.query('SELECT name FROM users WHERE id = 1')
+      await check.end()
+      assert(r.rows[0].name === 'Edited PG via GUI', 'postgres edit reached the server')
+
+      await page.getByTestId('new-query-tab').click()
+      const pgCm = page.locator('.tab-pane:not([hidden]) .query-tab .cm-content')
+      await pgCm.waitFor()
+      await pgCm.click()
+      await page.keyboard.type('SELECT id, name, balance, is_admin, tags FROM users ORDER BY id LIMIT 3;')
+      await page.keyboard.press(`${mod}+Enter`)
+      const pgResult = page.getByTestId('result-grid')
+      await pgResult.locator('tbody tr').first().waitFor({ timeout: 20000 })
+      assert((await pgResult.locator('tbody tr').count()) === 3, 'postgres query result has 3 rows')
+      assert((await pgResult.locator('td[data-r="0"][data-c="3"]').textContent()) === 'false', 'boolean renders as false')
+      await shot('10-postgres-query')
+      await page.getByTestId('disconnect-button').click()
+      await page.getByTestId('connect-button').waitFor()
+      assert((await page.locator('.conn-item').count()) === 2, 'postgres connection was saved')
+      console.log('postgres flow passed')
+    } else {
+      console.log('PG_URL not set; skipping the PostgreSQL flow')
+    }
 
     const realErrors = consoleErrors.filter((e) => !/Autofill|DevTools/.test(e))
     if (realErrors.length) {

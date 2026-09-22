@@ -1,5 +1,4 @@
 import { useStore } from '@/store'
-import { formatBytes } from '@/lib/format'
 
 export function StatusBar() {
   const session = useStore((s) => s.session)
@@ -11,17 +10,14 @@ export function StatusBar() {
     <div className="statusbar">
       <span className="status-item">
         <span className="dot ok" />
-        {session.username}@{session.host}
-        {session.port !== 22 ? `:${session.port}` : ''}
+        {session.target}
       </span>
       {db ? (
         <>
-          <span className="status-item mono" title={db.path}>
-            {db.path}
+          <span className="status-item mono" title={db.label}>
+            {db.label}
           </span>
-          <span className="status-item">
-            SQLite {db.sqliteVersion} · {session.interpreter} {db.pythonVersion} · {formatBytes(db.fileSize)} · {db.journalMode}
-          </span>
+          <span className="status-item">{[db.serverVersion, ...db.details.map((d) => `${d.label} ${d.value}`)].join(' · ')}</span>
           {db.readonly ? <span className="status-item status-ro">read-only</span> : null}
         </>
       ) : null}

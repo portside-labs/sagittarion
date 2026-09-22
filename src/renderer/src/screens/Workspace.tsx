@@ -50,10 +50,11 @@ export function Workspace() {
     <div className="app-frame workspace">
       <TitleBar
         left={
-          <span className="session-badge" title={session.db?.path}>
+          <span className="session-badge" title={session.db?.label}>
             <span className="dot ok" style={session.color ? { background: session.color, boxShadow: 'none' } : undefined} />
             <strong>{session.name}</strong>
-            <span className="path">{session.db?.path}</span>
+            <span className={`kind-badge ${session.kind}`}>{session.kind === 'postgres' ? 'PG' : 'SQLite'}</span>
+            <span className="path">{session.db?.label}</span>
           </span>
         }
         right={
@@ -79,7 +80,7 @@ export function Workspace() {
             {tabs.length === 0 ? (
               <div className="empty-state">
                 <Icon name="database" size={34} />
-                <h3>{session.db?.path.split('/').pop()}</h3>
+                <h3>{session.kind === 'sqlite' ? session.db?.label.split('/').pop() : session.db?.label}</h3>
                 <div>Pick a table on the left, or open a query tab.</div>
                 <div className="hints">
                   <span className="kbd">{modKey}T</span>

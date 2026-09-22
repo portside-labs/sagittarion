@@ -12,9 +12,24 @@ jobs:
   test:
     name: Typecheck and integration tests
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: test
+          POSTGRES_PASSWORD: secret
+          POSTGRES_DB: app
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U test -d app"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
     env:
       # These jobs never launch Electron, so skip the ~100 MB binary download.
       ELECTRON_SKIP_BINARY_DOWNLOAD: 1
+      PG_URL: postgres://test:secret@127.0.0.1:5432/app
     steps:
       - uses: actions/checkout@v6
       - uses: actions/setup-node@v6
@@ -29,6 +44,22 @@ jobs:
   e2e:
     name: End-to-end (Electron + Playwright)
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: test
+          POSTGRES_PASSWORD: secret
+          POSTGRES_DB: app
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U test -d app"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      PG_URL: postgres://test:secret@127.0.0.1:5432/app
     steps:
       - uses: actions/checkout@v6
       - uses: actions/setup-node@v6

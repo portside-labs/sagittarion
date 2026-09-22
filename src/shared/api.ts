@@ -11,13 +11,14 @@ import type {
   RowsResponse,
   SchemaInfo,
   SessionInfo,
-  TableDetails
+  TableDetails,
+  TableRef
 } from './types'
 
-export interface ConnectOptions {
-  /** Open the configured remote database after connecting (default true). */
+export interface OpenOptions {
+  /** Open the configured database after connecting (default true). SQLite only; Postgres always opens. */
   openDatabase?: boolean
-  /** Correlates progress events with this connect call. */
+  /** Correlates progress events with this call. */
   requestId?: string
 }
 
@@ -42,18 +43,19 @@ export interface Api {
     save(cfg: ConnectionConfig): Promise<ConnectionConfig>
     remove(id: string): Promise<void>
   }
-  ssh: {
-    connect(cfg: ConnectionConfig, opts?: ConnectOptions): Promise<SessionInfo>
-    disconnect(sessionId: string): Promise<void>
+  session: {
+    open(cfg: ConnectionConfig, opts?: OpenOptions): Promise<SessionInfo>
+    close(sessionId: string): Promise<void>
     onClosed(cb: (e: SessionClosedEvent) => void): Unsubscribe
     onProgress(cb: (e: ConnectProgressEvent) => void): Unsubscribe
   }
   db: {
+    /** SQLite only: open (or switch to) a file on an already connected SSH session. */
     open(sessionId: string, remotePath: string, readOnly: boolean): Promise<DatabaseInfo>
-    schema(sessionId: string, includeSystem?: boolean): Promise<SchemaInfo>
-    tableDetails(sessionId: string, table: string): Promise<TableDetails>
+    schema(sessionId: string): Promise<SchemaInfo>
+    tableDetails(sessionId: string, ref: TableRef): Promise<TableDetails>
     rows(sessionId: string, req: RowsRequest): Promise<RowsResponse>
-    count(sessionId: string, table: string, where?: string): Promise<number>
+    count(sessionId: string, ref: TableRef, where?: string): Promise<number>
     query(sessionId: string, sql: string, params?: unknown[], maxRows?: number): Promise<QueryResponse>
     cancel(sessionId: string): Promise<void>
     apply(sessionId: string, changes: PendingChange[]): Promise<number>

@@ -17,18 +17,18 @@ const api: Api = {
     save: (cfg) => ipcRenderer.invoke('connections:save', cfg),
     remove: (id) => ipcRenderer.invoke('connections:remove', id)
   },
-  ssh: {
-    connect: (cfg, opts) => ipcRenderer.invoke('ssh:connect', cfg, opts ?? {}),
-    disconnect: (sessionId) => ipcRenderer.invoke('ssh:disconnect', sessionId),
+  session: {
+    open: (cfg, opts) => ipcRenderer.invoke('session:open', cfg, opts ?? {}),
+    close: (sessionId) => ipcRenderer.invoke('session:close', sessionId),
     onClosed: (cb) => subscribe<SessionClosedEvent>('session:closed', cb),
     onProgress: (cb) => subscribe<ConnectProgressEvent>('connect:progress', cb)
   },
   db: {
     open: (sessionId, remotePath, readOnly) => ipcRenderer.invoke('db:open', sessionId, remotePath, readOnly),
-    schema: (sessionId, includeSystem) => ipcRenderer.invoke('db:schema', sessionId, includeSystem ?? false),
-    tableDetails: (sessionId, table) => ipcRenderer.invoke('db:tableDetails', sessionId, table),
+    schema: (sessionId) => ipcRenderer.invoke('db:schema', sessionId),
+    tableDetails: (sessionId, ref) => ipcRenderer.invoke('db:tableDetails', sessionId, ref),
     rows: (sessionId, req) => ipcRenderer.invoke('db:rows', sessionId, req),
-    count: (sessionId, table, where) => ipcRenderer.invoke('db:count', sessionId, table, where),
+    count: (sessionId, ref, where) => ipcRenderer.invoke('db:count', sessionId, ref, where),
     query: (sessionId, sql, params, maxRows) => ipcRenderer.invoke('db:query', sessionId, sql, params ?? [], maxRows ?? 1000),
     cancel: (sessionId) => ipcRenderer.invoke('db:cancel', sessionId),
     apply: (sessionId, changes) => ipcRenderer.invoke('db:apply', sessionId, changes)

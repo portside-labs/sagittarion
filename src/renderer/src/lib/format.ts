@@ -1,19 +1,14 @@
 import { isTagged, type CellValue, type TaggedBlob } from '@shared/types'
-import { blobToHex, cellToPlainText, floatText } from '@shared/export'
+import { blobToHex, cellToPlainText, floatText, formatBytes } from '@shared/export'
 
-export type StorageClass = 'NULL' | 'INTEGER' | 'REAL' | 'TEXT' | 'BLOB'
-export type Affinity = 'INTEGER' | 'TEXT' | 'BLOB' | 'REAL' | 'NUMERIC'
+export { formatBytes }
 
-export function formatBytes(n: number): string {
-  if (!Number.isFinite(n)) return '?'
-  if (n < 1024) return `${n} B`
-  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`
-  if (n < 1024 * 1024 * 1024) return `${(n / 1024 / 1024).toFixed(1)} MB`
-  return `${(n / 1024 / 1024 / 1024).toFixed(2)} GB`
-}
+export type StorageClass = 'NULL' | 'INTEGER' | 'REAL' | 'TEXT' | 'BLOB' | 'BOOLEAN'
+export type Affinity = 'INTEGER' | 'TEXT' | 'BLOB' | 'REAL' | 'NUMERIC' | 'BOOLEAN'
 
 export function storageClass(v: CellValue): StorageClass {
   if (v === null) return 'NULL'
+  if (typeof v === 'boolean') return 'BOOLEAN'
   if (typeof v === 'string') return 'TEXT'
   if (typeof v === 'number') return Number.isInteger(v) ? 'INTEGER' : 'REAL'
   if (isTagged(v)) {
@@ -25,8 +20,9 @@ export function storageClass(v: CellValue): StorageClass {
 }
 
 /** Short, single-line rendering for a grid cell. */
-export function displayCell(v: CellValue): { text: string; cls: 'null' | 'num' | 'text' | 'blob' } {
+export function displayCell(v: CellValue): { text: string; cls: 'null' | 'num' | 'text' | 'blob' | 'bool' } {
   if (v === null) return { text: 'NULL', cls: 'null' }
+  if (typeof v === 'boolean') return { text: v ? 'true' : 'false', cls: 'bool' }
   if (typeof v === 'number') return { text: String(v), cls: 'num' }
   if (typeof v === 'string') return { text: v.length > 512 ? v.slice(0, 512) + '…' : v, cls: 'text' }
   if (isTagged(v)) {
@@ -51,6 +47,7 @@ export function inspectorText(v: CellValue): string {
 /** SQLite's type affinity rules (https://www.sqlite.org/datatype3.html#determination_of_column_affinity). */
 export function affinityOf(declType?: string | null): Affinity {
   const t = (declType ?? '').toUpperCase()
+  if (t === 'BOOLEAN' || t === 'BOOL') return 'BOOLEAN'
   if (t.includes('INT')) return 'INTEGER'
   if (t.includes('CHAR') || t.includes('CLOB') || t.includes('TEXT')) return 'TEXT'
   if (t.includes('BLOB') || t === '') return 'BLOB'
@@ -72,6 +69,11 @@ function hexToBase64(hex: string): string {
 export function parseCellInput(text: string, declType?: string | null): CellValue {
   const aff = affinityOf(declType)
   const t = text.trim()
+  if (aff === 'BOOLEAN') {
+    if (/^(true|t|yes|y|on|1)$/i.test(t)) return true
+    if (/^(false|f|no|n|off|0)$/i.test(t)) return false
+    return text
+  }
   const hexMatch = /^[xX]'((?:[0-9a-fA-F]{2})*)'$/.exec(t)
   if (hexMatch && aff !== 'TEXT') {
     const hex = hexMatch[1]

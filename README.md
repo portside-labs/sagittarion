@@ -1,9 +1,9 @@
 # SQLite SSH
 
-A desktop GUI for SQLite databases that live on other machines. It connects over
-SSH and works on the database file **in place** on the remote host: nothing is
-downloaded, nothing is installed on the server, and edits are applied inside
-transactions right where the file lives.
+A desktop GUI for databases on other machines. It opens **SQLite files in place
+over SSH** (nothing is downloaded, nothing is installed on the server) and
+connects to **PostgreSQL** servers directly or through an SSH tunnel. Edits are
+staged in the grid and applied inside a single transaction.
 
 Built with Electron, React and TypeScript. The SSH layer uses
 [`ssh2`](https://github.com/mscdex/ssh2); the remote side is a small,
@@ -39,11 +39,37 @@ time you connect.
 - **Export**: loaded rows as CSV, JSON or SQL `INSERT` statements.
 - **Read-only mode** per connection; open transactions are shown in the status bar.
 
+## PostgreSQL
+
+Pick *PostgreSQL* when creating a connection. The form takes host, port,
+database, user, password and an SSL mode (`prefer` tries TLS and falls back to
+plain, `require`, `verify-full`, `disable`), or you can paste a
+`postgres://user:password@host/db` URL. Tick *Connect through an SSH tunnel*
+for servers that only listen on localhost: the app opens the SSH connection
+with the usual key, agent or password options and forwards a local port through
+it. Host key checks and saved-credential encryption work the same way as for
+SQLite.
+
+What the Postgres backend does differently:
+
+- Tables are grouped by schema in the sidebar when the database has more than
+  one; bare names refer to the current schema (normally `public`).
+- Rows are addressed by primary key, so tables without one are read-only in
+  the grid. Identity (`GENERATED ALWAYS`) and generated columns are shown but
+  not editable.
+- Values keep their server text form where JavaScript would lose information:
+  `bigint` and `numeric` never round, `bytea` is shown as a blob, and
+  timestamps, arrays, JSON and UUIDs appear exactly as the server prints them.
+- Result sets from the query tab are read through a cursor, so a `SELECT`
+  without a `LIMIT` only fetches as many rows as the limit dropdown allows.
+- *Open read-only* sets `default_transaction_read_only` for the session.
+- Requires PostgreSQL 12 or newer.
+
 ## Requirements
 
 - Local: Node.js 20 or newer to build and run from source.
-- Remote host: an SSH login and `python3` (3.5 or newer, standard library
-  only). Debian/Ubuntu, Fedora/RHEL, Raspberry Pi OS and most NAS systems have
+- SQLite: an SSH login on the remote host and `python3` there (3.5 or newer,
+  standard library only). Debian/Ubuntu, Fedora/RHEL, Raspberry Pi OS and most NAS systems have
   it already; on Alpine run `apk add python3`. SFTP is optional and only needed
   for the file browser. The `sqlite3` command-line tool is *not* required.
 
@@ -106,7 +132,9 @@ on the remote side.
 
 ```
 src/main/            Electron main process: window, IPC, dialogs
-src/main/ssh/        Session (ssh2), PythonAgent protocol client, host key store
+src/main/ssh/        Session (ssh2): exec, SFTP, local port forwarding; host key store
+src/main/db/         DatabaseDriver interface, SQLite-over-SSH adapter, PostgreSQL driver
+src/main/connections/ ConnectionManager: opens either kind, tunnels, lifecycle
 src/main/agent/      sqlite_agent.py – runs on the remote host
 src/main/store/      saved connections (secrets encrypted with safeStorage)
 src/preload/         contextBridge API exposed as window.api
@@ -120,8 +148,8 @@ test/e2e/            Playwright end-to-end test driving the built app
 ## Testing
 
 ```bash
-npm test             # integration tests against the built-in mock SSH server
-npm run test:e2e     # builds the app and drives it with Playwright (screenshots in test/e2e/artifacts)
+npm test             # integration tests: mock SSH server, plus PostgreSQL (uses PG_URL, or a throwaway Docker container)
+npm run test:e2e     # builds the app and drives it with Playwright (screenshots in test/e2e/artifacts); covers Postgres when PG_URL is set
 npm run test:docker  # real OpenSSH servers in Docker: Alpine with ash, bash and fish login shells, plus one without Python
 npm run typecheck
 ```
@@ -129,6 +157,10 @@ npm run typecheck
 The Docker tests build two small images from `alpine:3.20`; if that image cannot be
 pulled, point them at any Alpine-flavoured image you already have, e.g.
 `DOCKER_BASE=node:24-alpine npm run test:docker`.
+
+The PostgreSQL tests start a `postgres:16-alpine` container unless `PG_URL`
+points at a server you provide (set `PG_IMAGE` to use a different image). They
+recreate their own tables in that database, so use a scratch database.
 
 `npm run dev:server` starts the mock SSH server on port 2222 (user `test`,
 password `test`) serving `test/fixtures/sample.db`, which is handy for trying

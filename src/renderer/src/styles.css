@@ -1742,3 +1742,108 @@ table.struct {
   vertical-align: middle;
   flex: 0 0 auto;
 }
+
+/* ---------------------------------------------------------------- database kinds */
+.grid td.cell-bool {
+  color: #7fb3ff;
+  font-family: var(--mono);
+}
+.kind-badge {
+  display: inline-flex;
+  align-items: center;
+  height: 18px;
+  padding: 0 6px;
+  border-radius: 4px;
+  font-size: 10.5px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  background: var(--bg-active);
+  color: var(--text-muted);
+  flex: 0 0 auto;
+}
+.kind-badge.postgres {
+  background: rgba(51, 103, 145, 0.35);
+  color: #9ec5ff;
+}
+.kind-badge.sqlite {
+  background: rgba(62, 207, 142, 0.14);
+  color: #7ddcb0;
+}
+.kind-chooser {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 14px;
+  margin-top: 8px;
+}
+.kind-card {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 18px 18px 16px;
+  border-radius: 10px;
+  border: 1px solid var(--border-strong);
+  background: var(--bg-elev);
+  color: var(--text);
+  text-align: left;
+  cursor: pointer;
+  transition: border-color 0.12s, background 0.12s, transform 0.12s;
+}
+.kind-card:hover {
+  border-color: var(--accent);
+  background: var(--bg-hover);
+  transform: translateY(-1px);
+}
+.kind-card .kind-title {
+  font-weight: 700;
+  font-size: 14px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.kind-card .kind-desc {
+  color: var(--text-muted);
+  line-height: 1.5;
+  font-size: 12px;
+}
+.kind-card .kind-icon {
+  width: 34px;
+  height: 34px;
+  border-radius: 8px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+.kind-card.postgres .kind-icon {
+  background: rgba(51, 103, 145, 0.35);
+  color: #9ec5ff;
+}
+.kind-card.sqlite .kind-icon {
+  background: rgba(62, 207, 142, 0.14);
+  color: #7ddcb0;
+}
+.form-section.tunnel {
+  margin-top: 16px;
+  padding: 14px 16px 16px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg-panel);
+}
+.form-section.tunnel h2 {
+  margin-bottom: 10px;
+}
+.tree-schema {
+  margin-top: 4px;
+}
+.tree-schema > .tree-item {
+  font-weight: 600;
+}
+.tree-schema .tree-section-header {
+  padding-left: 22px;
+  font-size: 10.5px;
+}
+.tree-schema .tree-schema-body {
+  padding-left: 10px;
+}

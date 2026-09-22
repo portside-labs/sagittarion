@@ -1,13 +1,16 @@
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import { spawnSync } from 'node:child_process'
 import fs from 'node:fs'
+import net from 'node:net'
 import os from 'node:os'
 import path from 'node:path'
 import { startMockServer } from './mock-ssh/server.mjs'
 import { Session } from '../src/main/ssh/session'
 import { fingerprintSha256, matchOpenSshKnownHosts, parseKeyType, KnownHostsStore } from '../src/main/ssh/hostkeys'
 import { toCsv, toSqlInserts } from '../src/shared/export'
-import type { ConnectionConfig, RowsResult } from '../src/shared/types'
+import { ConnectionManager } from '../src/main/connections/manager'
+import { migrateStored } from '../src/main/store/connections'
+import type { RowsResult, SshConfig } from '../src/shared/types'
 
 const root = path.resolve(__dirname, '..')
 const agentSource = fs.readFileSync(path.join(root, 'src/main/agent/sqlite_agent.py'), 'utf8')
@@ -24,22 +27,19 @@ function freshDb(name: string): string {
   return target
 }
 
-function baseConfig(overrides: Partial<ConnectionConfig> = {}): ConnectionConfig {
+function baseConfig(overrides: Partial<SshConfig> = {}): SshConfig {
   return {
-    id: 'test',
-    name: 'test',
     host: server.host,
     port: server.port,
     username: server.username,
     auth: 'password',
     password: server.password,
-    remotePath: fixture,
     ...overrides
   }
 }
 
-function makeSession(cfg: ConnectionConfig, verify: (key: Buffer) => Promise<boolean> = async () => true): Session {
-  return new Session(cfg, { agentSource, verifyHostKey: verify })
+function makeSession(ssh: SshConfig, verify: (key: Buffer) => Promise<boolean> = async () => true): Session {
+  return new Session(ssh, { agentSource, verifyHostKey: verify })
 }
 
 beforeAll(async () => {
@@ -65,7 +65,7 @@ afterAll(async () => {
 describe('Session over SSH', () => {
   it('connects with a password, opens the database and reads schema and rows', async () => {
     const db = freshDb('a.db')
-    const s = makeSession(baseConfig({ remotePath: db }))
+    const s = makeSession(baseConfig())
     const stages: string[] = []
     ;(s as any).opts.onProgress = (p: any) => stages.push(p.stage)
     await s.connect()
@@ -130,7 +130,7 @@ describe('Session over SSH', () => {
 
   it('applies staged changes atomically and rolls back on failure', async () => {
     const db = freshDb('b.db')
-    const s = makeSession(baseConfig({ remotePath: db }))
+    const s = makeSession(baseConfig())
     await s.connect()
     await s.openDatabase(db)
     const applied = await s.apply([
@@ -177,7 +177,7 @@ describe('Session over SSH', () => {
 
   it('enforces read-only mode', async () => {
     const db = freshDb('c.db')
-    const s = makeSession(baseConfig({ remotePath: db, readOnly: true }))
+    const s = makeSession(baseConfig())
     await s.connect()
     const info = await s.openDatabase(db, true)
     expect(info.readonly).toBe(true)
@@ -204,7 +204,7 @@ describe('Session over SSH', () => {
 
   it('gives a friendly error on a bad password', async () => {
     const s = makeSession(baseConfig({ password: 'wrong' }))
-    await expect(s.connect()).rejects.toThrow(/Authentication failed for test@127\.0\.0\.1/)
+    await expect(s.connect()).rejects.toThrow(/authentication failed for test@127\.0\.0\.1/i)
   })
 
   it('aborts when the host key is rejected', async () => {
@@ -218,8 +218,7 @@ describe('Session over SSH', () => {
   })
 
   it('starts the helper even when the login shell prints noise', async () => {
-    const cfg = baseConfig({ host: noisyServer.host, port: noisyServer.port })
-    const s = makeSession(cfg)
+    const s = makeSession(baseConfig({ host: noisyServer.host, port: noisyServer.port }))
     await s.connect()
     const info = await s.openDatabase(fixture, true)
     expect(info.sqliteVersion).toMatch(/^3\./)
@@ -239,6 +238,71 @@ describe('Session over SSH', () => {
     expect(seen).not.toBeNull()
     expect(parseKeyType(seen!)).toBe('ssh-rsa')
     expect(fingerprintSha256(seen!)).toMatch(/^SHA256:[A-Za-z0-9+/]{43}$/)
+  })
+})
+
+describe('ConnectionManager', () => {
+  it('opens a SQLite connection end to end and reports it', async () => {
+    const db = freshDb('m.db')
+    const manager = new ConnectionManager({ agentSource, verifyHostKey: async () => true })
+    const closed: string[] = []
+    manager.on('closed', (e: { reason: string }) => closed.push(e.reason))
+    const conn = await manager.open({ id: 'c1', name: 'Mock', kind: 'sqlite', ssh: baseConfig(), remotePath: db })
+    const info = manager.info(conn)
+    expect(info.kind).toBe('sqlite')
+    expect(info.target).toBe(`test@127.0.0.1:${server.port}`)
+    expect(info.db?.label).toBe(db)
+    expect(info.db?.serverVersion).toMatch(/^SQLite 3\./)
+    const schema = await manager.driver(conn.id).schema()
+    expect(schema.kind).toBe('sqlite')
+    expect(schema.tables.map((t) => t.name)).toContain('users')
+    const details = await manager.driver(conn.id).tableDetails({ name: 'orders' })
+    expect(details.foreignKeys.length).toBe(1)
+    await manager.close(conn.id)
+    expect(() => manager.get(conn.id)).toThrow(/no longer open/)
+    // A user-initiated close does not fire the closed event.
+    expect(closed).toEqual([])
+  })
+
+  it('forwards a local port through the SSH connection', async () => {
+    const echo = net.createServer((sock) => sock.pipe(sock))
+    await new Promise<void>((r) => echo.listen(0, '127.0.0.1', () => r()))
+    const echoPort = (echo.address() as net.AddressInfo).port
+    const s = makeSession(baseConfig())
+    await s.connect()
+    const fwd = await s.createLocalForward('127.0.0.1', echoPort)
+    const reply = await new Promise<string>((resolve, reject) => {
+      const sock = net.connect(fwd.port, '127.0.0.1', () => sock.write('ping through tunnel'))
+      sock.on('data', (d) => {
+        resolve(d.toString())
+        sock.destroy()
+      })
+      sock.on('error', reject)
+    })
+    expect(reply).toBe('ping through tunnel')
+    fwd.close()
+    s.close()
+    echo.close()
+  })
+})
+
+describe('saved connection migration', () => {
+  it('lifts the old flat SSH layout into the nested one', () => {
+    const migrated = migrateStored({
+      id: 'x',
+      name: 'Old',
+      host: 'h',
+      port: '2222',
+      username: 'u',
+      auth: 'password',
+      savePassword: true,
+      encryptedPassword: 'abc',
+      remotePath: '/tmp/a.db',
+      color: '#fff'
+    })
+    expect(migrated).toMatchObject({ id: 'x', kind: 'sqlite', remotePath: '/tmp/a.db', color: '#fff', ssh: { host: 'h', port: 2222, username: 'u', auth: 'password', encryptedPassword: 'abc' } })
+    expect(migrateStored({ id: 'y', kind: 'postgres', ssh: { host: 'h' } })?.kind).toBe('postgres')
+    expect(migrateStored({ nonsense: true })).toBeNull()
   })
 })
 

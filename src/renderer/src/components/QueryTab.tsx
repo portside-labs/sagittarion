@@ -36,6 +36,14 @@ export function QueryTab({ tab, active }: { tab: Extract<Tab, { kind: 'query' }>
 
   const schemaMap = useMemo(() => {
     if (!schema) return undefined
+    if (schema.kind === 'postgres') {
+      const m: Record<string, Record<string, string[]>> = {}
+      for (const t of [...schema.tables, ...schema.views]) {
+        const s = t.schema ?? schema.defaultSchema ?? 'public'
+        ;(m[s] ??= {})[t.name] = t.columns.map((c) => c.name)
+      }
+      return m
+    }
     const m: Record<string, string[]> = {}
     for (const t of [...schema.tables, ...schema.views]) m[t.name] = t.columns.map((c) => c.name)
     return m
@@ -130,7 +138,15 @@ export function QueryTab({ tab, active }: { tab: Extract<Tab, { kind: 'query' }>
       </div>
       {running ? <div className="loading-bar" /> : null}
       <div className="editor-wrap" style={{ height: editorHeight }}>
-        <SqlEditor ref={editorRef} initialValue={tab.initialSql} onRun={() => void run()} schema={schemaMap} placeholder="SELECT * FROM …" />
+        <SqlEditor
+          ref={editorRef}
+          initialValue={tab.initialSql}
+          onRun={() => void run()}
+          schema={schemaMap}
+          defaultSchema={schema?.kind === 'postgres' ? schema.defaultSchema ?? 'public' : undefined}
+          dialect={session.kind}
+          placeholder="SELECT * FROM …"
+        />
       </div>
       <Splitter direction="horizontal" onResize={(dy) => setEditorHeight((h) => clamp(h + dy, 80, window.innerHeight - 260))} />
       <ResultsView results={results} running={running} error={error} onExport={(r) => void exportResult(r)} />

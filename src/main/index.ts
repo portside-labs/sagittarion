@@ -3,18 +3,18 @@ import { promises as fs } from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import agentSource from './agent/sqlite_agent.py?raw'
-import { Session } from './ssh/session'
+import { ConnectionManager } from './connections/manager'
 import { humanKeyType, KnownHostsStore } from './ssh/hostkeys'
 import { ConnectionStore, noopCodec, type SecretCodec } from './store/connections'
 import { toCsv, toJson, toSqlInserts } from '@shared/export'
-import type { ConnectOptions } from '@shared/api'
-import type { AppInfo, ConnectionConfig, ExportRequest, PendingChange, RowsRequest, SessionInfo } from '@shared/types'
+import type { OpenOptions } from '@shared/api'
+import type { AppInfo, ConnectionConfig, ExportRequest, PendingChange, RowsRequest, SessionInfo, SshConfig, TableRef } from '@shared/types'
 
 const isMac = process.platform === 'darwin'
-const sessions = new Map<string, Session>()
 let mainWindow: BrowserWindow | null = null
 let connectionStore: ConnectionStore
 let knownHosts: KnownHostsStore
+let manager: ConnectionManager
 
 // ---------------------------------------------------------------------------
 // Window
@@ -134,108 +134,58 @@ function makeCodec(): SecretCodec {
 // Host key verification (trust on first use, with the user's known_hosts as a second source)
 // ---------------------------------------------------------------------------
 
-async function verifyHostKey(cfg: ConnectionConfig, key: Buffer): Promise<boolean> {
-  const check = await knownHosts.check(cfg.host, cfg.port, key)
+async function verifyHostKey(ssh: SshConfig, key: Buffer): Promise<boolean> {
+  const check = await knownHosts.check(ssh.host, ssh.port, key)
   if (check.status === 'trusted') return true
-  const win = mainWindow ?? undefined
+  const win = mainWindow as BrowserWindow
   const keyLabel = humanKeyType(check.keyType)
   if (check.status === 'unknown') {
-    const r = await dialog.showMessageBox(win as BrowserWindow, {
+    const r = await dialog.showMessageBox(win, {
       type: 'question',
       buttons: ['Connect', 'Cancel'],
       defaultId: 0,
       cancelId: 1,
       title: 'Unknown host',
-      message: `The authenticity of host "${cfg.host}" can't be established.`,
+      message: `The authenticity of host "${ssh.host}" can't be established.`,
       detail: `${keyLabel} key fingerprint is\n${check.fingerprint}\n\nIf you trust this host, connect and the key will be remembered for next time.`
     })
     if (r.response !== 0) return false
-    await knownHosts.save(knownHosts.entryFor(cfg.host, cfg.port, key))
+    await knownHosts.save(knownHosts.entryFor(ssh.host, ssh.port, key))
     return true
   }
-  const r = await dialog.showMessageBox(win as BrowserWindow, {
+  const r = await dialog.showMessageBox(win, {
     type: 'warning',
     buttons: ['Cancel', 'Connect anyway and replace the saved key'],
     defaultId: 0,
     cancelId: 0,
     title: 'Host key changed',
-    message: `WARNING: the ${keyLabel} host key for ${cfg.host} has changed.`,
+    message: `WARNING: the ${keyLabel} host key for ${ssh.host} has changed.`,
     detail:
       `Offered fingerprint:\n${check.fingerprint}\n` +
       (check.previous ? `\nPreviously trusted:\n${check.previous.fingerprint}\n` : `\nIt does not match the entry in your ~/.ssh/known_hosts file.\n`) +
       '\nThis can mean someone is intercepting the connection, or that the server was legitimately reinstalled. Only continue if you know why the key changed.'
   })
   if (r.response !== 1) return false
-  await knownHosts.save(knownHosts.entryFor(cfg.host, cfg.port, key))
+  await knownHosts.save(knownHosts.entryFor(ssh.host, ssh.port, key))
   return true
-}
-
-// ---------------------------------------------------------------------------
-// Sessions
-// ---------------------------------------------------------------------------
-
-function sessionInfo(s: Session): SessionInfo {
-  return {
-    sessionId: s.id,
-    connectionId: s.config.id,
-    name: s.config.name,
-    host: s.config.host,
-    port: s.config.port,
-    username: s.config.username,
-    color: s.config.color,
-    db: s.db,
-    interpreter: s.interpreter ?? '',
-    serverBanner: s.serverBanner,
-    homeDir: s.homeDir
-  }
-}
-
-function requireSession(id: string): Session {
-  const s = sessions.get(id)
-  if (!s || s.closed) throw new Error('This connection is no longer open. Reconnect to continue.')
-  return s
-}
-
-function send(channel: string, payload: unknown): void {
-  if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send(channel, payload)
-}
-
-async function connect(cfg: ConnectionConfig, opts: ConnectOptions): Promise<SessionInfo> {
-  const session = new Session(cfg, {
-    agentSource,
-    verifyHostKey: (key) => verifyHostKey(cfg, key),
-    onProgress: (p) => send('connect:progress', { ...p, requestId: opts.requestId })
-  })
-  session.on('close', ({ reason }: { reason: string }) => {
-    sessions.delete(session.id)
-    send('session:closed', { sessionId: session.id, reason })
-  })
-  session.on('agent-exit', (info: { code: number | null; stderr: string }) => {
-    const detail = info?.stderr?.trim() ? `: ${info.stderr.trim().slice(-300)}` : ''
-    send('session:closed', { sessionId: session.id, reason: `The remote helper process exited${detail}` })
-    session.close()
-  })
-  session.on('error', () => {
-    /* surfaced through close */
-  })
-  try {
-    await session.connect()
-    if (opts.openDatabase !== false) {
-      if (!cfg.remotePath?.trim()) throw new Error('No remote database path given.')
-      await session.openDatabase(cfg.remotePath.trim(), Boolean(cfg.readOnly))
-    }
-  } catch (err) {
-    session.close()
-    throw err
-  }
-  sessions.set(session.id, session)
-  if (cfg.id) void connectionStore.touch(cfg.id)
-  return sessionInfo(session)
 }
 
 // ---------------------------------------------------------------------------
 // IPC
 // ---------------------------------------------------------------------------
+
+function send(channel: string, payload: unknown): void {
+  if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send(channel, payload)
+}
+
+async function openSession(cfg: ConnectionConfig, opts: OpenOptions): Promise<SessionInfo> {
+  const conn = await manager.open(cfg, {
+    openDatabase: opts.openDatabase,
+    onProgress: (p) => send('connect:progress', { ...p, requestId: opts.requestId })
+  })
+  if (cfg.id) void connectionStore.touch(cfg.id)
+  return manager.info(conn)
+}
 
 function registerIpc(): void {
   ipcMain.handle('app:info', async (): Promise<AppInfo> => ({
@@ -253,31 +203,26 @@ function registerIpc(): void {
   ipcMain.handle('connections:save', (_e, cfg: ConnectionConfig) => connectionStore.save(cfg))
   ipcMain.handle('connections:remove', (_e, id: string) => connectionStore.remove(id))
 
-  ipcMain.handle('ssh:connect', (_e, cfg: ConnectionConfig, opts: ConnectOptions) => connect(cfg, opts ?? {}))
-  ipcMain.handle('ssh:disconnect', async (_e, sessionId: string) => {
-    const s = sessions.get(sessionId)
-    if (s) {
-      sessions.delete(sessionId)
-      s.removeAllListeners('close')
-      s.close()
-    }
+  ipcMain.handle('session:open', (_e, cfg: ConnectionConfig, opts: OpenOptions) => openSession(cfg, opts ?? {}))
+  ipcMain.handle('session:close', (_e, sessionId: string) => manager.close(sessionId))
+
+  ipcMain.handle('db:open', async (_e, sessionId: string, remotePath: string, readOnly: boolean) => {
+    const conn = manager.get(sessionId)
+    if (conn.config.kind !== 'sqlite' || !conn.driver) throw new Error('Only SQLite connections open files.')
+    return (conn.driver as any).open(remotePath, readOnly)
   })
-
-  ipcMain.handle('db:open', (_e, sessionId: string, remotePath: string, readOnly: boolean) =>
-    requireSession(sessionId).openDatabase(remotePath, readOnly)
-  )
-  ipcMain.handle('db:schema', (_e, sessionId: string, includeSystem: boolean) => requireSession(sessionId).schema(includeSystem))
-  ipcMain.handle('db:tableDetails', (_e, sessionId: string, table: string) => requireSession(sessionId).tableDetails(table))
-  ipcMain.handle('db:rows', (_e, sessionId: string, req: RowsRequest) => requireSession(sessionId).rows(req))
-  ipcMain.handle('db:count', (_e, sessionId: string, table: string, where?: string) => requireSession(sessionId).count(table, where))
+  ipcMain.handle('db:schema', (_e, sessionId: string) => manager.driver(sessionId).schema())
+  ipcMain.handle('db:tableDetails', (_e, sessionId: string, ref: TableRef) => manager.driver(sessionId).tableDetails(ref))
+  ipcMain.handle('db:rows', (_e, sessionId: string, req: RowsRequest) => manager.driver(sessionId).rows(req))
+  ipcMain.handle('db:count', (_e, sessionId: string, ref: TableRef, where?: string) => manager.driver(sessionId).count(ref, where))
   ipcMain.handle('db:query', (_e, sessionId: string, sql: string, params: unknown[], maxRows: number) =>
-    requireSession(sessionId).query(sql, params, maxRows)
+    manager.driver(sessionId).query(sql, params, maxRows)
   )
-  ipcMain.handle('db:cancel', async (_e, sessionId: string) => requireSession(sessionId).cancel())
-  ipcMain.handle('db:apply', (_e, sessionId: string, changes: PendingChange[]) => requireSession(sessionId).apply(changes))
+  ipcMain.handle('db:cancel', (_e, sessionId: string) => manager.driver(sessionId).cancel())
+  ipcMain.handle('db:apply', (_e, sessionId: string, changes: PendingChange[]) => manager.driver(sessionId).apply(changes))
 
-  ipcMain.handle('sftp:readdir', (_e, sessionId: string, p: string) => requireSession(sessionId).readdir(p))
-  ipcMain.handle('sftp:home', (_e, sessionId: string) => requireSession(sessionId).home())
+  ipcMain.handle('sftp:readdir', (_e, sessionId: string, p: string) => manager.sshSession(sessionId).readdir(p))
+  ipcMain.handle('sftp:home', (_e, sessionId: string) => manager.sshSession(sessionId).home())
 
   ipcMain.handle('dialog:pickPrivateKey', async () => {
     const r = await dialog.showOpenDialog(mainWindow as BrowserWindow, {
@@ -287,6 +232,7 @@ function registerIpc(): void {
     })
     return r.canceled || !r.filePaths[0] ? null : r.filePaths[0]
   })
+
   ipcMain.handle('export:save', async (_e, req: ExportRequest) => {
     const ext = req.format === 'csv' ? 'csv' : req.format === 'json' ? 'json' : 'sql'
     const r = await dialog.showSaveDialog(mainWindow as BrowserWindow, {
@@ -327,6 +273,8 @@ if (!app.requestSingleInstanceLock()) {
     const userData = app.getPath('userData')
     connectionStore = new ConnectionStore(path.join(userData, 'connections.json'), makeCodec())
     knownHosts = new KnownHostsStore(path.join(userData, 'known_hosts.json'), path.join(os.homedir(), '.ssh', 'known_hosts'))
+    manager = new ConnectionManager({ agentSource, verifyHostKey })
+    manager.on('closed', (e: { sessionId: string; reason: string }) => send('session:closed', e))
     registerIpc()
     buildMenu()
     mainWindow = createWindow()
@@ -341,7 +289,6 @@ if (!app.requestSingleInstanceLock()) {
   })
 
   app.on('before-quit', () => {
-    for (const s of sessions.values()) s.close()
-    sessions.clear()
+    void manager?.closeAll()
   })
 }

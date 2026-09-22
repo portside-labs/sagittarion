@@ -1,10 +1,10 @@
 import { useEffect, useState } from 'react'
-import type { TableDetails } from '@shared/types'
+import type { TableDetails, TableRef } from '@shared/types'
 import { useStore } from '@/store'
 import { SqlEditor } from './SqlEditor'
 import { errorMessage } from '@/lib/util'
 
-export function StructureView({ table, refreshKey }: { table: string; refreshKey: number }) {
+export function StructureView({ table, refreshKey }: { table: TableRef; refreshKey: number }) {
   const session = useStore((s) => s.session)!
   const [details, setDetails] = useState<TableDetails | null>(null)
   const [error, setError] = useState<string | null>(null)
@@ -19,7 +19,8 @@ export function StructureView({ table, refreshKey }: { table: string; refreshKey
     return () => {
       cancelled = true
     }
-  }, [session.sessionId, table, refreshKey])
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [session.sessionId, table.schema, table.name, refreshKey])
 
   if (error) return <div className="banner error">{error}</div>
   if (!details) return <div className="structure">Loading…</div>
@@ -29,7 +30,8 @@ export function StructureView({ table, refreshKey }: { table: string; refreshKey
       <div className="struct-section">
         <h3>
           Columns <span className="count">{details.columns.length}</span>
-          {details.withoutRowid ? <span className="tag">WITHOUT ROWID</span> : null}
+          {details.schema ? <span className="tag">{details.schema}</span> : null}
+          {details.withoutRowid && session.kind === 'sqlite' ? <span className="tag">WITHOUT ROWID</span> : null}
           {details.type === 'view' ? <span className="tag">VIEW</span> : null}
         </h3>
         <table className="struct">
@@ -51,9 +53,15 @@ export function StructureView({ table, refreshKey }: { table: string; refreshKey
                 <td>
                   {c.pk ? <span className="tag pk">PK{details.pk.length > 1 ? ` ${c.pk}` : ''}</span> : null}
                   {c.notnull ? <span className="tag nn">NOT NULL</span> : null}
-                  {c.hidden === 2 ? <span className="tag">GENERATED VIRTUAL</span> : null}
-                  {c.hidden === 3 ? <span className="tag">GENERATED STORED</span> : null}
-                  {c.hidden === 1 ? <span className="tag">HIDDEN</span> : null}
+                  {c.extra ? (
+                    <span className="tag">{c.extra.toUpperCase()}</span>
+                  ) : (
+                    <>
+                      {c.hidden === 2 ? <span className="tag">GENERATED VIRTUAL</span> : null}
+                      {c.hidden === 3 ? <span className="tag">GENERATED STORED</span> : null}
+                      {c.hidden === 1 ? <span className="tag">HIDDEN</span> : null}
+                    </>
+                  )}
                 </td>
                 <td className="mono muted">{c.dflt ?? ''}</td>
               </tr>
@@ -144,7 +152,7 @@ export function StructureView({ table, refreshKey }: { table: string; refreshKey
                 {t.name}
               </div>
               <div className="struct-sql" style={{ height: Math.min(260, 40 + (t.sql?.split('\n').length ?? 1) * 20) }}>
-                <SqlEditor initialValue={t.sql ?? ''} readOnly />
+                <SqlEditor initialValue={t.sql ?? ''} readOnly dialect={session.kind} />
               </div>
             </div>
           ))}
@@ -154,7 +162,7 @@ export function StructureView({ table, refreshKey }: { table: string; refreshKey
       <div className="struct-section">
         <h3>Definition</h3>
         <div className="struct-sql" style={{ height: Math.min(420, 40 + (details.sql?.split('\n').length ?? 1) * 20) }}>
-          <SqlEditor initialValue={details.sql ?? '-- no SQL available'} readOnly />
+          <SqlEditor initialValue={details.sql ?? '-- no SQL available'} readOnly dialect={session.kind} />
         </div>
       </div>
     </div>

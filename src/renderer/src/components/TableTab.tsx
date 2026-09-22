@@ -58,6 +58,7 @@ export function TableTab({ tab, active }: { tab: Extract<Tab, { kind: 'table' }>
     try {
       const res = await window.api.db.rows(session.sessionId, {
         table: tab.table,
+        schema: tab.schema,
         offset: page * pageSize,
         limit: pageSize,
         orderBy: sort?.column,
@@ -79,7 +80,7 @@ export function TableTab({ tab, active }: { tab: Extract<Tab, { kind: 'table' }>
         setLoadCount((c) => c + 1)
       }
     }
-  }, [session.sessionId, tab.table, page, pageSize, sort, where, clearPending, setInTransaction, setStatus])
+  }, [session.sessionId, tab.table, tab.schema, page, pageSize, sort, where, clearPending, setInTransaction, setStatus])
 
   useEffect(() => {
     void load()
@@ -182,20 +183,20 @@ export function TableTab({ tab, active }: { tab: Extract<Tab, { kind: 'table' }>
   const apply = async () => {
     if (!data || pendingCount === 0) return
     const changes: PendingChange[] = []
-    for (const [row, values] of updates) if (!deletes.has(row)) changes.push({ type: 'update', table: tab.table, key: keyFor(row), values })
-    for (const row of deletes) changes.push({ type: 'delete', table: tab.table, key: keyFor(row) })
-    for (const values of inserts) changes.push({ type: 'insert', table: tab.table, values })
+    for (const [row, values] of updates) if (!deletes.has(row)) changes.push({ type: 'update', table: tab.table, schema: tab.schema, key: keyFor(row), values })
+    for (const row of deletes) changes.push({ type: 'delete', table: tab.table, schema: tab.schema, key: keyFor(row) })
+    for (const values of inserts) changes.push({ type: 'insert', table: tab.table, schema: tab.schema, values })
     const parts = [
       updates.size ? `${updates.size} update${updates.size === 1 ? '' : 's'}` : '',
       inserts.length ? `${inserts.length} insert${inserts.length === 1 ? '' : 's'}` : '',
       deletes.size ? `${deletes.size} delete${deletes.size === 1 ? '' : 's'}` : ''
     ].filter(Boolean)
-    const ok = await confirm(`Apply ${parts.join(', ')} to "${tab.table}"?`, 'The changes run inside one transaction on the remote database.', 'Apply', deletes.size > 0)
+    const ok = await confirm(`Apply ${parts.join(', ')} to "${tab.title}"?`, 'The changes run inside one transaction on the remote database.', 'Apply', deletes.size > 0)
     if (!ok) return
     setApplying(true)
     try {
       const n = await window.api.db.apply(session.sessionId, changes)
-      toast('success', `Applied ${n} change${n === 1 ? '' : 's'} to ${tab.table}`)
+      toast('success', `Applied ${n} change${n === 1 ? '' : 's'} to ${tab.title}`)
       clearPending()
       await load()
     } catch (e) {
@@ -212,7 +213,7 @@ export function TableTab({ tab, active }: { tab: Extract<Tab, { kind: 'table' }>
         format,
         columns: data.columns.map((c) => c.name),
         rows: data.rows,
-        tableName: tab.table,
+        tableName: tab.schema && tab.schema !== 'public' ? `${tab.schema}.${tab.table}` : tab.table,
         suggestedName: tab.table
       })
       if (res.saved) toast('success', `Exported ${formatNumber(data.rows.length)} rows`, res.path)
@@ -384,10 +385,14 @@ export function TableTab({ tab, active }: { tab: Extract<Tab, { kind: 'table' }>
         </div>
       ) : null}
       {view === 'data' && data && !editable && !data.isView && !session.db?.readonly ? (
-        <div className="banner info">This table has neither a rowid nor a primary key, so rows cannot be edited safely here.</div>
+        <div className="banner info">
+          {session.kind === 'postgres'
+            ? 'This table has no primary key, so rows cannot be edited safely here.'
+            : 'This table has neither a rowid nor a primary key, so rows cannot be edited safely here.'}
+        </div>
       ) : null}
       {view === 'structure' ? (
-        <StructureView table={tab.table} refreshKey={structureKey} />
+        <StructureView table={{ schema: tab.schema, name: tab.table }} refreshKey={structureKey} />
       ) : (
         <div className="grid-area">
           {data ? (

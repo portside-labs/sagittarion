@@ -1,14 +1,13 @@
 import { EventEmitter } from 'node:events'
 import { randomBytes } from 'node:crypto'
 import { promises as fs } from 'node:fs'
+import net from 'node:net'
 import os from 'node:os'
 import path from 'node:path'
 import { Client, type ClientChannel, type ConnectConfig, type SFTPWrapper } from 'ssh2'
 import { AgentError, PythonAgent } from './agent'
 import type {
   ConnectProgress,
-  ConnectionConfig,
-  DatabaseInfo,
   FileEntry,
   PendingChange,
   QueryResponse,
@@ -16,11 +15,12 @@ import type {
   RowsRequest,
   RowsResponse,
   SchemaInfo,
+  SshConfig,
   TableDetails
 } from '@shared/types'
 
 export interface SessionOptions {
-  /** Source of sqlite_agent.py, shipped to the remote host at connect time. */
+  /** Source of sqlite_agent.py, shipped to the remote host when a database is opened. */
   agentSource: string
   /** Resolve true to accept the host key, false to abort the connection. */
   verifyHostKey: (key: Buffer) => Promise<boolean>
@@ -34,6 +34,27 @@ export interface ExecResult {
   stdout: string
   stderr: string
   code: number | null
+}
+
+/** What sqlite_agent.py reports after opening a file. */
+export interface SqliteOpenInfo {
+  path: string
+  readonly: boolean
+  sqliteVersion: string
+  pythonVersion: string
+  fileSize: number
+  pageSize: number
+  pageCount: number
+  journalMode: string
+  home: string
+  hostname: string
+  writable: boolean
+}
+
+/** A local TCP listener whose connections are forwarded through the SSH connection. */
+export interface LocalForward {
+  port: number
+  close(): void
 }
 
 /*
@@ -60,22 +81,22 @@ export function expandHome(p: string): string {
   return p
 }
 
-export function friendlyConnectError(err: any, cfg: ConnectionConfig): Error {
+export function friendlyConnectError(err: any, ssh: SshConfig): Error {
   const msg: string = String(err?.message ?? err)
-  const target = `${cfg.host}:${cfg.port}`
+  const target = `${ssh.host}:${ssh.port}`
   if (err?.level === 'client-authentication' || /authentication methods failed/i.test(msg)) {
     const how =
-      cfg.auth === 'password'
+      ssh.auth === 'password'
         ? 'Check the username and password.'
-        : cfg.auth === 'key'
+        : ssh.auth === 'key'
           ? 'Check that the key is authorized for this user and that the passphrase is correct.'
           : 'Make sure your SSH agent is running and has the right key loaded (ssh-add -l).'
-    return new Error(`Authentication failed for ${cfg.username}@${cfg.host}. ${how}`)
+    return new Error(`SSH authentication failed for ${ssh.username}@${ssh.host}. ${how}`)
   }
   if (/ECONNREFUSED/.test(msg)) return new Error(`Connection refused by ${target}. Is an SSH server listening there?`)
-  if (/ENOTFOUND|EAI_AGAIN/.test(msg)) return new Error(`Host not found: ${cfg.host}`)
+  if (/ENOTFOUND|EAI_AGAIN/.test(msg)) return new Error(`Host not found: ${ssh.host}`)
   if (/ETIMEDOUT|Timed out/i.test(msg)) return new Error(`Timed out connecting to ${target}.`)
-  if (/EHOSTUNREACH|ENETUNREACH/.test(msg)) return new Error(`${cfg.host} is unreachable from this machine.`)
+  if (/EHOSTUNREACH|ENETUNREACH/.test(msg)) return new Error(`${ssh.host} is unreachable from this machine.`)
   if (/Host denied|Host key verification failed|hostVerifier|host key/i.test(msg)) return new Error('Host key was not accepted; connection aborted.')
   if (/Encrypted private key detected, but no passphrase given/i.test(msg)) {
     return new Error('The private key is encrypted. Enter its passphrase and try again.')
@@ -85,26 +106,30 @@ export function friendlyConnectError(err: any, cfg: ConnectionConfig): Error {
 }
 
 /**
- * One SSH connection to a host, optionally with the SQLite helper agent
- * running on it and a database open.
+ * One SSH connection to a host. It can run the SQLite helper agent with a
+ * database open, browse files over SFTP, and forward local TCP connections
+ * (used for Postgres tunnels).
  */
 export class Session extends EventEmitter {
   readonly id = randomBytes(8).toString('hex')
-  readonly config: ConnectionConfig
+  readonly ssh: SshConfig
   private readonly opts: SessionOptions
   private readonly client = new Client()
   private agent: PythonAgent | null = null
   private sftp: SFTPWrapper | null = null
   private sftpPromise: Promise<SFTPWrapper> | null = null
+  private forwards = new Set<net.Server>()
   interpreter: string | null = null
   serverBanner = ''
   homeDir: string | null = null
-  db: DatabaseInfo | null = null
+  db: SqliteOpenInfo | null = null
   closed = false
+  /** The most recent failure to open a forwarded channel, for diagnostics. */
+  lastForwardError: Error | null = null
 
-  constructor(config: ConnectionConfig, opts: SessionOptions) {
+  constructor(ssh: SshConfig, opts: SessionOptions) {
     super()
-    this.config = config
+    this.ssh = ssh
     this.opts = opts
   }
 
@@ -118,7 +143,7 @@ export class Session extends EventEmitter {
 
   async connect(): Promise<void> {
     const cfg = await this.buildConnectConfig()
-    this.progress('connecting', `Connecting to ${this.config.host}:${this.config.port}…`)
+    this.progress('connecting', `Connecting to ${this.ssh.host}:${this.ssh.port}…`)
     await new Promise<void>((resolve, reject) => {
       let settled = false
       const finish = (err?: Error) => {
@@ -129,25 +154,25 @@ export class Session extends EventEmitter {
         if (err) reject(err)
         else resolve()
       }
-      const onError = (err: Error) => finish(friendlyConnectError(err, this.config))
+      const onError = (err: Error) => finish(friendlyConnectError(err, this.ssh))
       const onReady = () => finish()
       this.client.on('error', onError)
       this.client.on('ready', onReady)
       this.client.on('banner', (message: string) => {
         this.serverBanner += message
       })
-      this.client.on('handshake', () => this.progress('authenticating', `Authenticating as ${this.config.username}…`))
+      this.client.on('handshake', () => this.progress('authenticating', `Authenticating as ${this.ssh.username}…`))
       this.client.on('keyboard-interactive', (_name, _instructions, _lang, prompts, finishKI) => {
-        finishKI(prompts.map(() => this.config.password ?? ''))
+        finishKI(prompts.map(() => this.ssh.password ?? ''))
       })
       this.client.on('close', () => {
-        finish(new Error(`Connection to ${this.config.host} closed before it was ready.`))
+        finish(new Error(`Connection to ${this.ssh.host} closed before it was ready.`))
         this.handleClosed('Connection closed by the remote host')
       })
       try {
         this.client.connect(cfg)
       } catch (err) {
-        finish(friendlyConnectError(err, this.config))
+        finish(friendlyConnectError(err, this.ssh))
       }
     })
     // Post-ready error handling: surface but do not crash.
@@ -157,7 +182,7 @@ export class Session extends EventEmitter {
   }
 
   private async buildConnectConfig(): Promise<ConnectConfig> {
-    const c = this.config
+    const c = this.ssh
     const cfg: ConnectConfig = {
       host: c.host,
       port: c.port || 22,
@@ -201,7 +226,7 @@ export class Session extends EventEmitter {
   }
 
   private async resolveKeyPath(): Promise<string> {
-    if (this.config.privateKeyPath?.trim()) return expandHome(this.config.privateKeyPath.trim())
+    if (this.ssh.privateKeyPath?.trim()) return expandHome(this.ssh.privateKeyPath.trim())
     const sshDir = path.join(os.homedir(), '.ssh')
     for (const name of DEFAULT_KEY_CANDIDATES) {
       const p = path.join(sshDir, name)
@@ -219,6 +244,8 @@ export class Session extends EventEmitter {
     if (this.closed) return
     this.closed = true
     this.db = null
+    for (const server of this.forwards) server.close()
+    this.forwards.clear()
     this.emit('close', { reason })
   }
 
@@ -259,6 +286,60 @@ export class Session extends EventEmitter {
       stream.on('error', (e: Error) => {
         clearTimeout(timer)
         reject(e)
+      })
+    })
+  }
+
+  // ---------------------------------------------------------------------
+  // Port forwarding (Postgres tunnels)
+  // ---------------------------------------------------------------------
+
+  /**
+   * Listen on a random local port and forward every connection to
+   * dstHost:dstPort as seen from the SSH server.
+   */
+  createLocalForward(dstHost: string, dstPort: number): Promise<LocalForward> {
+    return new Promise((resolve, reject) => {
+      const server = net.createServer((socket) => {
+        socket.on('error', () => socket.destroy())
+        this.client.forwardOut('127.0.0.1', socket.localPort ?? 0, dstHost, dstPort, (err, channel) => {
+          if (err) {
+            this.lastForwardError = err
+            socket.destroy()
+            return
+          }
+          this.lastForwardError = null
+          channel.on('error', () => socket.destroy())
+          socket.pipe(channel).pipe(socket)
+          channel.on('close', () => socket.destroy())
+          socket.on('close', () => {
+            try {
+              channel.close()
+            } catch {
+              /* already closed */
+            }
+          })
+        })
+      })
+      server.on('error', (err) => {
+        this.forwards.delete(server)
+        reject(err)
+      })
+      server.listen(0, '127.0.0.1', () => {
+        const addr = server.address()
+        if (!addr || typeof addr === 'string') {
+          server.close()
+          reject(new Error('Could not open a local port for the tunnel'))
+          return
+        }
+        this.forwards.add(server)
+        resolve({
+          port: addr.port,
+          close: () => {
+            this.forwards.delete(server)
+            server.close()
+          }
+        })
       })
     })
   }
@@ -331,23 +412,23 @@ export class Session extends EventEmitter {
   // Database operations
   // ---------------------------------------------------------------------
 
-  async openDatabase(remotePath: string, readonly = false, create = false): Promise<DatabaseInfo> {
+  async openDatabase(remotePath: string, readonly = false, create = false): Promise<SqliteOpenInfo> {
     const agent = await this.startAgent()
     this.progress('opening', `Opening ${remotePath}…`)
-    const res = await agent.request<DatabaseInfo & { id: number; ok: true }>('open', {
+    const res = await agent.request<SqliteOpenInfo & { id: number; ok: true }>('open', {
       path: remotePath,
       readonly,
       create
     })
     const { id: _id, ok: _ok, ...info } = res as any
-    this.db = info as DatabaseInfo
+    this.db = info as SqliteOpenInfo
     this.homeDir = this.db.home
     return this.db
   }
 
   async schema(includeSystem = false): Promise<SchemaInfo> {
     const res = await this.requireAgent().request('schema', { include_system: includeSystem })
-    return { tables: res.tables, views: res.views, indexes: res.indexes, triggers: res.triggers }
+    return { kind: 'sqlite', tables: res.tables, views: res.views, indexes: res.indexes, triggers: res.triggers }
   }
 
   async tableDetails(table: string): Promise<TableDetails> {
@@ -454,7 +535,7 @@ export class Session extends EventEmitter {
     if (target === '~') target = '.'
     else if (target.startsWith('~/')) target = path.posix.join(await this.home(), target.slice(2))
     const abs = await this.realpath(target)
-    const list = await new Promise<Awaited<ReturnType<typeof readdirAsync>>>((resolve, reject) => {
+    const list = await new Promise<{ filename: string; longname: string; attrs: any }[]>((resolve, reject) => {
       sftp.readdir(abs, (err, entries) => (err ? reject(err) : resolve(entries as any)))
     })
     const entries: FileEntry[] = []
@@ -464,7 +545,6 @@ export class Session extends EventEmitter {
       let isDir = typeof attrs?.isDirectory === 'function' ? attrs.isDirectory() : false
       const full = path.posix.join(abs, e.filename)
       if (isSymlink) {
-        // Follow the link to find out whether it points at a directory.
         try {
           const st = await new Promise<any>((resolve, reject) => sftp.stat(full, (err, s) => (err ? reject(err) : resolve(s))))
           isDir = st.isDirectory()
@@ -512,6 +592,3 @@ export class Session extends EventEmitter {
     this.handleClosed('Disconnected')
   }
 }
-
-// Only used for typing the readdir promise above.
-declare function readdirAsync(): Promise<{ filename: string; longname: string; attrs: unknown }[]>
