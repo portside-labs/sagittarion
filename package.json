@@ -1,7 +1,7 @@
 {
-  "name": "sqlite-ssh",
-  "productName": "SQLite SSH",
-  "version": "0.2.0",
+  "name": "sagittarion",
+  "productName": "Sagittarion",
+  "version": "0.3.0",
   "description": "Desktop GUI for browsing and editing SQLite databases on remote hosts over SSH",
   "main": "./out/main/index.js",
   "author": {
@@ -55,8 +55,8 @@
     "vitest": "^3.2.0"
   },
   "build": {
-    "appId": "io.portsidelabs.sqlite-ssh",
-    "productName": "SQLite SSH",
+    "appId": "io.portsidelabs.sagittarion",
+    "productName": "Sagittarion",
     "copyright": "Copyright © 2026 Portside Labs LLC",
     "directories": {
       "output": "release"
@@ -89,5 +89,5 @@
       "category": "Development"
     }
   },
-  "homepage": "https://portsidelabs.io/sqlite-ssh"
+  "homepage": "https://portsidelabs.io/sagittarion"
 }
