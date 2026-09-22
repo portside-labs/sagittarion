@@ -59,7 +59,7 @@ export async function startMockServer(options = {}) {
   const log = quiet ? () => {} : (...a) => console.log('[mock-ssh]', ...a)
 
   const clients = new Set()
-  const server = new Server({ hostKeys: [hostKey], banner: 'sqlite-ssh mock server' }, (client) => {
+  const server = new Server({ hostKeys: [hostKey], banner: 'sagittarion mock server' }, (client) => {
     log('client connected')
     clients.add(client)
     client.on('close', () => clients.delete(client))

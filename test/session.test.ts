@@ -43,7 +43,7 @@ function makeSession(ssh: SshConfig, verify: (key: Buffer) => Promise<boolean> =
 }
 
 beforeAll(async () => {
-  tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'sqlite-ssh-test-'))
+  tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'sagittarion-test-'))
   if (!fs.existsSync(fixture)) {
     const r = spawnSync('python3', [path.join(root, 'test/fixtures/make-sample-db.py'), fixture], { stdio: 'inherit' })
     if (r.status !== 0) throw new Error('fixture generation failed')

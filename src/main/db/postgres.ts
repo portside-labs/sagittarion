@@ -133,7 +133,7 @@ export class PostgresDriver extends EventEmitter implements DatabaseDriver {
       user: o.user,
       password: o.password ?? '',
       connectionTimeoutMillis: 20_000,
-      application_name: 'SQLite SSH',
+      application_name: 'Sagittarion',
       keepAlive: true,
       types: pgTypes as any
     }

@@ -65,7 +65,7 @@ function createWindow(): BrowserWindow {
     minWidth: 900,
     minHeight: 560,
     show: false,
-    title: 'SQLite SSH',
+    title: 'Sagittarion',
     backgroundColor: '#17181b',
     titleBarStyle: isMac ? 'hiddenInset' : 'default',
     trafficLightPosition: isMac ? { x: 16, y: 18 } : undefined,
@@ -359,8 +359,8 @@ function registerIpc(): void {
 // ---------------------------------------------------------------------------
 
 // Lets tests (and power users) point the app at a separate profile directory.
-if (process.env['SQLITE_SSH_USER_DATA']) {
-  app.setPath('userData', process.env['SQLITE_SSH_USER_DATA'])
+if (process.env['SAGITTARION_USER_DATA']) {
+  app.setPath('userData', process.env['SAGITTARION_USER_DATA'])
 }
 
 if (!app.requestSingleInstanceLock()) {

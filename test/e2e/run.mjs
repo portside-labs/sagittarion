@@ -37,7 +37,7 @@ function sqlite(db, sql) {
 }
 
 async function main() {
-  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'sqlite-ssh-e2e-'))
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'sagittarion-e2e-'))
   const userData = path.join(tmp, 'userData')
   fs.mkdirSync(userData)
   const db = path.join(tmp, 'e2e.db')
@@ -63,7 +63,7 @@ async function main() {
 
   const app = await electron.launch({
     args: [path.join(root, 'out', 'main', 'index.js')],
-    env: { ...process.env, SQLITE_SSH_USER_DATA: userData, NODE_ENV: 'production' }
+    env: { ...process.env, SAGITTARION_USER_DATA: userData, NODE_ENV: 'production' }
   })
   const consoleErrors = []
   const page = await app.firstWindow()

@@ -10,7 +10,7 @@ import { QueryTab } from '@/components/QueryTab'
 import { Icon } from '@/components/Icons'
 import { clamp, isModKey, modKey } from '@/lib/util'
 
-export const REFRESH_EVENT = 'sqlite-ssh:refresh'
+export const REFRESH_EVENT = 'sagittarion:refresh'
 
 export function Workspace() {
   const session = useStore((s) => s.session)!

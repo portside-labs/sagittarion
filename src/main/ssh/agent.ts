@@ -1,7 +1,7 @@
 import { EventEmitter } from 'node:events'
 import type { ClientChannel } from 'ssh2'
 
-export const READY_PREFIX = '__SQLITE_SSH_READY__'
+export const READY_PREFIX = '__SAGITTARION_READY__'
 
 export class AgentError extends Error {
   readonly sqlite: boolean

@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-SQLite SSH remote agent.
+Sagittarion remote agent.
 
 This file is shipped to the remote host over SSH (base64-encoded in the exec
 command line) and run with the remote's python3. It opens the SQLite file
@@ -14,7 +14,7 @@ Constraints:
 
 Protocol
 --------
-Startup: prints "__SQLITE_SSH_READY__ <token>" once it is listening. Anything
+Startup: prints "__SAGITTARION_READY__ <token>" once it is listening. Anything
 printed before that line (shell rc noise, MOTD-like output) is ignored by the
 client.
 
@@ -46,7 +46,7 @@ try:
 except ImportError:  # pragma: no cover
     from urllib import quote as url_quote  # type: ignore
 
-READY_PREFIX = '__SQLITE_SSH_READY__'
+READY_PREFIX = '__SAGITTARION_READY__'
 MAX_SAFE_INT = 2 ** 53 - 1
 BLOB_INLINE_LIMIT = 1024 * 1024  # send blobs up to 1 MiB in full
 BLOB_PREVIEW_BYTES = 64 * 1024   # otherwise send this much as a preview

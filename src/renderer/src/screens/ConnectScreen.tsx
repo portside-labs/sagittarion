@@ -340,7 +340,7 @@ export function ConnectScreen() {
   return (
     <div className="app-frame">
       <TitleBar
-        center={<span className="app-title">SQLite SSH</span>}
+        center={<span className="app-title">Sagittarion</span>}
         right={
           <button className="btn ghost icon small" title="Settings" onClick={() => setSettingsOpen(true)} data-testid="open-settings">
             <Icon name="settings" />

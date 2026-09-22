@@ -1,4 +1,4 @@
-# SQLite SSH
+# Sagittarion
 
 A desktop GUI for databases on other machines. It opens **SQLite files in place
 over SSH** (nothing is downloaded, nothing is installed on the server) and

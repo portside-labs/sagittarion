@@ -10,8 +10,8 @@ const here = path.dirname(fileURLToPath(import.meta.url))
 export const context = path.join(here, '.context')
 export const keyPath = path.join(context, 'id_ed25519')
 export const IMAGES = {
-  alpine: 'sqlite-ssh-test-alpine',
-  bare: 'sqlite-ssh-test-alpine-bare'
+  alpine: 'sagittarion-test-alpine',
+  bare: 'sagittarion-test-alpine-bare'
 }
 /** Any Alpine-flavoured base image; override when the default cannot be pulled. */
 export const BASE = process.env.DOCKER_BASE || 'alpine:3.20'
