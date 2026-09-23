@@ -113,6 +113,83 @@ export interface AiSettings {
   /** Token budget for the schema excerpt in each request. */
   schemaBudgetTokens: number
   encryptionAvailable: boolean
+  /** Providers with a stored key, plus those that need none. */
+  configuredProviders: AiProviderKind[]
+}
+
+export interface CatalogModel {
+  provider: AiProviderKind
+  id: string
+  label: string
+}
+
+/** Well-known models offered in the model menu; the configured provider's live list is merged in. */
+export const MODEL_CATALOG: CatalogModel[] = [
+  { provider: 'anthropic', id: 'claude-opus-5', label: 'Claude Opus 5' },
+  { provider: 'anthropic', id: 'claude-sonnet-5', label: 'Claude Sonnet 5' },
+  { provider: 'anthropic', id: 'claude-haiku-4-5-20251001', label: 'Claude Haiku 4.5' },
+  { provider: 'openai', id: 'gpt-5.4', label: 'GPT-5.4' },
+  { provider: 'openai', id: 'gpt-5.4-mini', label: 'GPT-5.4 mini' },
+  { provider: 'google', id: 'gemini-2.5-pro', label: 'Gemini 2.5 Pro' },
+  { provider: 'google', id: 'gemini-2.5-flash', label: 'Gemini 2.5 Flash' },
+  { provider: 'groq', id: 'llama-3.3-70b-versatile', label: 'Llama 3.3 70B' },
+  { provider: 'groq', id: 'openai/gpt-oss-120b', label: 'GPT-OSS 120B' }
+]
+
+/** Family names and qualifiers as their makers write them, for ids that are not in the catalogue. */
+const MODEL_WORDS: Record<string, string> = {
+  claude: 'Claude', gpt: 'GPT', gemini: 'Gemini', gemma: 'Gemma', llama: 'Llama', mistral: 'Mistral', mixtral: 'Mixtral',
+  qwen: 'Qwen', qwq: 'QwQ', deepseek: 'DeepSeek', phi: 'Phi', grok: 'Grok', codestral: 'Codestral', devstral: 'Devstral',
+  command: 'Command', nemotron: 'Nemotron', kimi: 'Kimi', glm: 'GLM', minimax: 'MiniMax',
+  opus: 'Opus', sonnet: 'Sonnet', haiku: 'Haiku', pro: 'Pro', flash: 'Flash', lite: 'Lite', mini: 'mini', nano: 'nano',
+  oss: 'OSS', turbo: 'Turbo', instruct: 'Instruct', chat: 'Chat', preview: 'Preview', versatile: 'Versatile', instant: 'Instant',
+  thinking: 'Thinking', vision: 'Vision', coder: 'Coder', code: 'Code', moe: 'MoE', large: 'Large', medium: 'Medium', small: 'Small',
+  ultra: 'Ultra', embed: 'Embed', embedding: 'Embedding', text: 'Text', exp: 'Exp', it: 'IT', r1: 'R1', v3: 'V3', k2: 'K2',
+  maverick: 'Maverick', scout: 'Scout'
+}
+
+/**
+ * A readable title for a model id: "claude-haiku-4-5-20251001" becomes "Claude Haiku 4.5",
+ * "llama3.2:latest" becomes "Llama 3.2". Vendor prefixes, release dates and ":latest" tags are dropped.
+ */
+export function prettyModelName(id: string): string {
+  let s = id.trim()
+  const slash = s.lastIndexOf('/')
+  if (slash >= 0) s = s.slice(slash + 1)
+  s = s.replace(/:latest$/i, '').replace(/:/g, '-')
+  s = s.replace(/-\d{8}$/, '').replace(/-\d{4}-\d{2}-\d{2}$/, '')
+  // "llama3.2" and "gpt4" read better with the number set apart, but only after a family name.
+  s = s.replace(/^([a-z]+)(\d)/i, (m, w: string, d: string) => (MODEL_WORDS[w.toLowerCase()] ? `${w}-${d}` : m))
+  const words: string[] = []
+  for (const t of s.split(/[-_]+/).filter(Boolean)) {
+    const lower = t.toLowerCase()
+    if (lower === 'latest') continue
+    const prev = words[words.length - 1]
+    if (/^\d{1,2}$/.test(t) && prev !== undefined && /^\d+(\.\d+)*$/.test(prev)) {
+      words[words.length - 1] = `${prev}.${t}`
+    } else if (/^\d+(\.\d+)*$/.test(t) || /^o\d+$/.test(lower) || /^\d+[a-z]$/.test(lower) && !/^\d+[bm]$/.test(lower)) {
+      words.push(t)
+    } else if (/^\d+[bm]$/.test(lower)) {
+      words.push(t.toUpperCase())
+    } else if (MODEL_WORDS[lower]) {
+      words.push(MODEL_WORDS[lower])
+    } else {
+      words.push(t.charAt(0).toUpperCase() + t.slice(1))
+    }
+  }
+  let out = ''
+  for (const [i, w] of words.entries()) {
+    if (i === 0) out = w
+    else if (words[i - 1] === 'GPT' && /^\d/.test(w)) out += `-${w}`
+    else out += ` ${w}`
+  }
+  return out || id
+}
+
+/** The catalogue title of a model when it has one, otherwise a readable form of its id. */
+export function modelTitle(provider: AiProviderKind, id: string): string {
+  const known = MODEL_CATALOG.find((m) => m.provider === provider && m.id === id)
+  return known ? known.label : prettyModelName(id)
 }
 
 export interface AiSettingsUpdate {

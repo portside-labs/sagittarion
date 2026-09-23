@@ -18,17 +18,17 @@ import type {
   TableRef
 } from '@shared/types'
 import { formatBytes } from '@shared/export'
-import { Session } from '../ssh/session'
+import type { AgentSession } from '../ssh/agent-session'
 import type { DatabaseDriver } from './driver'
 import { catalogFromSchema, definitionFromSchema, objectsFromSchema, relationsFromSchema, searchSchema, tablesFromSchema } from './catalog'
 
-/** SQLite file on a remote host, driven through the Python helper over SSH. */
+/** SQLite file on this computer or on an SSH host, driven through the Python helper. */
 export class SqliteSshDriver implements DatabaseDriver {
   readonly kind = 'sqlite' as const
   /** SQLite files are small enough to load whole; the lazy calls are answered from this. */
   private cached: Promise<SchemaInfo> | null = null
 
-  constructor(readonly session: Session) {}
+  constructor(readonly session: AgentSession) {}
 
   async open(remotePath: string, readOnly: boolean): Promise<DatabaseInfo> {
     this.cached = null

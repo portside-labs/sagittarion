@@ -8,7 +8,7 @@ export function Toasts() {
   return (
     <div className="toasts">
       {toasts.map((t) => (
-        <div key={t.id} className={`toast ${t.kind}`} role="status">
+        <div key={t.id} className={`toast ${t.kind} ${t.detail ? 'has-detail' : ''} ${t.leaving ? 'leaving' : ''}`} role="status">
           <div className="toast-body">
             <div className="toast-msg">{t.message}</div>
             {t.detail ? <div className="toast-detail">{t.detail}</div> : null}

@@ -1,6 +1,8 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import type { RowsResult, StatementResult } from '@shared/types'
 import { tableKey } from '@shared/connections'
+import type { TableRef } from '@shared/types'
+import type { CompletionData, TableEntry } from '@/lib/sql-complete'
 import { AskPanel, emptyChat, type ChatState } from './AskPanel'
 import { PaneHeader, PaneLayout, type DragHandleProps } from './PaneLayout'
 import { defaultLayout, moveLeaf, setRatio, type PaneId } from '@/lib/layout'
@@ -14,11 +16,36 @@ import { errorMessage, formatDuration, formatNumber, modKey } from '@/lib/util'
 
 const LIMITS = [200, 1000, 5000, 20000]
 
+/** Column names of a table, fetching them through the store when they are not cached yet. */
+async function loadColumnsFor(ref: TableRef): Promise<string[]> {
+  const key = tableKey(ref)
+  const names = (state: ReturnType<typeof useStore.getState>) => {
+    const t = state.tables[key]
+    return t?.status === 'ready' ? t.details.columns.map((c) => c.name) : t?.status === 'loading' ? null : []
+  }
+  await useStore.getState().loadTable(ref)
+  const now = names(useStore.getState())
+  if (now !== null) return now
+  // Another caller is fetching it; wait for the store to settle.
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => {
+      unsub()
+      resolve([])
+    }, 10_000)
+    const unsub = useStore.subscribe((state) => {
+      const cols = names(state)
+      if (cols === null) return
+      clearTimeout(timer)
+      unsub()
+      resolve(cols)
+    })
+  })
+}
+
 export function QueryTab({ tab, active }: { tab: Extract<Tab, { kind: 'query' }>; active: boolean }) {
   const session = useStore((s) => s.session)!
   const catalog = useStore((s) => s.catalog)
   const names = useStore((s) => s.names)
-  const tableCache = useStore((s) => s.tables)
   const refreshSchema = useStore((s) => s.refreshSchema)
   const setStatus = useStore((s) => s.setStatus)
   const setInTransaction = useStore((s) => s.setInTransaction)
@@ -44,31 +71,20 @@ export function QueryTab({ tab, active }: { tab: Extract<Tab, { kind: 'query' }>
     if (active) requestAnimationFrame(() => editorRef.current?.focus())
   }, [active])
 
-  // Autocomplete knows every table name (up to a cap) and the columns of tables that have been looked at.
-  const schemaMap = useMemo(() => {
+  // Autocomplete: every table name from the index, columns fetched the first time a table is referenced.
+  const completion = useMemo<CompletionData | undefined>(() => {
     if (!catalog) return undefined
-    const cap = 5000
-    const colsFor = (schema: string | undefined, name: string) => {
-      const t = tableCache[tableKey({ schema, name })]
-      return t?.status === 'ready' ? t.details.columns.map((c) => c.name) : []
+    const tables: TableEntry[] = names.entries.map((e) => ({ schema: e.obj.schema, name: e.obj.name, kind: e.obj.kind === 'view' ? 'view' : 'table' }))
+    return {
+      tables,
+      defaultSchema: catalog.kind === 'postgres' ? (catalog.defaultSchema ?? 'public') : undefined,
+      columnsFor: (t) => {
+        const cached = useStore.getState().tables[tableKey({ schema: t.schema, name: t.name })]
+        return cached?.status === 'ready' ? cached.details.columns.map((c) => c.name) : undefined
+      },
+      loadColumns: (t) => loadColumnsFor({ schema: t.schema, name: t.name })
     }
-    let n = 0
-    if (catalog.kind === 'postgres') {
-      const m: Record<string, Record<string, string[]>> = {}
-      for (const e of names.entries) {
-        if (n++ > cap) break
-        const s = e.obj.schema ?? catalog.defaultSchema ?? 'public'
-        ;(m[s] ??= {})[e.obj.name] = colsFor(e.obj.schema, e.obj.name)
-      }
-      return m
-    }
-    const m: Record<string, string[]> = {}
-    for (const e of names.entries) {
-      if (n++ > cap) break
-      m[e.obj.name] = colsFor(undefined, e.obj.name)
-    }
-    return m
-  }, [catalog, names, tableCache])
+  }, [catalog, names])
 
   const run = async (sqlOverride?: string) => {
     if (running) return
@@ -144,8 +160,7 @@ export function QueryTab({ tab, active }: { tab: Extract<Tab, { kind: 'query' }>
                 sqlRef.current = v
               }}
               onRun={() => void run()}
-              schema={schemaMap}
-              defaultSchema={catalog?.kind === 'postgres' ? catalog.defaultSchema ?? 'public' : undefined}
+              completion={completion}
               dialect={session.kind}
               placeholder="SELECT * FROM …"
             />
@@ -209,7 +224,7 @@ export function QueryTab({ tab, active }: { tab: Extract<Tab, { kind: 'query' }>
           <Icon name="layout" />
         </button>
         <button className={`btn small ${chatOpen ? 'active' : 'ghost'}`} onClick={() => setChatOpen(!chatOpen)} title={chatOpen ? 'Hide the plain-English chat' : 'Ask in plain English'} data-testid="ask-toggle">
-          <Icon name="sparkles" /> Ask
+          <Icon name="chat" /> Ask
         </button>
       </div>
       {running ? <div className="loading-bar" /> : null}
@@ -217,7 +232,7 @@ export function QueryTab({ tab, active }: { tab: Extract<Tab, { kind: 'query' }>
         <PaneLayout layout={layout} hidden={hidden} render={renderPane} onRatio={(path, ratio) => setLayout(setRatio(layout, path, ratio))} onMove={(id, target, side) => setLayout(moveLeaf(layout, id, target, side))} />
         {!chatOpen ? (
           <button className="ask-strip" onClick={() => setChatOpen(true)} title="Ask in plain English" data-testid="ask-strip">
-            <Icon name="sparkles" size={14} />
+            <Icon name="chat" size={14} />
             <span className="ask-strip-label">Ask</span>
           </button>
         ) : null}

@@ -431,7 +431,7 @@ describe.skipIf(!enabled)('PostgreSQL driver', () => {
       })
       const info = manager.info(conn)
       expect(info.kind).toBe('postgres')
-      expect(info.tunnel).toBe(`${ssh.username}@${ssh.host}`)
+      expect(info.tunnel).toBe(`${ssh.username}@${ssh.host}:${ssh.port}`)
       expect(info.target).toBe(`test@${server.host}${server.port !== 5432 ? `:${server.port}` : ''}/app`)
       expect(info.db?.details.find((x) => x.label === 'tunnel')?.value).toContain('via')
       const rows = await manager.driver(conn.id).rows({ table: 'settings', offset: 0, limit: 10, withCount: true })

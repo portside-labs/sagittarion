@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useLayoutEffect, useState } from 'react'
 import { AI_PRESETS, SCHEMA_BUDGETS, type AiProviderKind, type AiSettingsUpdate } from '@shared/ai'
 import { useStore } from '@/store'
 import { Modal } from './Modal'
@@ -9,6 +9,7 @@ const PROVIDER_ORDER: AiProviderKind[] = ['openai', 'anthropic', 'google', 'groq
 
 export function SettingsDialog() {
   const open = useStore((s) => s.settingsOpen)
+  const intent = useStore((s) => s.settingsIntent)
   const setOpen = useStore((s) => s.setSettingsOpen)
   const settings = useStore((s) => s.settings)
   const loadSettings = useStore((s) => s.loadSettings)
@@ -25,8 +26,8 @@ export function SettingsDialog() {
   const [models, setModels] = useState<string[] | null>(null)
   const [busy, setBusy] = useState<null | 'save' | 'test' | 'remove' | 'models'>(null)
 
-  // Load the saved values each time the dialog opens.
-  useEffect(() => {
+  // Load the saved values each time the dialog opens, before the first paint so no stale draft shows.
+  useLayoutEffect(() => {
     if (!open || !settings) return
     setProvider(settings.provider)
     setBaseUrl(settings.baseUrl)
@@ -37,7 +38,17 @@ export function SettingsDialog() {
     setAutoRun(settings.autoRun)
     setBudget(settings.schemaBudgetTokens)
     setModels(null)
-  }, [open, settings])
+    // Opened from the model picker: start on that provider with the model filled in.
+    if (intent && intent.provider !== settings.provider) {
+      const p = AI_PRESETS[intent.provider]
+      setProvider(intent.provider)
+      setBaseUrl(p.baseUrl)
+      setModel(intent.model || p.defaultModel)
+      setEmbeddingModel('')
+    } else if (intent?.model) {
+      setModel(intent.model)
+    }
+  }, [open, settings, intent])
 
   if (!open) return null
 
@@ -159,7 +170,7 @@ export function SettingsDialog() {
       <div className="settings-body" data-testid="settings-dialog">
         <section>
           <h2>
-            <Icon name="sparkles" /> Ask in plain English
+            <Icon name="chat" /> Ask in plain English
           </h2>
           <p className="hint">
             Questions typed into the Ask box are turned into SQL by a language model of your choice, using your own account. The app sends your

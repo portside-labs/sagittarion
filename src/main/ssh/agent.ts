@@ -1,5 +1,16 @@
 import { EventEmitter } from 'node:events'
-import type { ClientChannel } from 'ssh2'
+
+/** What the agent needs from its transport: an SSH exec channel or a local child process. */
+export interface AgentStream {
+  on(event: 'data', cb: (chunk: Buffer) => void): unknown
+  on(event: 'exit', cb: (code: number | null, signal?: string) => void): unknown
+  on(event: 'close', cb: () => void): unknown
+  on(event: 'error', cb: (err: Error) => void): unknown
+  stderr: { on(event: 'data', cb: (chunk: Buffer) => void): unknown }
+  write(data: string, cb?: (err?: Error | null) => void): unknown
+  end(): unknown
+  close(): unknown
+}
 
 export const READY_PREFIX = '__SAGITTARION_READY__'
 
@@ -37,7 +48,7 @@ export class PythonAgent extends EventEmitter {
   private exitSignal: string | null = null
 
   constructor(
-    private readonly stream: ClientChannel,
+    private readonly stream: AgentStream,
     private readonly token: string
   ) {
     super()

@@ -7,6 +7,10 @@ export type IconName =
   | 'trigger'
   | 'function'
   | 'grip'
+  | 'send'
+  | 'calendar'
+  | 'clock'
+  | 'chat'
   | 'layout'
   | 'key'
   | 'chevron-right'
@@ -59,6 +63,25 @@ const paths: Record<IconName, ReactNode> = {
     </>
   ),
   trigger: <path d="M13 2L4 14h7l-1 8 9-12h-7l1-8z" />,
+  calendar: (
+    <>
+      <rect x="3" y="4" width="18" height="18" rx="2" />
+      <path d="M16 2v4M8 2v4M3 10h18" />
+    </>
+  ),
+  clock: (
+    <>
+      <circle cx="12" cy="12" r="10" />
+      <path d="M12 6v6l4 2" />
+    </>
+  ),
+  send: (
+    <>
+      <path d="M22 2L11 13" />
+      <path d="M22 2l-7 20-4-9-9-4 20-7z" />
+    </>
+  ),
+  chat: <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" />,
   grip: (
     <>
       <circle cx="9" cy="6" r="1.4" fill="currentColor" stroke="none" />

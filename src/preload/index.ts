@@ -16,7 +16,14 @@ const api: Api = {
   connections: {
     list: () => ipcRenderer.invoke('connections:list'),
     save: (cfg) => ipcRenderer.invoke('connections:save', cfg),
-    remove: (id) => ipcRenderer.invoke('connections:remove', id)
+    remove: (id) => ipcRenderer.invoke('connections:remove', id),
+    setGroup: (ids, group) => ipcRenderer.invoke('connections:setGroup', ids, group),
+    duplicate: (id) => ipcRenderer.invoke('connections:duplicate', id)
+  },
+  sshProfiles: {
+    list: () => ipcRenderer.invoke('sshProfiles:list'),
+    save: (profile) => ipcRenderer.invoke('sshProfiles:save', profile),
+    remove: (id) => ipcRenderer.invoke('sshProfiles:remove', id)
   },
   session: {
     open: (cfg, opts) => ipcRenderer.invoke('session:open', cfg, opts ?? {}),
@@ -42,7 +49,8 @@ const api: Api = {
     home: (sessionId) => ipcRenderer.invoke('sftp:home', sessionId)
   },
   dialog: {
-    pickPrivateKey: () => ipcRenderer.invoke('dialog:pickPrivateKey')
+    pickPrivateKey: () => ipcRenderer.invoke('dialog:pickPrivateKey'),
+    pickSqliteFile: (current) => ipcRenderer.invoke('dialog:pickSqliteFile', current)
   },
   exportData: (req) => ipcRenderer.invoke('export:save', req),
   settings: {

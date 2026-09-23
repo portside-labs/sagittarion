@@ -143,4 +143,33 @@ export class ConnectionStore {
     const list = await this.load()
     await this.persist(list.filter((c) => c.id !== id))
   }
+
+  /** A copy of a saved connection, secrets included, named "<name> copy" (numbered when that name is taken). */
+  async duplicate(id: string): Promise<ConnectionConfig> {
+    const list = await this.load()
+    const source = list.find((c) => c.id === id)
+    if (!source) throw new Error('That connection no longer exists.')
+    const taken = new Set(list.map((c) => c.name.toLowerCase()))
+    const base = `${source.name.replace(/ copy(?: \d+)?$/i, '')} copy`
+    let name = base
+    for (let n = 2; taken.has(name.toLowerCase()); n++) name = `${base} ${n}`
+    const copy: StoredConnection = { ...structuredClone(source), id: randomUUID(), name, createdAt: Date.now() }
+    delete copy.lastUsedAt
+    list.push(copy)
+    await this.persist(list)
+    return this.toConfig(copy)
+  }
+
+  /** Moves connections into a group, or out of any group when it is null. */
+  async setGroup(ids: string[], group: string | null): Promise<void> {
+    const list = await this.load()
+    const name = group?.trim()
+    const wanted = new Set(ids)
+    for (const c of list) {
+      if (!wanted.has(c.id)) continue
+      if (name) c.group = name
+      else delete c.group
+    }
+    await this.persist(list)
+  }
 }

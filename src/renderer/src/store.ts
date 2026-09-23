@@ -1,6 +1,6 @@
 import { create } from 'zustand'
-import type { AppInfo, Catalog, ConnectionConfig, ObjectKind, ObjectRef, SearchResult, SessionInfo, TableRef } from '@shared/types'
-import type { AiSettings } from '@shared/ai'
+import type { AppInfo, Catalog, ConnectionConfig, ObjectKind, ObjectRef, SearchResult, SessionInfo, SshProfile, TableRef } from '@shared/types'
+import type { AiSettings, AiProviderKind } from '@shared/ai'
 import { sameTable, tableKey, tableLabel } from '@shared/connections'
 import { errorMessage } from './lib/util'
 import { appendNames, emptyNames, groupKey, type GroupState, type NameIndex, type TableState } from './lib/tree'
@@ -10,11 +10,18 @@ export type Tab =
   | { id: string; kind: 'table'; schema?: string; table: string; title: string }
   | { id: string; kind: 'query'; title: string; initialSql: string }
 
+export interface SettingsIntent {
+  provider: AiProviderKind
+  model?: string
+}
+
 export interface Toast {
   id: number
   kind: 'info' | 'success' | 'error'
   message: string
   detail?: string
+  /** Set while the exit animation plays. */
+  leaving?: boolean
 }
 
 export interface ConfirmRequest {
@@ -38,6 +45,10 @@ const NAMES_PAGE = 4000
 interface State {
   appInfo: AppInfo | null
   connections: ConnectionConfig[]
+  /** Saved SSH hosts, reusable by any connection. */
+  sshProfiles: SshProfile[]
+  /** True once the profile list has been read, so a connection's profile can be checked against it. */
+  sshProfilesLoaded: boolean
   session: SessionInfo | null
   /** Schema names and counts; the rest of the tree loads on demand. */
   catalog: Catalog | null
@@ -60,6 +71,8 @@ interface State {
   queryCounter: number
   settings: AiSettings | null
   settingsOpen: boolean
+  /** What the settings dialog should start on when opened from a model choice. */
+  settingsIntent: SettingsIntent | null
   /** Arrangement of the editor, chat and results panes in query tabs. */
   queryLayout: LayoutNode
   chatOpen: boolean
@@ -68,10 +81,11 @@ interface State {
   setChatOpen(open: boolean): void
   init(): Promise<void>
   loadSettings(): Promise<void>
-  setSettingsOpen(open: boolean): void
+  setSettingsOpen(open: boolean, intent?: SettingsIntent): void
   confirm(message: string, detail?: string, confirmLabel?: string, destructive?: boolean): Promise<boolean>
   resolveConfirm(ok: boolean): void
   loadConnections(): Promise<void>
+  loadSshProfiles(): Promise<void>
   setSession(s: SessionInfo | null): void
   /** Reload the catalog and restart the name stream; drops every cached list. */
   refreshSchema(): Promise<void>
@@ -130,11 +144,14 @@ const emptySession = {
 export const useStore = create<State>()((set, get) => ({
   appInfo: null,
   connections: [],
+  sshProfiles: [],
+  sshProfilesLoaded: false,
   ...emptySession,
   toasts: [],
   confirmRequest: null,
   settings: null,
   settingsOpen: false,
+  settingsIntent: null,
   queryLayout: loadLayout(),
   chatOpen: localStorage.getItem('askPanelOpen') !== 'false',
 
@@ -164,8 +181,8 @@ export const useStore = create<State>()((set, get) => ({
     }
   },
 
-  setSettingsOpen(open) {
-    set({ settingsOpen: open })
+  setSettingsOpen(open, intent) {
+    set({ settingsOpen: open, settingsIntent: open ? (intent ?? null) : null })
   },
 
   confirm(message, detail, confirmLabel = 'OK', destructive = false) {
@@ -190,14 +207,14 @@ export const useStore = create<State>()((set, get) => ({
     } catch (e) {
       get().toast('error', 'Could not initialise', errorMessage(e))
     }
-    await get().loadConnections()
+    // Profiles and connections arrive together: a connection's profile is checked against the list on select.
+    await Promise.all([get().loadSshProfiles(), get().loadConnections()])
     await get().loadSettings()
     window.api.session.onClosed((e) => {
       const s = get().session
       if (s && s.sessionId === e.sessionId) {
         get().toast('error', 'Connection closed', e.reason)
-        set({ ...emptySession })
-        void get().loadConnections()
+        void get().loadConnections().then(() => set({ ...emptySession }))
       }
     })
   },
@@ -207,6 +224,14 @@ export const useStore = create<State>()((set, get) => ({
       set({ connections: await window.api.connections.list() })
     } catch (e) {
       get().toast('error', 'Could not load saved connections', errorMessage(e))
+    }
+  },
+
+  async loadSshProfiles() {
+    try {
+      set({ sshProfiles: await window.api.sshProfiles.list(), sshProfilesLoaded: true })
+    } catch (e) {
+      get().toast('error', 'Could not load SSH profiles', errorMessage(e))
     }
   },
 
@@ -381,8 +406,9 @@ export const useStore = create<State>()((set, get) => ({
     } catch {
       /* already gone */
     }
-    set({ ...emptySession })
+    // Refresh the list first so the connect screen opens on the connection that was just used.
     await get().loadConnections()
+    set({ ...emptySession })
   },
 
   toast(kind, message, detail) {
@@ -392,7 +418,10 @@ export const useStore = create<State>()((set, get) => ({
   },
 
   dismissToast(id) {
-    set({ toasts: get().toasts.filter((t) => t.id !== id) })
+    const current = get().toasts.find((t) => t.id === id)
+    if (!current || current.leaving) return
+    set({ toasts: get().toasts.map((t) => (t.id === id ? { ...t, leaving: true } : t)) })
+    setTimeout(() => set({ toasts: get().toasts.filter((t) => t.id !== id) }), 160)
   },
 
   setInTransaction(v) {

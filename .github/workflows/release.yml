@@ -1,0 +1,117 @@
+name: Release
+
+# Builds installers when a version tag is pushed and attaches them to the
+# GitHub release for that tag (creating it if needed). macOS builds are
+# signed and notarized when the Apple secrets are configured; without them
+# the build still runs and produces unsigned installers.
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  macos:
+    name: macOS (signed, notarized)
+    runs-on: macos-latest
+    env:
+      # Developer ID Application certificate, exported as a .p12 and base64 encoded.
+      CSC_LINK: ${{ secrets.MAC_CERT_P12_BASE64 }}
+      CSC_KEY_PASSWORD: ${{ secrets.MAC_CERT_PASSWORD }}
+      # Notarization: an App Store Connect API key (preferred)...
+      APPLE_API_KEY: ${{ secrets.APPLE_API_KEY_P8 && '/tmp/AuthKey.p8' || '' }}
+      APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+      APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+      # ...or an Apple ID with an app-specific password.
+      APPLE_ID: ${{ secrets.APPLE_ID }}
+      APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+      APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: Write the App Store Connect API key
+        if: ${{ env.APPLE_API_KEY != '' }}
+        run: printf '%s' "${{ secrets.APPLE_API_KEY_P8 }}" > /tmp/AuthKey.p8
+      - name: Warn when signing secrets are missing
+        if: ${{ env.CSC_LINK == '' }}
+        run: echo "::warning::MAC_CERT_P12_BASE64 is not set; the macOS build will be unsigned. See docs/RELEASING.md."
+      - name: Build, sign and notarize
+        run: npx electron-vite build && npx electron-builder --mac dmg zip --arm64 --x64 --publish never
+      - name: Verify the signature and notarization ticket
+        if: ${{ env.CSC_LINK != '' }}
+        run: |
+          set -e
+          app=$(ls -d release/mac-arm64/*.app | head -1)
+          codesign --verify --deep --strict --verbose=2 "$app"
+          spctl --assess --type execute --verbose=2 "$app"
+      - name: Checksums
+        run: cd release && shasum -a 256 *.dmg *.zip > SHA256SUMS-macos.txt && cat SHA256SUMS-macos.txt
+      - uses: actions/upload-artifact@v6
+        with:
+          name: macos
+          path: |
+            release/*.dmg
+            release/*.zip
+            release/SHA256SUMS-macos.txt
+
+  windows:
+    name: Windows
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npx electron-vite build && npx electron-builder --win nsis --x64 --publish never
+      - uses: actions/upload-artifact@v6
+        with:
+          name: windows
+          path: release/*.exe
+
+  linux:
+    name: Linux
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npx electron-vite build && npx electron-builder --linux AppImage deb --x64 --publish never
+      - uses: actions/upload-artifact@v6
+        with:
+          name: linux
+          path: |
+            release/*.AppImage
+            release/*.deb
+
+  publish:
+    name: Attach to the GitHub release
+    needs: [macos, windows, linux]
+    runs-on: ubuntu-latest
+    if: ${{ startsWith(github.ref, 'refs/tags/v') }}
+    steps:
+      - uses: actions/download-artifact@v6
+        with:
+          path: dist
+      - name: Upload installers
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -e
+          tag="${GITHUB_REF_NAME}"
+          if ! gh release view "$tag" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release create "$tag" -R "$GITHUB_REPOSITORY" --title "$tag" --generate-notes
+          fi
+          gh release upload "$tag" -R "$GITHUB_REPOSITORY" --clobber dist/*/*

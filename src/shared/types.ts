@@ -3,7 +3,7 @@
 export type DatabaseKind = 'sqlite' | 'postgres'
 
 export const KIND_LABELS: Record<DatabaseKind, string> = {
-  sqlite: 'SQLite over SSH',
+  sqlite: 'SQLite',
   postgres: 'PostgreSQL'
 }
 
@@ -45,15 +45,34 @@ export interface ConnectionConfig {
   kind: DatabaseKind
   /** Optional accent colour shown in the sidebar and title bar. */
   color?: string
+  /** Optional group the connection is listed under: an app, an environment, whatever suits the user. */
+  group?: string
   readOnly?: boolean
   lastUsedAt?: number
   createdAt?: number
-  /** SQLite: the host holding the file. Postgres: the tunnel host, used when pg.tunnel is set. */
+  /** SQLite: the host holding the file when `remote` is set. Postgres: the tunnel host, used when pg.tunnel is set. */
   ssh: SshConfig
-  /** SQLite only. Path of the file on the remote host; `~` is expanded remotely. */
+  /** SQLite: the file lives on the SSH host rather than on this computer. */
+  remote?: boolean
+  /** Use a saved SSH profile for the SSH host or tunnel instead of the inline `ssh` fields. */
+  sshProfileId?: string
+  /** SQLite only. Path of the database file, on this computer or on the SSH host; `~` is expanded there. */
   remotePath?: string
   /** Postgres only. */
   pg?: PostgresConfig
+}
+
+/** SSH details saved once and reused by any number of connections. */
+export interface SshProfile extends SshConfig {
+  id: string
+  name: string
+  createdAt?: number
+  lastUsedAt?: number
+}
+
+export interface StoredSshProfile extends Omit<SshProfile, 'password' | 'passphrase'> {
+  encryptedPassword?: string
+  encryptedPassphrase?: string
 }
 
 type StoredSsh = Omit<SshConfig, 'password' | 'passphrase'> & { encryptedPassword?: string; encryptedPassphrase?: string }
@@ -292,6 +311,8 @@ export interface TableDetails extends TableMeta {
 export interface ResultColumn {
   name: string
   declType?: string
+  /** The type was read off the values rather than declared (SQLite query results). */
+  inferred?: boolean
   pk?: number
   notnull?: boolean
   dflt?: string | null

@@ -6,10 +6,13 @@ import os from 'node:os'
 import path from 'node:path'
 import { startMockServer } from './mock-ssh/server.mjs'
 import { Session } from '../src/main/ssh/session'
+import { LocalSession } from '../src/main/ssh/local-session'
+import { SshProfileStore } from '../src/main/store/ssh-profiles'
+import { normalizeConnection, resolveSshProfile, describeTarget } from '../src/shared/connections'
 import { fingerprintSha256, matchOpenSshKnownHosts, parseKeyType, KnownHostsStore } from '../src/main/ssh/hostkeys'
 import { toCsv, toSqlInserts } from '../src/shared/export'
 import { ConnectionManager } from '../src/main/connections/manager'
-import { migrateStored } from '../src/main/store/connections'
+import { migrateStored, noopCodec } from '../src/main/store/connections'
 import type { RowsResult, SshConfig } from '../src/shared/types'
 
 const root = path.resolve(__dirname, '..')
@@ -111,6 +114,14 @@ describe('Session over SSH', () => {
     const first = q.results[0] as RowsResult
     expect(first.kind).toBe('rows')
     expect(first.rows[0][1]).toBe('Radia Hamilton')
+    // Query results carry the storage class seen in the values, since SQLite declares none.
+    expect(first.columns.map((c) => [c.declType, c.inferred])).toEqual([['INTEGER', true], ['TEXT', true]])
+    const typed = (await s.query("SELECT NULL AS nil, CAST('x' AS BLOB) AS b, 1.5 AS f, 1 AS i, 'a' AS t FROM users LIMIT 3")).results[0] as RowsResult
+    expect(typed.kind).toBe('rows')
+    expect(typed.columns.map((c) => c.declType)).toEqual([undefined, 'BLOB', 'REAL', 'INTEGER', 'TEXT'])
+    // A column mixing integers and reals is numeric; one mixing text and numbers is left untyped.
+    const mixed = (await s.query('SELECT 1 AS n, 1 AS m UNION ALL SELECT 2.5, \'x\'')).results[0] as RowsResult
+    expect(mixed.columns.map((c) => c.declType)).toEqual(['REAL', undefined])
     expect(q.tx).toBe(false)
 
     const big = await s.rows({ table: 'big_numbers', offset: 0, limit: 10 })
@@ -262,7 +273,99 @@ describe('Session over SSH', () => {
   })
 })
 
+describe('LocalSession', () => {
+  it('runs the helper on this computer and serves the same operations', async () => {
+    const db = freshDb('local.db')
+    const stages: string[] = []
+    const s = new LocalSession({ agentSource, onProgress: (p) => stages.push(p.stage) })
+    await s.connect()
+    expect(s.interpreter).toMatch(/python/)
+    const info = await s.openDatabase(db)
+    expect(info.path).toBe(db)
+    expect(info.readonly).toBe(false)
+    expect(stages).toEqual(['probing', 'starting-agent', 'opening'])
+    const schema = await s.schema()
+    expect(schema.tables.map((t) => t.name)).toEqual(['big_numbers', 'orders', 'settings', 'users', 'weird name'])
+    const q = await s.query('SELECT count(*) FROM users')
+    expect((q.results[0] as RowsResult).rows[0][0]).toBe(60)
+    const listing = await s.readdir(path.dirname(db))
+    expect(listing.entries.some((e) => e.name === 'local.db' && !e.isDir)).toBe(true)
+    expect(await s.home()).toBe(os.homedir())
+    expect(await s.ping()).toBe(true)
+    const closed: string[] = []
+    s.on('close', (e: { reason: string }) => closed.push(e.reason))
+    s.close()
+    expect(s.closed).toBe(true)
+    expect(closed).toEqual(['Disconnected'])
+  })
+
+  it('explains a missing interpreter', async () => {
+    const s = new LocalSession({ agentSource, interpreters: ['/nonexistent/python3'] })
+    await expect(s.connect()).rejects.toThrow(/Python 3 was not found on this computer/)
+  })
+})
+
+describe('SSH profiles', () => {
+  it('stores profiles with encrypted secrets and resolves them into connections', async () => {
+    const codec = { available: true, encrypt: (p: string) => `enc:${p}`, decrypt: (c: string) => (c.startsWith('enc:') ? c.slice(4) : null) }
+    const store = new SshProfileStore(path.join(tmp, 'profiles.json'), codec)
+    const saved = await store.save({ id: '', name: 'Mock box', host: server.host, port: server.port, username: server.username, auth: 'password', password: server.password, savePassword: true })
+    expect(saved.id).toBeTruthy()
+    expect(saved.password).toBe(server.password)
+    const raw = JSON.parse(fs.readFileSync(path.join(tmp, 'profiles.json'), 'utf8'))
+    expect(raw.profiles[0].encryptedPassword).toBe(`enc:${server.password}`)
+    expect(raw.profiles[0].password).toBeUndefined()
+    expect((await store.list()).map((p) => p.name)).toEqual(['Mock box'])
+    // A connection that references the profile gets its SSH fields from it.
+    const cfg = normalizeConnection({ id: 'x', name: 'x', kind: 'sqlite', remote: true, sshProfileId: saved.id, ssh: { host: '', port: 22, username: '', auth: 'key' }, remotePath: '/tmp/x.db' })
+    const resolved = resolveSshProfile(cfg, [saved])
+    expect(resolved.ssh.host).toBe(server.host)
+    expect(resolved.ssh.password).toBe(server.password)
+    expect(describeTarget(resolved)).toBe(`test@127.0.0.1:${server.port}`)
+    // Secrets are dropped when the codec cannot store them.
+    const plain = new SshProfileStore(path.join(tmp, 'profiles2.json'), noopCodec)
+    const p2 = await plain.save({ id: '', name: 'No codec', host: 'h', port: 22, username: 'u', auth: 'password', password: 'pw', savePassword: true })
+    expect(p2.password).toBeUndefined()
+    await store.remove(saved.id)
+    expect(await store.list()).toEqual([])
+  })
+
+  it('treats connections saved before local files existed as remote', () => {
+    expect(normalizeConnection({ id: 'a', name: 'a', kind: 'sqlite', ssh: { host: 'db.example.com', port: 22, username: 'u', auth: 'key' }, remotePath: '/x.db' }).remote).toBe(true)
+    expect(normalizeConnection({ id: 'b', name: 'b', kind: 'sqlite', ssh: { host: '', port: 22, username: '', auth: 'key' }, remotePath: '/x.db' }).remote).toBe(false)
+    expect(normalizeConnection({ id: 'c', name: 'c', kind: 'sqlite', remote: false, ssh: { host: 'db.example.com', port: 22, username: 'u', auth: 'key' }, remotePath: '/x.db' }).remote).toBe(false)
+    expect(describeTarget(normalizeConnection({ id: 'd', name: 'd', kind: 'sqlite', remote: false, ssh: { host: '', port: 22, username: '', auth: 'key' }, remotePath: '/x.db' }))).toBe('This computer')
+  })
+})
+
 describe('ConnectionManager', () => {
+  it('opens a local SQLite file without any SSH', async () => {
+    const db = freshDb('local-manager.db')
+    const manager = new ConnectionManager({ agentSource, verifyHostKey: async () => true })
+    const conn = await manager.open({ id: 'l1', name: 'Local', kind: 'sqlite', remote: false, ssh: { host: '', port: 22, username: '', auth: 'key' }, remotePath: db })
+    const info = manager.info(conn)
+    expect(info.target).toBe('This computer')
+    expect(info.db?.label).toBe(db)
+    expect(info.interpreter).toMatch(/python/)
+    expect(conn.ssh).toBeNull()
+    const catalog = await manager.driver(conn.id).catalog()
+    expect(catalog.totalTables).toBe(6)
+    expect((await manager.fileSession(conn.id).readdir(path.dirname(db))).entries.length).toBeGreaterThan(0)
+    await manager.close(conn.id)
+    await expect(manager.open({ id: 'l2', name: 'Local', kind: 'sqlite', remote: false, ssh: { host: '', port: 22, username: '', auth: 'key' }, remotePath: '' })).rejects.toThrow(/No database file chosen/)
+  })
+
+  it('resolves an SSH profile when opening a remote SQLite file', async () => {
+    const db = freshDb('profile-manager.db')
+    const profile = { id: 'p1', name: 'Mock box', ...baseConfig() }
+    const manager = new ConnectionManager({ agentSource, verifyHostKey: async () => true, resolveSshProfile: async (id) => (id === 'p1' ? profile : undefined) })
+    const conn = await manager.open({ id: 'r1', name: 'Via profile', kind: 'sqlite', remote: true, sshProfileId: 'p1', ssh: { host: '', port: 22, username: '', auth: 'key' }, remotePath: db })
+    expect(manager.info(conn).target).toBe(`test@127.0.0.1:${server.port}`)
+    expect(conn.ssh).not.toBeNull()
+    await manager.close(conn.id)
+    await expect(manager.open({ id: 'r2', name: 'Gone', kind: 'sqlite', remote: true, sshProfileId: 'missing', ssh: { host: '', port: 22, username: '', auth: 'key' }, remotePath: db })).rejects.toThrow(/no longer exists/)
+  })
+
   it('opens a SQLite connection end to end and reports it', async () => {
     const db = freshDb('m.db')
     const manager = new ConnectionManager({ agentSource, verifyHostKey: async () => true })

@@ -467,6 +467,34 @@ def op_query(req):
                 pass
 
 
+def infer_column_types(rows, ncols):
+    """Storage class per column from the fetched values: INTEGER, REAL, TEXT or BLOB, None when unknown or mixed."""
+    kinds = [set() for _ in range(ncols)]
+    for row in rows:
+        for i, v in enumerate(row):
+            if v is None:
+                continue
+            if isinstance(v, bool):
+                kinds[i].add('INTEGER')
+            elif isinstance(v, int):
+                kinds[i].add('INTEGER')
+            elif isinstance(v, float):
+                kinds[i].add('REAL')
+            elif isinstance(v, (bytes, bytearray, memoryview)):
+                kinds[i].add('BLOB')
+            else:
+                kinds[i].add('TEXT')
+    out = []
+    for k in kinds:
+        if len(k) == 1:
+            out.append(next(iter(k)))
+        elif k == set(['INTEGER', 'REAL']):
+            out.append('REAL')
+        else:
+            out.append(None)
+    return out
+
+
 def run_statements(statements, params, max_rows):
     results = []
     for stmt in statements:
@@ -481,10 +509,12 @@ def run_statements(statements, params, max_rows):
                 fetched = cur.fetchmany(max_rows + 1)
                 truncated = len(fetched) > max_rows
                 fetched = fetched[:max_rows]
+                # sqlite3 exposes no declared types for query results; report the storage class of the values instead.
+                inferred = infer_column_types(fetched, len(columns))
                 results.append({
                     'kind': 'rows',
                     'sql': stmt,
-                    'columns': [{'name': c} for c in columns],
+                    'columns': [dict(name=c, **({'declType': t, 'inferred': True} if t else {})) for c, t in zip(columns, inferred)],
                     'rows': [[encode_cell(v) for v in r] for r in fetched],
                     'rowCount': len(fetched),
                     'truncated': truncated,

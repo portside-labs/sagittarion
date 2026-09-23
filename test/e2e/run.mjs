@@ -61,16 +61,20 @@ async function main() {
     ])
   )
 
-  const app = await electron.launch({
+  const launchOptions = {
     args: [path.join(root, 'out', 'main', 'index.js')],
     env: { ...process.env, SAGITTARION_USER_DATA: userData, NODE_ENV: 'production' }
-  })
+  }
+  let app = await electron.launch(launchOptions)
   const consoleErrors = []
-  const page = await app.firstWindow()
-  page.on('console', (m) => {
-    if (m.type() === 'error') consoleErrors.push(m.text())
-  })
-  page.on('pageerror', (e) => consoleErrors.push(String(e)))
+  let page = await app.firstWindow()
+  const watchConsole = () => {
+    page.on('console', (m) => {
+      if (m.type() === 'error') consoleErrors.push(m.text())
+    })
+    page.on('pageerror', (e) => consoleErrors.push(String(e)))
+  }
+  watchConsole()
   await page.waitForLoadState('domcontentloaded')
   const shot = (name) => page.screenshot({ path: path.join(artifacts, name + '.png') })
 
@@ -85,31 +89,56 @@ async function main() {
     await page.keyboard.press('Escape')
     await page.waitForFunction(() => !document.querySelector('[data-testid=settings-dialog]'))
 
-    // ------------------------------------------------------------ connect
+    // ------------------------------------------------------------ local SQLite: the default
     await page.getByTestId('choose-sqlite').waitFor()
     await shot('00-choose-kind')
     await page.getByTestId('choose-sqlite').click()
+    assert((await page.getByTestId('conn-kind').textContent()).includes('SQLite'), 'the form names the database type')
+    assert((await page.getByTestId('sqlite-remote').isChecked()) === false, 'a new SQLite connection is local by default')
+    await page.getByPlaceholder('Production analytics').fill('E2E local file')
+    await page.getByTestId('sqlite-path').fill(db)
+    await shot('01-connect-local')
+    await page.getByTestId('connect-button').click()
+    await page.getByTestId('tree-table-users').waitFor({ timeout: 30000 })
+    assert((await page.locator('.statusbar').textContent()).includes('This computer'), 'status bar says the file is local')
+    console.log('local file connected; schema loaded')
+    await shot('01b-workspace-empty')
+    await page.getByTestId('disconnect-button').click()
+    await page.getByTestId('new-connection').waitFor()
+
+    // ------------------------------------------------------------ remote SQLite over SSH, saving the host as a profile
+    await page.getByTestId('new-connection').click()
+    await page.getByTestId('choose-sqlite').click()
     await page.getByPlaceholder('Production analytics').fill('E2E mock host')
+    await page.getByTestId('sqlite-remote').check()
     await page.getByPlaceholder('db.example.com').fill(server.host)
     await page.locator('input[type=number]').fill(String(server.port))
     await page.getByPlaceholder('ubuntu').fill(server.username)
     await page.getByRole('button', { name: 'Password', exact: true }).click()
     await page.locator('input[type=password]').fill(server.password)
-    await page.getByPlaceholder('/var/lib/app/data.sqlite or ~/app.db').fill(db)
+    await page.getByTestId('ssh-save-profile').check()
+    await page.getByTestId('ssh-profile-name').fill('E2E SSH')
+    await page.getByTestId('sqlite-path').fill(db)
     await shot('01-connect')
 
     // Remote file browser round trip
-    await page.getByRole('button', { name: /Browse…/ }).click()
+    await page.getByTestId('sqlite-browse').click()
     await page.getByText('Choose a database on the remote host').waitFor({ timeout: 20000 })
     await page.locator('.fb-row.db', { hasText: 'e2e.db' }).waitFor({ timeout: 20000 })
     await shot('02-file-browser')
     await page.locator('.fb-row.db', { hasText: 'e2e.db' }).dblclick()
-    const picked = await page.getByPlaceholder('/var/lib/app/data.sqlite or ~/app.db').inputValue()
+    const picked = await page.getByTestId('sqlite-path').inputValue()
     assert(fs.realpathSync(picked) === fs.realpathSync(db), `file browser filled the path (got ${picked})`)
 
     await page.getByTestId('connect-button').click()
     await page.getByTestId('tree-table-users').waitFor({ timeout: 30000 })
     console.log('connected; schema loaded')
+    const profiles = JSON.parse(fs.readFileSync(path.join(userData, 'ssh-profiles.json'), 'utf8')).profiles
+    assert(profiles.length === 1 && profiles[0].name === 'E2E SSH' && profiles[0].host === server.host, 'the SSH details were saved as a profile')
+    assert(!('password' in profiles[0]), 'the profile stores no plaintext password')
+    const savedConns = JSON.parse(fs.readFileSync(path.join(userData, 'connections.json'), 'utf8')).connections
+    const remoteConn = savedConns.find((c) => c.name === 'E2E mock host')
+    assert(remoteConn && remoteConn.sshProfileId === profiles[0].id && !remoteConn.ssh.host, 'the connection references the profile instead of holding SSH details')
 
     // Sidebar filter: instant local matches for names, column matches via the server search.
     await page.getByTestId('tree-filter').fill('ord')
@@ -286,7 +315,41 @@ async function main() {
     })
     ;[askBox, editorBox] = [await boxOf('ask-panel'), await boxOf('pane-editor')]
     assert(askBox.x > editorBox.x, 'reset puts the chat back to the right')
+    // Model picker under the chat input: unconfigured models explain what to set up.
+    await page.getByTestId('model-button').click()
+    await page.getByTestId('model-menu').waitFor()
+    await page.waitForTimeout(200)
+    assert((await page.getByTestId('model-button').textContent()).includes('GPT-5.4 mini'), 'the picker shows the model title, not its id')
+    {
+      const [vw, vh] = await page.evaluate(() => [window.innerWidth, window.innerHeight])
+      const mb = await page.getByTestId('model-menu').boundingBox()
+      assert(mb.x >= 0 && mb.y >= 0 && mb.x + mb.width <= vw && mb.y + mb.height <= vh, 'the model menu stays inside the window')
+    }
+    await shot('06e-model-menu')
+    await page.getByTestId('model-claude-sonnet-5').click()
+    await page.getByTestId('model-notice').waitFor()
+    await shot('06f-model-notice')
+    assert((await page.getByTestId('model-notice').textContent()).includes('Anthropic'), 'the notice names the provider to set up')
+    await page.getByTestId('model-notice-settings').click()
+    await page.getByTestId('settings-dialog').waitFor()
+    assert((await page.getByTestId('ai-provider').inputValue()) === 'anthropic', 'settings open on the picked provider')
+    assert((await page.getByTestId('ai-model').inputValue()) === 'claude-sonnet-5', 'settings open with the picked model')
+    await page.keyboard.press('Escape')
+    await page.waitForFunction(() => !document.querySelector('[data-testid=settings-dialog]'))
+
+    // Autocomplete: table names while typing, and a table's columns after its name (fetched on demand).
     await cm.click()
+    await page.keyboard.type('SELECT * FROM us')
+    await page.locator('.cm-tooltip-autocomplete li', { hasText: 'users' }).first().waitFor({ timeout: 5000 })
+    await page.keyboard.press('Escape')
+    await page.keyboard.press(`${mod}+A`)
+    await page.keyboard.press('Backspace')
+    await page.keyboard.type('SELECT * FROM orders WHERE orders.')
+    await page.locator('.cm-tooltip-autocomplete li', { hasText: 'status' }).first().waitFor({ timeout: 10000 })
+    await shot('06d-autocomplete')
+    await page.keyboard.press('Escape')
+    await page.keyboard.press(`${mod}+A`)
+    await page.keyboard.press('Backspace')
     await page.keyboard.type('SELECT id, name, email, balance FROM users ORDER BY id LIMIT 5;\nSELECT count(*) AS orders FROM orders;')
     await page.keyboard.press(`${mod}+Enter`)
     await page.getByTestId('results').waitFor({ timeout: 20000 })
@@ -298,6 +361,9 @@ async function main() {
     const resultRows = await resultGrid.locator('tbody tr').count()
     assert(resultRows === 5, `query result has 5 rows (got ${resultRows})`)
     assert((await resultGrid.locator('td[data-r="0"][data-c="1"]').textContent()) === 'Edited via GUI', 'query sees the applied edit')
+    // Query results show a type glyph per column, inferred from the values for SQLite.
+    await resultGrid.locator('thead .th-type').first().waitFor()
+    assert((await resultGrid.locator('thead .th-type').first().getAttribute('title')).includes('from the values'), 'result glyphs say the type was inferred')
     await shot('06-query')
 
     // Error handling
@@ -328,8 +394,70 @@ async function main() {
     // ------------------------------------------------------------ disconnect
     await page.getByTestId('disconnect-button').click()
     await page.getByTestId('connect-button').waitFor()
-    assert((await page.locator('.conn-item').count()) === 1, 'connection was saved')
+    assert((await page.locator('.conn-item').count()) === 2, 'both connections were saved')
     await shot('07-back-to-connections')
+
+    // ------------------------------------------------------------ a new connection reuses the saved SSH profile
+    await page.getByTestId('new-connection').click()
+    await page.getByTestId('choose-sqlite').click()
+    await page.getByPlaceholder('Production analytics').fill('E2E via profile')
+    // Groups are made from the form: pick "New group" and type a name.
+    await page.getByTestId('conn-group').selectOption('__new__')
+    await page.getByTestId('conn-group-name').fill('Acme')
+    await page.getByTestId('sqlite-remote').check()
+    await page.getByTestId('ssh-profile-select').selectOption({ label: 'E2E SSH' })
+    await page.getByTestId('ssh-profile-summary').waitFor()
+    assert((await page.getByPlaceholder('db.example.com').count()) === 0, 'a chosen profile hides the SSH fields')
+    await page.getByTestId('sqlite-path').fill(db)
+    await shot('07a-connect-via-profile')
+    await page.getByTestId('connect-button').click()
+    await page.getByTestId('tree-table-users').waitFor({ timeout: 30000 })
+    console.log('connected through the saved SSH profile')
+    await page.getByTestId('disconnect-button').click()
+    await page.getByTestId('new-connection').waitFor()
+
+    // ------------------------------------------------------------ grouped connections sit under a collapsible header
+    const acme = page.locator('[data-testid=conn-group-header]', { hasText: 'Acme' })
+    await acme.waitFor()
+    assert((await acme.locator('.count').textContent()) === '1', 'the group counts its connections')
+    assert((await page.getByTestId('conn-group').locator('option:checked').textContent()) === 'Acme', 'the form shows which group the connection is in')
+    await acme.click()
+    await page.waitForFunction(() => document.querySelectorAll('[data-group="Acme"] .conn-item').length === 0)
+    await acme.click()
+    await page.locator('[data-group="Acme"] .conn-item').first().waitFor()
+    await shot('07c-connection-groups')
+    // Renaming from the header's menu moves every member.
+    await acme.click({ button: 'right' })
+    await page.getByText('Rename group…').click()
+    await page.getByTestId('conn-group-rename').fill('Acme Corp')
+    await page.keyboard.press('Enter')
+    await page.locator('[data-group="Acme Corp"] .conn-item').first().waitFor()
+    await page.waitForFunction(() => document.querySelector('[data-testid=conn-group]')?.value === 'Acme Corp')
+    console.log('connection groups work')
+
+    // ------------------------------------------------------------ duplicating a connection copies everything but the name
+    const viaProfile = page.locator('.conn-item', { hasText: 'E2E via profile' }).first()
+    await viaProfile.hover()
+    await viaProfile.getByTestId('conn-duplicate').click()
+    await page.locator('.conn-item', { hasText: 'E2E via profile copy' }).waitFor()
+    await page.waitForFunction(() => document.querySelector('[data-testid=conn-name]')?.value === 'E2E via profile copy')
+    assert((await page.getByTestId('conn-group').locator('option:checked').textContent()) === 'Acme Corp', 'the copy keeps the group')
+    await page.getByTestId('ssh-profile-summary').waitFor()
+    assert((await page.locator('[data-group="Acme Corp"] .conn-item').count()) === 2, 'the copy sits in the same group')
+    console.log('duplicated a connection')
+
+    // ------------------------------------------------------------ a restart still shows which profile the connection uses
+    await app.close()
+    app = await electron.launch(launchOptions)
+    page = await app.firstWindow()
+    watchConsole()
+    await page.waitForLoadState('domcontentloaded')
+    await page.getByTestId('ssh-profile-summary').waitFor({ timeout: 15000 })
+    assert((await page.getByTestId('conn-name').inputValue()) === 'E2E via profile', 'the most recent connection opens after a restart')
+    assert((await page.getByTestId('ssh-profile-select').locator('option:checked').textContent()) === 'E2E SSH', 'the connection still points at its SSH profile after a restart')
+    assert((await page.getByTestId('conn-group').locator('option:checked').textContent()) === 'Acme Corp', 'the connection keeps its group after a restart')
+    await shot('07b-profile-after-restart')
+    console.log('profile remembered across a restart')
 
     // ------------------------------------------------------------ PostgreSQL (when a server is available)
     if (process.env.PG_URL) {
@@ -404,7 +532,7 @@ async function main() {
       await shot('10-postgres-query')
       await page.getByTestId('disconnect-button').click()
       await page.getByTestId('connect-button').waitFor()
-      assert((await page.locator('.conn-item').count()) === 2, 'postgres connection was saved')
+      assert((await page.locator('.conn-item').count()) === 5, 'postgres connection was saved')
       console.log('postgres flow passed')
     } else {
       console.log('PG_URL not set; skipping the PostgreSQL flow')

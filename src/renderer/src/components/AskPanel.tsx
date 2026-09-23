@@ -1,6 +1,7 @@
-import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
-import type { AiProgressEvent, AiResult, AiTurn } from '@shared/ai'
-import { AI_PRESETS } from '@shared/ai'
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties, type ReactNode } from 'react'
+import { createPortal } from 'react-dom'
+import type { AiProgressEvent, AiProviderKind, AiResult, AiTurn, CatalogModel } from '@shared/ai'
+import { AI_PRESETS, MODEL_CATALOG, modelTitle } from '@shared/ai'
 import { useStore } from '@/store'
 import { Icon } from './Icons'
 import { PaneHeader, type DragHandleProps } from './PaneLayout'
@@ -53,7 +54,17 @@ export function AskPanel({ sessionId, chat, setChat, handle, onSql, running, onC
 
   const listRef = useRef<HTMLDivElement>(null)
   const inputRef = useRef<HTMLTextAreaElement>(null)
+  const loadSettings = useStore((s) => s.loadSettings)
   const [, tick] = useState(0)
+  const [menuOpen, setMenuOpen] = useState(false)
+  const [liveModels, setLiveModels] = useState<string[] | null>(null)
+  const modelButtonRef = useRef<HTMLButtonElement>(null)
+  const menuRef = useRef<HTMLDivElement>(null)
+  const menuScrolledRef = useRef(false)
+  /** Where the open menu sits; it renders at the document root so no pane can clip it. */
+  const [menuStyle, setMenuStyle] = useState<CSSProperties | null>(null)
+  /** A model that needs a provider set up first, with the message shown above the input. */
+  const [notice, setNotice] = useState<{ model: CatalogModel; text: string } | null>(null)
   const { messages, input } = chat
 
   const asking = messages.some((m) => m.role === 'assistant' && m.status === 'working')
@@ -94,6 +105,122 @@ export function AskPanel({ sessionId, chat, setChat, handle, onSql, running, onC
     const el = listRef.current
     if (el) el.scrollTop = el.scrollHeight
   }, [messages])
+
+  // The box starts as one line and grows with the text up to a limit, then scrolls.
+  useLayoutEffect(() => {
+    const el = inputRef.current
+    if (!el) return
+    el.style.height = '0px'
+    const max = 160
+    const next = Math.min(el.scrollHeight, max)
+    el.style.height = `${next}px`
+    el.style.overflowY = el.scrollHeight > max ? 'auto' : 'hidden'
+  }, [input])
+
+  // Put the menu above the button, or below when there is more room there, never taller than that room.
+  const placeMenu = useCallback(() => {
+    const el = modelButtonRef.current
+    if (!el) return
+    const r = el.getBoundingClientRect()
+    const gap = 6
+    const margin = 8
+    const width = 280
+    const above = r.top - gap - margin
+    const below = window.innerHeight - r.bottom - gap - margin
+    const flip = above < 240 && below > above
+    const left = Math.max(margin, Math.min(r.left, window.innerWidth - width - margin))
+    const maxHeight = Math.max(120, Math.min(360, flip ? below : above))
+    setMenuStyle(flip ? { left, top: r.bottom + gap, width, maxHeight } : { left, bottom: window.innerHeight - r.top + gap, width, maxHeight })
+  }, [])
+
+  useLayoutEffect(() => {
+    if (!menuOpen) {
+      setMenuStyle(null)
+      menuScrolledRef.current = false
+      return
+    }
+    placeMenu()
+    window.addEventListener('resize', placeMenu)
+    return () => window.removeEventListener('resize', placeMenu)
+  }, [menuOpen, placeMenu])
+
+  // Bring the current model into view once the menu is on screen.
+  useEffect(() => {
+    if (!menuOpen || !menuStyle || menuScrolledRef.current) return
+    menuScrolledRef.current = true
+    menuRef.current?.querySelector('.model-item.current')?.scrollIntoView({ block: 'nearest' })
+  }, [menuOpen, menuStyle])
+
+  // Close the model menu on any outside click or Escape.
+  useEffect(() => {
+    if (!menuOpen) return
+    const onDown = (e: MouseEvent) => {
+      if (!(e.target as HTMLElement).closest?.('.model-menu, .model-button')) setMenuOpen(false)
+    }
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') setMenuOpen(false)
+    }
+    window.addEventListener('mousedown', onDown)
+    window.addEventListener('keydown', onKey)
+    return () => {
+      window.removeEventListener('mousedown', onDown)
+      window.removeEventListener('keydown', onKey)
+    }
+  }, [menuOpen])
+
+  // The configured provider's own list (e.g. models installed in Ollama) joins the catalogue.
+  useEffect(() => {
+    if (!menuOpen || liveModels !== null || !providerReady) return
+    let cancelled = false
+    window.api.settings
+      .listModels()
+      .then((list) => {
+        if (!cancelled) setLiveModels(list)
+      })
+      .catch(() => {
+        if (!cancelled) setLiveModels([])
+      })
+    return () => {
+      cancelled = true
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [menuOpen])
+
+  const menuModels = useMemo<CatalogModel[]>(() => {
+    if (!settings) return MODEL_CATALOG
+    const out: CatalogModel[] = []
+    const seen = new Set<string>()
+    const add = (m: CatalogModel) => {
+      const key = `${m.provider}:${m.id}`
+      if (seen.has(key)) return
+      seen.add(key)
+      out.push(m)
+    }
+    for (const m of MODEL_CATALOG) add(m)
+    if (settings.model) add({ provider: settings.provider, id: settings.model, label: modelTitle(settings.provider, settings.model) })
+    for (const id of liveModels ?? []) add({ provider: settings.provider, id, label: modelTitle(settings.provider, id) })
+    return out
+  }, [settings, liveModels])
+
+  const chooseModel = async (m: CatalogModel) => {
+    setMenuOpen(false)
+    if (!settings) return
+    const configured = settings.configuredProviders.includes(m.provider)
+    if (!configured) {
+      const preset = AI_PRESETS[m.provider]
+      const needs = preset.needsKey ? `${preset.label} API key` : `${preset.label} server details`
+      setNotice({ model: m, text: `${m.label} needs ${/^[aeiou]/i.test(needs) ? 'an' : 'a'} ${needs} before it can answer.` })
+      return
+    }
+    setNotice(null)
+    try {
+      await window.api.settings.update({ provider: m.provider, model: m.id })
+      await loadSettings()
+      setLiveModels(null)
+    } catch (e) {
+      toast('error', 'Could not switch model', errorMessage(e))
+    }
+  }
 
   const history = useMemo<AiTurn[]>(() => {
     const turns: AiTurn[] = []
@@ -266,7 +393,6 @@ export function AskPanel({ sessionId, chat, setChat, handle, onSql, running, onC
   return (
     <div className="pane ask-panel" data-testid="ask-panel">
       <PaneHeader title="Ask" handle={handle} testId="ask-header">
-        {settings?.model && providerReady ? <span className="muted mono">{settings.model}</span> : null}
         <span className="spacer" />
         {messages.length ? (
           <button className="btn ghost icon small" onClick={clear} title="Start a new conversation" data-testid="ask-reset">
@@ -306,11 +432,29 @@ export function AskPanel({ sessionId, chat, setChat, handle, onSql, running, onC
           )
         )}
       </div>
+      {notice ? (
+        <div className="chat-notice" data-testid="model-notice">
+          <span>{notice.text}</span>
+          <button
+            className="btn small"
+            onClick={() => {
+              setSettingsOpen(true, { provider: notice.model.provider, model: notice.model.id })
+              setNotice(null)
+            }}
+            data-testid="model-notice-settings"
+          >
+            <Icon name="settings" /> Set up {AI_PRESETS[notice.model.provider].label}
+          </button>
+          <button className="btn ghost icon small notice-close" onClick={() => setNotice(null)} title="Dismiss">
+            <Icon name="x" size={12} />
+          </button>
+        </div>
+      ) : null}
       <div className="chat-input">
         <textarea
           ref={inputRef}
           className="text"
-          rows={2}
+          rows={1}
           placeholder={awaitingReply ? 'Reply…' : messages.length ? 'Ask a follow-up, or a new question…' : 'Ask in plain English…'}
           value={input}
           onChange={(e) => {
@@ -326,9 +470,63 @@ export function AskPanel({ sessionId, chat, setChat, handle, onSql, running, onC
           disabled={asking}
           data-testid="ask-input"
         />
-        <button className="btn small primary" onClick={() => void send()} disabled={asking || !input.trim()} title="Send (Enter)" data-testid="ask-button">
-          {asking ? <span className="spinner" /> : <Icon name="sparkles" />}
+        <button className="chat-send" onClick={() => void send()} disabled={asking || !input.trim()} title="Send (Enter)" data-testid="ask-button">
+          {asking ? <span className="spinner" /> : <Icon name="send" size={15} />}
         </button>
+      </div>
+      <div className="chat-footer">
+        <div className="model-picker">
+          <button
+            ref={modelButtonRef}
+            className={`model-button ${menuOpen ? 'open' : ''}`}
+            onClick={() => setMenuOpen((v) => !v)}
+            title={settings?.model ? `${settings.model} · choose the model that answers questions` : 'Choose the model that answers questions'}
+            data-testid="model-button"
+          >
+            <span className="model-name">{settings?.model ? modelTitle(settings.provider, settings.model) : 'Choose a model'}</span>
+            <Icon name={menuOpen ? 'chevron-down' : 'chevron-right'} size={11} />
+          </button>
+          {menuOpen && menuStyle ? (
+            createPortal(
+            <div className="model-menu" role="menu" style={menuStyle} ref={menuRef} data-testid="model-menu">
+              {(['anthropic', 'openai', 'google', 'groq', 'openrouter', 'ollama', 'custom'] as AiProviderKind[]).map((provider) => {
+                const items = menuModels.filter((m) => m.provider === provider)
+                if (!items.length) return null
+                const configured = settings?.configuredProviders.includes(provider)
+                return (
+                  <div className="model-group" key={provider}>
+                    <div className="model-group-title">
+                      {AI_PRESETS[provider].label}
+                      {!configured ? <span className="model-group-note">not set up</span> : null}
+                    </div>
+                    {items.map((m) => {
+                      const current = settings?.provider === m.provider && settings?.model === m.id
+                      return (
+                        <button key={`${m.provider}:${m.id}`} className={`model-item ${current ? 'current' : ''} ${configured ? '' : 'unavailable'}`} role="menuitem" onClick={() => void chooseModel(m)} data-testid={`model-${m.id}`}>
+                          <span className="model-item-label">{m.label}</span>
+                          {m.label !== m.id ? <span className="model-item-id">{m.id}</span> : null}
+                          {current ? <Icon name="check" size={12} /> : null}
+                        </button>
+                      )
+                    })}
+                  </div>
+                )
+              })}
+              <button
+                className="model-item manage"
+                role="menuitem"
+                onClick={() => {
+                  setMenuOpen(false)
+                  setSettingsOpen(true)
+                }}
+              >
+                <Icon name="settings" size={12} /> Manage providers…
+              </button>
+            </div>,
+            document.body
+            )
+          ) : null}
+        </div>
       </div>
     </div>
   )

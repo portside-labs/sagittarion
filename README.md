@@ -1,9 +1,10 @@
 # Sagittarion
 
-A desktop GUI for databases on other machines. It opens **SQLite files in place
-over SSH** (nothing is downloaded, nothing is installed on the server) and
-connects to **PostgreSQL** servers directly or through an SSH tunnel. Edits are
-staged in the grid and applied inside a single transaction.
+A desktop GUI for SQLite and PostgreSQL. It opens **SQLite files** on this
+computer or, over SSH, in place on another machine (nothing is downloaded,
+nothing is installed on the server), and connects to **PostgreSQL** servers
+directly or through an SSH tunnel. Edits are staged in the grid and applied
+inside a single transaction.
 
 Built with Electron, React and TypeScript. The SSH layer uses
 [`ssh2`](https://github.com/mscdex/ssh2); the remote side is a small,
@@ -12,10 +13,20 @@ time you connect.
 
 ## Features
 
-- **Connections**: password, private key (with passphrase) or SSH agent
+- **Connections**: SQLite files on this computer by default, or on another
+  machine with *connect over SSH* ticked; PostgreSQL directly or through an
+  SSH tunnel. Password, private key (with passphrase) or SSH agent
   authentication. Saved connections with per-connection colour; passwords and
   passphrases are stored encrypted with the OS keychain (Electron
   `safeStorage`) only when you tick *Save*.
+- **SSH profiles**: tick *Save as an SSH profile* once and any later
+  connection, SQLite or a Postgres tunnel, picks the host from a dropdown
+  instead of retyping it. Profiles are edited in place and can be forgotten.
+- **Groups and copies**: put connections into groups from the *Group* field,
+  one per app, one per environment, whatever fits; groups fold up in the
+  list and are renamed or dissolved from their header. Any connection can be
+  duplicated from the list, settings and saved secrets included, to make a
+  variant.
 - **Host key verification**: trust-on-first-use with a fingerprint prompt, plus
   your existing `~/.ssh/known_hosts` (plain, port-qualified and hashed entries)
   as a second source. Changed keys produce a loud warning.
@@ -88,7 +99,7 @@ output in a query tab.
 
 ## Ask in plain English
 
-Every query tab has an *Ask* chat beside the editor, above the results. Type
+Every query tab has an *Ask* chat beside the editor and results. Type
 a question such as "top 10 customers by revenue last quarter", "orders that
 have no invoice" or "average time from signup to first purchase per plan", and
 the app asks a language model of your choice to write the SQL. The query lands
@@ -100,6 +111,8 @@ label on the highlight says what the drop will do. The chat also collapses to a
 thin strip on the right when you want the whole width for SQL; the layout
 button in the toolbar restores the default, editor above results with the chat
 down the right side. The generated query is checked before it runs:
+A picker under the chat input switches models; choosing one whose provider
+is not set up yet opens Settings on that provider with the model filled in.
 
 1. **Read-only by construction.** Only a single `SELECT` (or `WITH ... SELECT`)
    is accepted, and the statement is executed under SQLite's `query_only`
@@ -175,9 +188,11 @@ results are never sent.
 ## Requirements
 
 - Local: Node.js 20 or newer to build and run from source.
-- SQLite: an SSH login on the remote host and `python3` there (3.5 or newer,
-  standard library only). Debian/Ubuntu, Fedora/RHEL, Raspberry Pi OS and most NAS systems have
-  it already; on Alpine run `apk add python3`. SFTP is optional and only needed
+- SQLite files on this computer: `python3` (3.5 or newer, standard library
+  only). On macOS the Xcode Command Line Tools or Homebrew provide it.
+- SQLite over SSH: an SSH login on the remote host and `python3` there.
+  Debian/Ubuntu, Fedora/RHEL, Raspberry Pi OS and most NAS systems have it
+  already; on Alpine run `apk add python3`. SFTP is optional and only needed
   for the file browser. The `sqlite3` command-line tool is *not* required.
 
 ## Getting started
@@ -297,6 +312,12 @@ the UI without a real host.
   `Session`).
 - Export covers the rows currently loaded, not whole tables.
 - One connection per window.
+
+## Releasing
+
+Tagged commits are built and signed by the Release workflow; see
+[docs/RELEASING.md](docs/RELEASING.md) for the macOS certificate and
+notarization setup.
 
 ## License
 

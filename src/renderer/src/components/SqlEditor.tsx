@@ -5,6 +5,7 @@ import { indentWithTab } from '@codemirror/commands'
 import { PostgreSQL, sql, SQLite } from '@codemirror/lang-sql'
 import { oneDark } from '@codemirror/theme-one-dark'
 import { basicSetup } from 'codemirror'
+import { sqlCompletionSource, type CompletionData } from '@/lib/sql-complete'
 
 export interface SqlEditorHandle {
   getValue(): string
@@ -17,8 +18,8 @@ interface Props {
   initialValue?: string
   onChange?: (value: string) => void
   onRun?: () => void
-  schema?: Record<string, any>
-  defaultSchema?: string
+  /** Tables and on-demand columns for autocomplete; read on every request, so it may change freely. */
+  completion?: CompletionData
   dialect?: 'sqlite' | 'postgres'
   readOnly?: boolean
   placeholder?: string
@@ -42,7 +43,7 @@ const appTheme = EditorView.theme(
 )
 
 export const SqlEditor = forwardRef<SqlEditorHandle, Props>(function SqlEditor(
-  { initialValue = '', onChange, onRun, schema, defaultSchema, dialect = 'sqlite', readOnly = false, placeholder, className },
+  { initialValue = '', onChange, onRun, completion, dialect = 'sqlite', readOnly = false, placeholder, className },
   ref
 ) {
   const host = useRef<HTMLDivElement>(null)
@@ -51,11 +52,15 @@ export const SqlEditor = forwardRef<SqlEditorHandle, Props>(function SqlEditor(
   const roComp = useRef(new Compartment())
   const onRunRef = useRef(onRun)
   const onChangeRef = useRef(onChange)
+  const completionRef = useRef(completion)
   onRunRef.current = onRun
   onChangeRef.current = onChange
+  completionRef.current = completion
 
-  const langExt = (s?: Record<string, any>) =>
-    sql({ dialect: dialect === 'postgres' ? PostgreSQL : SQLite, schema: s, defaultSchema, upperCaseKeywords: true })
+  const langExt = () => {
+    const d = dialect === 'postgres' ? PostgreSQL : SQLite
+    return [sql({ dialect: d, upperCaseKeywords: true }), d.language.data.of({ autocomplete: sqlCompletionSource(() => completionRef.current ?? null) })]
+  }
   const roExt = (ro: boolean) => [EditorState.readOnly.of(ro), EditorView.editable.of(!ro)]
 
   useEffect(() => {
@@ -76,7 +81,7 @@ export const SqlEditor = forwardRef<SqlEditorHandle, Props>(function SqlEditor(
         ),
         basicSetup,
         keymap.of([indentWithTab]),
-        schemaComp.current.of(langExt(schema)),
+        schemaComp.current.of(langExt()),
         roComp.current.of(roExt(readOnly)),
         oneDark,
         appTheme,
@@ -97,9 +102,9 @@ export const SqlEditor = forwardRef<SqlEditorHandle, Props>(function SqlEditor(
   }, [])
 
   useEffect(() => {
-    view.current?.dispatch({ effects: schemaComp.current.reconfigure(langExt(schema)) })
+    view.current?.dispatch({ effects: schemaComp.current.reconfigure(langExt()) })
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [schema, defaultSchema, dialect])
+  }, [dialect])
 
   useEffect(() => {
     view.current?.dispatch({ effects: roComp.current.reconfigure(roExt(readOnly)) })

@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type KeyboardEvent, type MouseEvent } from 'react'
 import type { CellValue } from '@shared/types'
+import { classifyType } from '@shared/coltypes'
 import { cellText, displayCell, parseCellInput, valuesEqual } from '@/lib/format'
 import { copyText, hasOwn, isModKey } from '@/lib/util'
 import { Icon } from './Icons'
@@ -7,6 +8,8 @@ import { Icon } from './Icons'
 export interface GridColumn {
   name: string
   declType?: string
+  /** The type was read off the values rather than declared (SQLite query results). */
+  inferred?: boolean
   pk?: boolean
   readOnly?: boolean
   notnull?: boolean
@@ -43,7 +46,8 @@ const CHAR_W = 7.4
 
 /** Size a column from its header and a sample of its content, within sane bounds. */
 function measureWidth(col: GridColumn, index: number, rows: CellValue[][]): number {
-  let chars = col.name.length + (col.declType ? col.declType.length * 0.8 + 3 : 0) + 2
+  // The header holds the name, a key icon for primary keys, a possible sort arrow and a short type glyph.
+  let chars = col.name.length + (col.declType ? 4 : 0) + (col.pk ? 3 : 0) + 4
   const n = Math.min(rows.length, SAMPLE_ROWS)
   for (let r = 0; r < n; r++) {
     const v = rows[r]?.[index]
@@ -257,7 +261,15 @@ export function DataGrid(props: DataGridProps) {
                     {c.pk ? <Icon className="th-key" name="key" size={11} /> : null}
                     <span className="th-name">{c.name}</span>
                     {sort?.column === c.name ? <span className="th-sort">{sort.dir === 'asc' ? '▲' : '▼'}</span> : null}
-                    {c.declType ? <span className="th-type">{c.declType}</span> : null}
+                    {(() => {
+                      const g = classifyType(c.declType)
+                      if (!g) return null
+                      return (
+                        <span className={`th-type family-${g.family}`} title={c.inferred ? `${g.label} (from the values)` : g.label}>
+                          {g.icon ? <Icon name={g.icon} size={11} /> : g.glyph}
+                        </span>
+                      )
+                    })()}
                   </div>
                   <span className={`col-resizer ${resizing === c.name ? 'active' : ''}`} onMouseDown={(e) => startResize(e, c.name)} onClick={(e) => e.stopPropagation()} />
                 </th>

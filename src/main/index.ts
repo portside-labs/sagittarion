@@ -8,6 +8,7 @@ import { ConnectionManager } from './connections/manager'
 import { humanKeyType, KnownHostsStore } from './ssh/hostkeys'
 import { ConnectionStore, noopCodec, type SecretCodec } from './store/connections'
 import { SettingsStore } from './store/settings'
+import { SshProfileStore } from './store/ssh-profiles'
 import { qi, qualify } from './db/pg-values'
 import { cellToPlainText } from '@shared/export'
 import { AI_PRESETS, type AiProgressEvent, type AiProgressStep, type AiSettings, type AiSettingsUpdate, type AiTurn } from '@shared/ai'
@@ -19,12 +20,13 @@ import { EmbeddingCache } from './ai/embeddings'
 import type { DatabaseDriver } from './db/driver'
 import { toCsv, toJson, toSqlInserts } from '@shared/export'
 import type { OpenOptions } from '@shared/api'
-import type { AppInfo, ConnectionConfig, ExportRequest, ListObjectsRequest, ObjectRef, PendingChange, RowsRequest, SessionInfo, SshConfig, TableRef } from '@shared/types'
+import type { AppInfo, ConnectionConfig, ExportRequest, ListObjectsRequest, ObjectRef, PendingChange, RowsRequest, SessionInfo, SshConfig, SshProfile, TableRef } from '@shared/types'
 
 const isMac = process.platform === 'darwin'
 let mainWindow: BrowserWindow | null = null
 let connectionStore: ConnectionStore
 let settingsStore: SettingsStore
+let sshProfileStore: SshProfileStore
 let knownHosts: KnownHostsStore
 let manager: ConnectionManager
 let embeddingCache: EmbeddingCache
@@ -102,7 +104,7 @@ function createWindow(): BrowserWindow {
     title: 'Sagittarion',
     backgroundColor: '#17181b',
     titleBarStyle: isMac ? 'hiddenInset' : 'default',
-    trafficLightPosition: isMac ? { x: 16, y: 18 } : undefined,
+    trafficLightPosition: isMac ? { x: 14, y: 13 } : undefined,
     webPreferences: {
       preload: path.join(__dirname, '../preload/index.js'),
       contextIsolation: true,
@@ -256,6 +258,7 @@ async function openSession(cfg: ConnectionConfig, opts: OpenOptions): Promise<Se
     onProgress: (p) => send('connect:progress', { ...p, requestId: opts.requestId })
   })
   if (cfg.id) void connectionStore.touch(cfg.id)
+  if (cfg.sshProfileId) void sshProfileStore.touch(cfg.sshProfileId)
   return manager.info(conn)
 }
 
@@ -274,6 +277,11 @@ function registerIpc(): void {
   ipcMain.handle('connections:list', () => connectionStore.list())
   ipcMain.handle('connections:save', (_e, cfg: ConnectionConfig) => connectionStore.save(cfg))
   ipcMain.handle('connections:remove', (_e, id: string) => connectionStore.remove(id))
+  ipcMain.handle('connections:setGroup', (_e, ids: string[], group: string | null) => connectionStore.setGroup(ids, group))
+  ipcMain.handle('connections:duplicate', (_e, id: string) => connectionStore.duplicate(id))
+  ipcMain.handle('sshProfiles:list', () => sshProfileStore.list())
+  ipcMain.handle('sshProfiles:save', (_e, p: SshProfile) => sshProfileStore.save(p))
+  ipcMain.handle('sshProfiles:remove', (_e, id: string) => sshProfileStore.remove(id))
 
   ipcMain.handle('session:open', (_e, cfg: ConnectionConfig, opts: OpenOptions) => openSession(cfg, opts ?? {}))
   ipcMain.handle('session:close', (_e, sessionId: string) => {
@@ -303,8 +311,20 @@ function registerIpc(): void {
   ipcMain.handle('db:cancel', (_e, sessionId: string) => manager.driver(sessionId).cancel())
   ipcMain.handle('db:apply', (_e, sessionId: string, changes: PendingChange[]) => manager.driver(sessionId).apply(changes))
 
-  ipcMain.handle('sftp:readdir', (_e, sessionId: string, p: string) => manager.sshSession(sessionId).readdir(p))
-  ipcMain.handle('sftp:home', (_e, sessionId: string) => manager.sshSession(sessionId).home())
+  ipcMain.handle('sftp:readdir', (_e, sessionId: string, p: string) => manager.fileSession(sessionId).readdir(p))
+  ipcMain.handle('sftp:home', (_e, sessionId: string) => manager.fileSession(sessionId).home())
+  ipcMain.handle('dialog:pickSqliteFile', async (_e, current?: string) => {
+    const r = await dialog.showOpenDialog(mainWindow as BrowserWindow, {
+      title: 'Choose an SQLite database',
+      defaultPath: current?.trim() ? path.dirname(current.trim()) : os.homedir(),
+      filters: [
+        { name: 'SQLite databases', extensions: ['db', 'sqlite', 'sqlite3', 'db3', 's3db', 'sl3'] },
+        { name: 'All files', extensions: ['*'] }
+      ],
+      properties: ['openFile', 'showHiddenFiles', 'treatPackageAsDirectory']
+    })
+    return r.canceled || !r.filePaths[0] ? null : r.filePaths[0]
+  })
 
   ipcMain.handle('dialog:pickPrivateKey', async () => {
     const r = await dialog.showOpenDialog(mainWindow as BrowserWindow, {
@@ -440,9 +460,10 @@ if (!app.requestSingleInstanceLock()) {
     const codec = makeCodec()
     connectionStore = new ConnectionStore(path.join(userData, 'connections.json'), codec)
     settingsStore = new SettingsStore(path.join(userData, 'settings.json'), codec)
+    sshProfileStore = new SshProfileStore(path.join(userData, 'ssh-profiles.json'), codec)
     embeddingCache = new EmbeddingCache(path.join(userData, 'ai-cache', 'embeddings.json'))
     knownHosts = new KnownHostsStore(path.join(userData, 'known_hosts.json'), path.join(os.homedir(), '.ssh', 'known_hosts'))
-    manager = new ConnectionManager({ agentSource, verifyHostKey })
+    manager = new ConnectionManager({ agentSource, verifyHostKey, resolveSshProfile: (id) => sshProfileStore.get(id) })
     manager.on('closed', (e: { sessionId: string; reason: string }) => send('session:closed', e))
     registerIpc()
     buildMenu()

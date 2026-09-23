@@ -1,12 +1,13 @@
-import { useEffect, useState } from 'react'
-import type { ConnectionConfig, DatabaseKind, PostgresConfig, SshConfig, SslMode } from '@shared/types'
+import { useEffect, useMemo, useRef, useState } from 'react'
+import type { ConnectionConfig, DatabaseKind, PostgresConfig, SshConfig, SshProfile, SslMode } from '@shared/types'
 import { KIND_LABELS } from '@shared/types'
 import { DbLogo } from '@/components/DbLogo'
-import { describeTarget, newConnection, normalizeConnection, parsePostgresUrl } from '@shared/connections'
+import { defaultSsh, describeSsh, describeTarget, newConnection, normalizeConnection, parsePostgresUrl, resolveSshProfile, usesSsh } from '@shared/connections'
 import { useStore } from '@/store'
-import { TitleBar } from '@/components/TitleBar'
 import { Icon } from '@/components/Icons'
 import { RemoteFileBrowser } from '@/components/RemoteFileBrowser'
+import { ContextMenu, type MenuItem } from '@/components/ContextMenu'
+import { groupConnections, groupNames, loadCollapsedGroups, saveCollapsedGroups } from '@/lib/connection-groups'
 import { errorMessage } from '@/lib/util'
 
 const COLORS = ['#5b93ff', '#3ecf8e', '#e6a23c', '#ff5f57', '#b57bee', '#38bdf8']
@@ -18,6 +19,14 @@ const SSL_MODES: { value: SslMode; label: string; hint: string }[] = [
 ]
 
 type Busy = null | 'connect' | 'test' | 'browse'
+
+/** Whether to store the SSH fields being typed as a reusable profile, and under which name. */
+interface ProfileDraft {
+  save: boolean
+  name: string
+}
+
+const AUTH_LABELS: Record<SshConfig['auth'], string> = { key: 'private key', agent: 'SSH agent', password: 'password' }
 
 // ---------------------------------------------------------------------------
 // Shared SSH fields (SQLite host, or Postgres tunnel host)
@@ -126,11 +135,99 @@ function SshFields({
 }
 
 // ---------------------------------------------------------------------------
+// SSH host: a saved profile, or details typed here (optionally saved as one)
+// ---------------------------------------------------------------------------
+
+function SshSection({
+  form,
+  profiles,
+  draft,
+  encryption,
+  idPrefix,
+  onSsh,
+  onProfile,
+  onDraft,
+  onForget
+}: {
+  form: ConnectionConfig
+  profiles: SshProfile[]
+  draft: ProfileDraft
+  encryption: boolean
+  idPrefix: string
+  onSsh: (patch: Partial<SshConfig>) => void
+  onProfile: (id: string | undefined, prefill?: SshConfig) => void
+  onDraft: (d: ProfileDraft) => void
+  onForget: (p: SshProfile) => void
+}) {
+  const active = form.sshProfileId ? profiles.find((p) => p.id === form.sshProfileId) : undefined
+  const edit = () => {
+    if (!active) return
+    const { id: _id, name, createdAt: _c, lastUsedAt: _l, ...ssh } = active
+    onProfile(undefined, ssh)
+    onDraft({ save: true, name })
+  }
+  return (
+    <>
+      {profiles.length ? (
+        <div className="field ssh-profile-pick">
+          <label>SSH profile</label>
+          <select className="select" value={active ? active.id : ''} onChange={(e) => onProfile(e.target.value || undefined)} data-testid={`${idPrefix}-profile-select`}>
+            <option value="">Enter details below</option>
+            {profiles.map((p) => (
+              <option key={p.id} value={p.id}>
+                {p.name}
+              </option>
+            ))}
+          </select>
+        </div>
+      ) : null}
+      {active ? (
+        <div className="ssh-profile-summary" data-testid={`${idPrefix}-profile-summary`}>
+          <Icon name="terminal" />
+          <span className="mono">
+            {describeSsh(active)} · {AUTH_LABELS[active.auth]}
+          </span>
+          <span className="spacer" />
+          <button className="btn small" type="button" onClick={edit} title="Change these details; saving keeps the profile up to date" data-testid={`${idPrefix}-profile-edit`}>
+            Edit
+          </button>
+          <button className="btn small ghost" type="button" onClick={() => onForget(active)} title="Delete this profile" data-testid={`${idPrefix}-profile-forget`}>
+            Forget
+          </button>
+        </div>
+      ) : (
+        <>
+          <SshFields ssh={form.ssh} onChange={onSsh} encryption={encryption} idPrefix={idPrefix} />
+          <div className="save-profile">
+            <label className="checkbox">
+              <input type="checkbox" checked={draft.save} onChange={(e) => onDraft({ ...draft, save: e.target.checked })} data-testid={`${idPrefix}-save-profile`} />
+              Save as an SSH profile to reuse for other connections
+            </label>
+            {draft.save ? (
+              <input
+                className="text save-profile-name"
+                value={draft.name}
+                placeholder={form.ssh.host ? `${form.ssh.username || 'user'}@${form.ssh.host}` : 'Profile name, e.g. Production box'}
+                onChange={(e) => onDraft({ ...draft, name: e.target.value })}
+                data-testid={`${idPrefix}-profile-name`}
+              />
+            ) : null}
+          </div>
+        </>
+      )}
+    </>
+  )
+}
+
+// ---------------------------------------------------------------------------
 // Screen
 // ---------------------------------------------------------------------------
 
 export function ConnectScreen() {
   const connections = useStore((s) => s.connections)
+  const sshProfiles = useStore((s) => s.sshProfiles)
+  const sshProfilesLoaded = useStore((s) => s.sshProfilesLoaded)
+  const loadSshProfiles = useStore((s) => s.loadSshProfiles)
   const appInfo = useStore((s) => s.appInfo)
   const toast = useStore((s) => s.toast)
   const setSession = useStore((s) => s.setSession)
@@ -149,14 +246,27 @@ export function ConnectScreen() {
   const [error, setError] = useState<string | null>(null)
   const [browser, setBrowser] = useState<{ sessionId: string } | null>(null)
   const [initialised, setInitialised] = useState(false)
+  const [draft, setDraft] = useState<ProfileDraft>({ save: false, name: '' })
+  /** 'new' while a group name is being typed in the form instead of picked from the list. */
+  const [groupMode, setGroupMode] = useState<'new' | null>(null)
+  const [collapsedGroups, setCollapsedGroups] = useState<Set<string>>(() => loadCollapsedGroups())
+  const [groupMenu, setGroupMenu] = useState<{ x: number; y: number; name: string } | null>(null)
+  const [connMenu, setConnMenu] = useState<{ x: number; y: number; conn: ConnectionConfig } | null>(null)
+  const nameInputRef = useRef<HTMLInputElement>(null)
+  const [renamingGroup, setRenamingGroup] = useState<{ from: string; value: string } | null>(null)
+  const renameInFlight = useRef(false)
+  const groups = useMemo(() => groupConnections(connections), [connections])
+  const names = useMemo(() => groupNames(connections), [connections])
 
+  // Open the most recent connection once both it and the profile list are known.
   useEffect(() => {
-    if (initialised) return
+    if (initialised || !sshProfilesLoaded) return
     if (connections.length > 0) {
       select(connections[0])
       setInitialised(true)
     }
-  }, [connections, initialised])
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [connections, sshProfilesLoaded, initialised])
 
   const update = (patch: Partial<ConnectionConfig>) => {
     setForm((f) => ({ ...f, ...patch }))
@@ -172,11 +282,16 @@ export function ConnectScreen() {
   }
 
   function select(c: ConnectionConfig) {
+    const cfg = normalizeConnection(c)
+    // A profile that was deleted leaves the connection without SSH details; the form asks for them again.
+    if (cfg.sshProfileId && sshProfilesLoaded && !sshProfiles.some((p) => p.id === cfg.sshProfileId)) cfg.sshProfileId = undefined
     setSelectedId(c.id)
-    setForm(normalizeConnection(c))
+    setForm(cfg)
     setKindChosen(true)
     setDirty(false)
     setError(null)
+    setDraft({ save: false, name: '' })
+    setGroupMode(null)
   }
 
   function startNew() {
@@ -185,6 +300,22 @@ export function ConnectScreen() {
     setKindChosen(false)
     setDirty(false)
     setError(null)
+    setDraft({ save: false, name: '' })
+    setGroupMode(null)
+  }
+
+  /** Point the connection at a saved profile, or back at typed details (optionally prefilled from a profile). */
+  function useProfile(id: string | undefined, prefill?: SshConfig) {
+    setForm((f) => ({ ...f, sshProfileId: id, ssh: prefill ?? (id ? defaultSsh() : f.ssh) }))
+    setDirty(true)
+  }
+
+  async function forgetProfile(p: SshProfile) {
+    const ok = await confirm(`Forget SSH profile "${p.name}"?`, 'Connections that use it will ask for SSH details again.', 'Forget', true)
+    if (!ok) return
+    await window.api.sshProfiles.remove(p.id)
+    await loadSshProfiles()
+    setForm((f) => (f.sshProfileId === p.id ? { ...f, sshProfileId: undefined } : f))
   }
 
   function chooseKind(kind: DatabaseKind) {
@@ -195,14 +326,15 @@ export function ConnectScreen() {
 
   function validate(needTarget = true): string | null {
     const portOk = (p: number) => Number.isInteger(Number(p)) && Number(p) >= 1 && Number(p) <= 65535
-    const needSsh = form.kind === 'sqlite' || form.pg?.tunnel
-    if (needSsh) {
+    const profileActive = Boolean(form.sshProfileId && sshProfiles.some((p) => p.id === form.sshProfileId))
+    if (usesSsh(form) && !profileActive) {
       if (!form.ssh.host.trim()) return 'SSH host is required.'
       if (!form.ssh.username.trim()) return 'SSH username is required.'
       if (!portOk(form.ssh.port)) return 'SSH port must be between 1 and 65535.'
+      if (draft.save && !draft.name.trim()) return 'Give the SSH profile a name, or untick "Save as an SSH profile".'
     }
     if (form.kind === 'sqlite') {
-      if (needTarget && !form.remotePath?.trim()) return 'Enter the path of the SQLite file on the remote host.'
+      if (needTarget && !form.remotePath?.trim()) return form.remote ? 'Enter the path of the SQLite file on the SSH host.' : 'Choose the SQLite file to open.'
     } else {
       const pg = form.pg
       if (!pg?.host.trim()) return 'Database host is required.'
@@ -235,7 +367,8 @@ export function ConnectScreen() {
 
   const normalised = (): ConnectionConfig => {
     const n = normalizeConnection(form)
-    n.name = form.name.trim() || describeTarget(n)
+    const shown = resolveSshProfile(n, sshProfiles)
+    n.name = form.name.trim() || (n.kind === 'sqlite' && !n.remote ? n.remotePath?.trim().split(/[\\/]/).pop() || 'SQLite file' : describeTarget(shown))
     n.ssh.host = n.ssh.host.trim()
     n.ssh.username = n.ssh.username.trim()
     if (n.remotePath !== undefined) n.remotePath = n.remotePath.trim()
@@ -254,13 +387,25 @@ export function ConnectScreen() {
     pg: saved.pg ? { ...saved.pg, password: source.pg?.password } : undefined
   })
 
+  /** Stores the typed SSH details as a profile (updating one with the same name) and points the connection at it. */
+  async function saveDraftProfile(cfg: ConnectionConfig): Promise<ConnectionConfig> {
+    if (!usesSsh(cfg) || cfg.sshProfileId || !draft.save || !draft.name.trim()) return cfg
+    const name = draft.name.trim()
+    const existing = sshProfiles.find((p) => p.name.toLowerCase() === name.toLowerCase())
+    const profile = await window.api.sshProfiles.save({ ...cfg.ssh, id: existing?.id ?? '', name })
+    await loadSshProfiles()
+    setDraft({ save: false, name: '' })
+    return { ...cfg, sshProfileId: profile.id, ssh: defaultSsh() }
+  }
+
   async function saveOnly(): Promise<ConnectionConfig> {
-    const source = normalised()
+    const source = await saveDraftProfile(normalised())
     const saved = await window.api.connections.save(source)
     const merged = withSecrets(saved, source)
     setForm(merged)
     setSelectedId(saved.id)
     setDirty(false)
+    setGroupMode(null)
     await loadConnections()
     return merged
   }
@@ -298,8 +443,30 @@ export function ConnectScreen() {
     }
   }
 
-  async function remove(c: ConnectionConfig, e: React.MouseEvent) {
-    e.stopPropagation()
+  /** A copy of a saved connection opens in the form with its name selected, ready to be renamed. */
+  async function duplicate(c: ConnectionConfig, e?: React.MouseEvent) {
+    e?.stopPropagation()
+    try {
+      const copy = await window.api.connections.duplicate(c.id)
+      select(copy)
+      await loadConnections()
+      requestAnimationFrame(() => {
+        nameInputRef.current?.focus()
+        nameInputRef.current?.select()
+      })
+    } catch (err) {
+      toast('error', 'Could not duplicate the connection', errorMessage(err))
+    }
+  }
+
+  const connMenuItems = (c: ConnectionConfig): MenuItem[] => [
+    { label: 'Duplicate', onClick: () => void duplicate(c) },
+    { separator: true },
+    { label: 'Delete…', danger: true, onClick: () => void remove(c) }
+  ]
+
+  async function remove(c: ConnectionConfig, e?: React.MouseEvent) {
+    e?.stopPropagation()
     const ok = await confirm(`Delete connection "${c.name}"?`, 'Saved credentials for it will be removed too.', 'Delete', true)
     if (!ok) return
     await window.api.connections.remove(c.id)
@@ -307,7 +474,77 @@ export function ConnectScreen() {
     if (selectedId === c.id) startNew()
   }
 
+  const toggleGroup = (name: string) => {
+    setCollapsedGroups((prev) => {
+      const next = new Set(prev)
+      if (next.has(name)) next.delete(name)
+      else next.add(name)
+      saveCollapsedGroups(next)
+      return next
+    })
+  }
+
+  /** Moves connections into a group (null for none) and keeps the open form in step without touching its other edits. */
+  async function moveToGroup(members: ConnectionConfig[], to: string | null) {
+    await window.api.connections.setGroup(members.map((c) => c.id), to)
+    if (members.some((c) => c.id === selectedId)) setForm((f) => ({ ...f, group: to ?? undefined }))
+    await loadConnections()
+  }
+
+  async function renameGroup(from: string, to: string) {
+    if (renameInFlight.current) return
+    setRenamingGroup(null)
+    const name = to.trim()
+    if (!name || name === from) return
+    renameInFlight.current = true
+    try {
+      const members = groups.find((g) => g.name === from)?.connections ?? []
+      await moveToGroup(members, name)
+      setCollapsedGroups((prev) => {
+        if (!prev.has(from)) return prev
+        const next = new Set(prev)
+        next.delete(from)
+        next.add(name)
+        saveCollapsedGroups(next)
+        return next
+      })
+    } catch (e) {
+      toast('error', 'Could not rename the group', errorMessage(e))
+    } finally {
+      renameInFlight.current = false
+    }
+  }
+
+  async function removeGroup(name: string) {
+    const members = groups.find((g) => g.name === name)?.connections ?? []
+    const ok = await confirm(`Remove the group "${name}"?`, 'Its connections are kept and listed on their own.', 'Remove group')
+    if (!ok) return
+    try {
+      await moveToGroup(members, null)
+    } catch (e) {
+      toast('error', 'Could not remove the group', errorMessage(e))
+    }
+  }
+
+  const groupMenuItems = (name: string): MenuItem[] => [
+    { label: 'Rename group…', onClick: () => setRenamingGroup({ from: name, value: name }) },
+    {
+      label: 'New connection in this group',
+      onClick: () => {
+        startNew()
+        setForm((f) => ({ ...f, group: name }))
+      }
+    },
+    { separator: true },
+    { label: 'Remove group', danger: true, onClick: () => void removeGroup(name) }
+  ]
+
   async function browse() {
+    if (form.kind === 'sqlite' && !form.remote) {
+      const picked = await window.api.dialog.pickSqliteFile(form.remotePath)
+      if (picked) update({ remotePath: picked })
+      return
+    }
     const v = validate(false)
     if (v) return setError(v)
     await withProgress('browse', async (requestId) => {
@@ -340,21 +577,17 @@ export function ConnectScreen() {
 
   return (
     <div className="app-frame">
-      <TitleBar
-        center={<span className="app-title">Sagittarion</span>}
-        right={
-          <button className="btn ghost icon small" title="Settings" onClick={() => setSettingsOpen(true)} data-testid="open-settings">
-            <Icon name="settings" />
-          </button>
-        }
-      />
       <div className="connect-screen">
         <aside className="conn-list">
           <div className="conn-list-header">
-            <span>Connections</span>
+            <span className="spacer" />
             <button className="btn ghost small" onClick={startNew} title="New connection" data-testid="new-connection">
               <Icon name="plus" /> New
             </button>
+          </div>
+          <div className="conn-section-header tree-section-header">
+            <span>Connections</span>
+            {connections.length ? <span className="count">{connections.length}</span> : null}
           </div>
           <div className="conn-items">
             {connections.length === 0 ? (
@@ -364,26 +597,100 @@ export function ConnectScreen() {
                 Pick a database type to add one.
               </div>
             ) : (
-              connections.map((c) => (
-                <div key={c.id} className={`conn-item ${c.id === selectedId ? 'active' : ''}`} onClick={() => select(c)} onDoubleClick={() => void connect()}>
+              groups.map((g) => {
+                const collapsed = g.name !== null && collapsedGroups.has(g.name)
+                const renaming = g.name !== null && renamingGroup?.from === g.name ? renamingGroup : null
+                return (
+                  <div key={g.name ?? '\u0000'} className={`conn-group ${g.name !== null ? 'named' : ''}`} data-group={g.name ?? undefined}>
+                    {g.name === null ? null : renaming ? (
+                      <div className="conn-group-header renaming">
+                        <Icon name="folder" size={13} />
+                        <input
+                          className="text"
+                          autoFocus
+                          value={renaming.value}
+                          onChange={(e) => setRenamingGroup({ from: renaming.from, value: e.target.value })}
+                          onKeyDown={(e) => {
+                            if (e.key === 'Enter') void renameGroup(renaming.from, renaming.value)
+                            if (e.key === 'Escape') setRenamingGroup(null)
+                          }}
+                          onBlur={() => void renameGroup(renaming.from, renaming.value)}
+                          data-testid="conn-group-rename"
+                        />
+                      </div>
+                    ) : (
+                      <div
+                        className="conn-group-header"
+                        onClick={() => toggleGroup(g.name!)}
+                        onContextMenu={(e) => {
+                          e.preventDefault()
+                          setGroupMenu({ x: e.clientX, y: e.clientY, name: g.name! })
+                        }}
+                        title={collapsed ? 'Show these connections' : 'Hide these connections'}
+                        data-testid="conn-group-header"
+                      >
+                        <Icon name={collapsed ? 'chevron-right' : 'chevron-down'} size={12} />
+                        <span className="conn-group-name">{g.name}</span>
+                        <span className="count">{g.connections.length}</span>
+                        <button
+                          className="btn ghost icon small conn-group-menu"
+                          title="Group options"
+                          onClick={(e) => {
+                            e.stopPropagation()
+                            const r = e.currentTarget.getBoundingClientRect()
+                            setGroupMenu({ x: r.left, y: r.bottom + 4, name: g.name! })
+                          }}
+                          data-testid="conn-group-options"
+                        >
+                          <Icon name="settings" size={12} />
+                        </button>
+                      </div>
+                    )}
+                    {collapsed
+                      ? null
+                      : g.connections.map((c) => (
+                <div
+                  key={c.id}
+                  className={`conn-item ${c.id === selectedId ? 'active' : ''}`}
+                  onClick={() => select(c)}
+                  onDoubleClick={() => void connect()}
+                  onContextMenu={(e) => {
+                    e.preventDefault()
+                    setConnMenu({ x: e.clientX, y: e.clientY, conn: c })
+                  }}
+                >
                   <span className="conn-dot" style={c.color ? { background: c.color } : undefined} />
                   <div className="conn-text">
                     <div className="conn-name">{c.name}</div>
-                    <div className="conn-sub">{describeTarget(c)}</div>
-                    <div className="conn-sub">{c.kind === 'postgres' ? (c.pg?.tunnel ? `via ssh ${c.ssh.username}@${c.ssh.host}` : KIND_LABELS.postgres) : c.remotePath}</div>
+                    <div className="conn-sub">{describeTarget(resolveSshProfile(c, sshProfiles))}</div>
+                    <div className="conn-sub">{c.kind === 'postgres' ? (c.pg?.tunnel ? `via ssh ${describeSsh(resolveSshProfile(c, sshProfiles).ssh)}` : KIND_LABELS.postgres) : c.remotePath}</div>
                   </div>
                   <span className={`conn-kind ${c.kind}`}>
                     <DbLogo kind={c.kind} size={20} />
                   </span>
-                  <button className="btn ghost icon small conn-delete" title="Delete" onClick={(e) => void remove(c, e)}>
+                  <button className="btn ghost icon small conn-duplicate" title="Duplicate" onClick={(e) => void duplicate(c, e)} data-testid="conn-duplicate">
+                    <Icon name="copy" />
+                  </button>
+                  <button className="btn ghost icon small conn-delete" title="Delete" onClick={(e) => void remove(c, e)} data-testid="conn-delete">
                     <Icon name="trash" />
                   </button>
                 </div>
-              ))
+                        ))}
+                  </div>
+                )
+              })
             )}
           </div>
+          {groupMenu ? <ContextMenu x={groupMenu.x} y={groupMenu.y} items={groupMenuItems(groupMenu.name)} onClose={() => setGroupMenu(null)} /> : null}
+          {connMenu ? <ContextMenu x={connMenu.x} y={connMenu.y} items={connMenuItems(connMenu.conn)} onClose={() => setConnMenu(null)} /> : null}
         </aside>
 
+        <div className="connect-main">
+          <div className="connect-topbar">
+            <button className="btn ghost icon small" title="Settings" onClick={() => setSettingsOpen(true)} data-testid="open-settings">
+              <Icon name="settings" />
+            </button>
+          </div>
         <section
           className="conn-form"
           onKeyDown={(e) => {
@@ -402,79 +709,127 @@ export function ConnectScreen() {
                 </h1>
                 <p className="lede">What kind of database do you want to connect to?</p>
                 <div className="kind-chooser">
-                  <button type="button" className="kind-card sqlite" onClick={() => chooseKind('sqlite')} data-testid="choose-sqlite">
+                  <button type="button" className="kind-card sqlite" onClick={() => chooseKind('sqlite')} title="An SQLite file on a host you reach over SSH" data-testid="choose-sqlite">
                     <span className="kind-icon sqlite">
-                      <DbLogo kind="sqlite" size={34} />
+                      <DbLogo kind="sqlite" size={46} />
                     </span>
-                    <span className="kind-title">SQLite over SSH</span>
-                    <span className="kind-desc">A .db or .sqlite file on a server you can reach with SSH. Queries run on that host; the file never leaves it.</span>
+                    <span className="kind-title">SQLite</span>
                   </button>
-                  <button type="button" className="kind-card postgres" onClick={() => chooseKind('postgres')} data-testid="choose-postgres">
+                  <button type="button" className="kind-card postgres" onClick={() => chooseKind('postgres')} title="A PostgreSQL server, directly or through an SSH tunnel" data-testid="choose-postgres">
                     <span className="kind-icon postgres">
-                      <DbLogo kind="postgres" size={36} />
+                      <DbLogo kind="postgres" size={48} />
                     </span>
                     <span className="kind-title">PostgreSQL</span>
-                    <span className="kind-desc">A PostgreSQL server reached directly over the network, or through an SSH tunnel when it only listens locally.</span>
                   </button>
                 </div>
               </>
             ) : (
               <>
-                <h1>
-                  <DbLogo kind={form.kind} size={22} className="title-logo" />
-                  {selectedId ? form.name || 'Connection' : 'New connection'}
-                  <span className={`kind-badge ${form.kind}`}>{KIND_LABELS[form.kind]}</span>
-                </h1>
-                <p className="lede">
-                  {form.kind === 'sqlite'
-                    ? 'Open an SQLite file that lives on another machine, over SSH. Queries run on the remote host; nothing is copied locally.'
-                    : 'Connect to a PostgreSQL server. Use the SSH tunnel option for servers that only accept local connections.'}
-                </p>
+                <div className="conn-head">
+                  <h1 className="conn-title">{selectedId ? form.name || 'Connection' : 'New connection'}</h1>
+                  <div className="conn-kind-line" data-testid="conn-kind">
+                    <DbLogo kind={form.kind} size={20} />
+                    <span>{KIND_LABELS[form.kind]}</span>
+                  </div>
+                </div>
 
                 <div className="form-grid">
                   <div className="field">
                     <label>Name</label>
-                    <input className="text" value={form.name} placeholder="Production analytics" onChange={(e) => update({ name: e.target.value })} data-testid="conn-name" />
+                    <input ref={nameInputRef} className="text" value={form.name} placeholder="Production analytics" onChange={(e) => update({ name: e.target.value })} data-testid="conn-name" />
                   </div>
                   <div className="field">
-                    <label>Database type</label>
-                    <div className="segmented">
-                      {(['sqlite', 'postgres'] as const).map((k) => (
-                        <button key={k} type="button" className={form.kind === k ? 'active' : ''} onClick={() => chooseKind(k)}>
-                          <DbLogo kind={k} size={14} />
-                          {KIND_LABELS[k]}
+                    <label>Group</label>
+                    {groupMode === 'new' ? (
+                      <div className="group-new">
+                        <input
+                          className="text"
+                          autoFocus
+                          value={form.group ?? ''}
+                          placeholder="e.g. Acme or Production"
+                          onChange={(e) => update({ group: e.target.value })}
+                          onKeyDown={(e) => {
+                            if (e.key === 'Escape') {
+                              setGroupMode(null)
+                              update({ group: undefined })
+                            }
+                          }}
+                          data-testid="conn-group-name"
+                        />
+                        <button
+                          className="btn ghost icon"
+                          title="Cancel"
+                          onClick={() => {
+                            setGroupMode(null)
+                            update({ group: undefined })
+                          }}
+                        >
+                          <Icon name="x" size={12} />
                         </button>
-                      ))}
-                    </div>
+                      </div>
+                    ) : (
+                      <select
+                        className="select"
+                        value={!form.group ? '' : names.includes(form.group) ? form.group : '__unsaved__'}
+                        onChange={(e) => {
+                          const v = e.target.value
+                          if (v === '__new__') {
+                            setGroupMode('new')
+                            update({ group: '' })
+                          } else update({ group: v || undefined })
+                        }}
+                        data-testid="conn-group"
+                      >
+                        <option value="">No group</option>
+                        {names.map((n) => (
+                          <option key={n} value={n}>
+                            {n}
+                          </option>
+                        ))}
+                        {form.group && !names.includes(form.group) ? <option value="__unsaved__">{form.group}</option> : null}
+                        <option value="__new__">New group…</option>
+                      </select>
+                    )}
+                    <span className="hint">Keeps related connections together, such as one app's environments.</span>
                   </div>
                 </div>
 
                 {form.kind === 'sqlite' ? (
                   <>
                     <div className="form-section">
-                      <h2>SSH host</h2>
-                      <SshFields ssh={form.ssh} onChange={updateSsh} encryption={encryption} idPrefix="ssh" />
-                    </div>
-                    <div className="form-section">
                       <h2>Database file</h2>
                       <div className="form-grid">
                         <div className="field full">
-                          <label>Path on remote host</label>
+                          <label>{form.remote ? 'Path on the SSH host' : 'Path on this computer'}</label>
                           <div className="row">
                             <input
                               className="text mono"
                               value={form.remotePath ?? ''}
-                              placeholder="/var/lib/app/data.sqlite or ~/app.db"
+                              placeholder={form.remote ? '/var/lib/app/data.sqlite or ~/app.db' : '~/Documents/app.db'}
                               onChange={(e) => update({ remotePath: e.target.value })}
                               spellCheck={false}
-                              data-testid="remote-path"
+                              data-testid="sqlite-path"
                             />
-                            <button className="btn" type="button" disabled={disabled} onClick={() => void browse()}>
+                            <button className="btn" type="button" disabled={disabled} onClick={() => void browse()} data-testid="sqlite-browse">
                               {busy === 'browse' ? <span className="spinner" /> : <Icon name="folder" />} Browse…
                             </button>
                           </div>
                         </div>
                       </div>
+                    </div>
+                    <div className={`form-section ${form.remote ? 'tunnel' : ''}`}>
+                      <label className="checkbox">
+                        <input type="checkbox" checked={!!form.remote} onChange={(e) => update({ remote: e.target.checked })} data-testid="sqlite-remote" />
+                        The file is on another machine: connect over SSH
+                      </label>
+                      {form.remote ? (
+                        <>
+                          <p className="hint" style={{ margin: '8px 0 12px' }}>
+                            Queries run on that host through a small Python helper sent over the connection; the file never leaves it.
+                          </p>
+                          <SshSection form={form} profiles={sshProfiles} draft={draft} encryption={encryption} idPrefix="ssh" onSsh={updateSsh} onProfile={useProfile} onDraft={setDraft} onForget={(p) => void forgetProfile(p)} />
+                        </>
+                      ) : null}
                     </div>
                   </>
                 ) : (
@@ -536,7 +891,7 @@ export function ConnectScreen() {
                           <p className="hint" style={{ margin: '8px 0 12px' }}>
                             The database host and port above are resolved from the SSH host, so <code>localhost:5432</code> means the server on that machine.
                           </p>
-                          <SshFields ssh={form.ssh} onChange={updateSsh} encryption={encryption} idPrefix="tunnel" />
+                          <SshSection form={form} profiles={sshProfiles} draft={draft} encryption={encryption} idPrefix="tunnel" onSsh={updateSsh} onProfile={useProfile} onDraft={setDraft} onForget={(p) => void forgetProfile(p)} />
                         </>
                       ) : null}
                     </div>
@@ -588,7 +943,12 @@ export function ConnectScreen() {
                 {error ? <div className="error-box">{error}</div> : null}
 
                 <div className="requirements">
-                  {form.kind === 'sqlite' ? (
+                  {form.kind === 'sqlite' && !form.remote ? (
+                    <>
+                      Needs <code>python3</code> on this computer (any version from 3.5, standard library only); on macOS the Xcode Command Line Tools or
+                      Homebrew provide it. The file is opened in place.
+                    </>
+                  ) : form.kind === 'sqlite' ? (
                     <>
                       The remote host needs <code>python3</code> (any version from 3.5, standard library only). A small helper script is sent over the SSH
                       connection each time you connect; nothing is installed on the server.
@@ -597,13 +957,19 @@ export function ConnectScreen() {
                     <>
                       Works with PostgreSQL 12 and newer. Rows are edited by primary key, so tables without one are read-only in the grid.
                     </>
-                  )}{' '}
-                  Host keys are checked against your <code>~/.ssh/known_hosts</code> and remembered after you accept them.
+                  )}
+                  {usesSsh(form) ? (
+                    <>
+                      {' '}
+                      Host keys are checked against your <code>~/.ssh/known_hosts</code> and remembered after you accept them.
+                    </>
+                  ) : null}
                 </div>
               </>
             )}
           </div>
         </section>
+        </div>
       </div>
       {browser ? (
         <RemoteFileBrowser

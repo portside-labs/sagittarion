@@ -10,3 +10,4 @@ test/fixtures/*.db
 test/fixtures/*.db-*
 test/docker/.context/
 *.tsbuildinfo
+__pycache__/

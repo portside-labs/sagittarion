@@ -1,4 +1,4 @@
-import type { ConnectionConfig, DatabaseKind, PostgresConfig, SshConfig, TableRef } from './types'
+import type { ConnectionConfig, DatabaseKind, PostgresConfig, SshConfig, SshProfile, TableRef } from './types'
 
 export function defaultSsh(): SshConfig {
   return { host: '', port: 22, username: '', auth: 'key', savePassword: true, savePassphrase: true }
@@ -15,6 +15,7 @@ export function newConnection(kind: DatabaseKind): ConnectionConfig {
     kind,
     readOnly: false,
     ssh: defaultSsh(),
+    remote: kind === 'sqlite' ? false : undefined,
     remotePath: kind === 'sqlite' ? '' : undefined,
     pg: kind === 'postgres' ? defaultPostgres() : undefined
   }
@@ -28,6 +29,12 @@ export function normalizeConnection(cfg: ConnectionConfig): ConnectionConfig {
     ssh: { ...defaultSsh(), ...(cfg.ssh ?? {}) }
   }
   out.ssh.port = Number(out.ssh.port) || 22
+  const group = cfg.group?.trim()
+  if (group) out.group = group
+  else delete out.group
+  // Connections saved before local files were supported were all over SSH.
+  if (out.kind === 'sqlite') out.remote = cfg.remote ?? Boolean(cfg.ssh?.host)
+  else delete out.remote
   if (out.kind === 'postgres') {
     out.pg = { ...defaultPostgres(), ...(cfg.pg ?? {}) }
     out.pg.port = Number(out.pg.port) || 5432
@@ -41,8 +48,27 @@ export function describeTarget(cfg: ConnectionConfig): string {
     const p = cfg.pg
     return `${p.user}@${p.host}${p.port !== 5432 ? `:${p.port}` : ''}/${p.database}`
   }
-  const s = cfg.ssh
+  if (cfg.kind === 'sqlite' && !cfg.remote) return 'This computer'
+  return describeSsh(cfg.ssh)
+}
+
+/** "user@host[:port]" for an SSH endpoint. */
+export function describeSsh(s: SshConfig): string {
   return `${s.username}@${s.host}${s.port !== 22 ? `:${s.port}` : ''}`
+}
+
+/** True when the connection goes through SSH at all: a remote SQLite file or a Postgres tunnel. */
+export function usesSsh(cfg: ConnectionConfig): boolean {
+  return cfg.kind === 'sqlite' ? cfg.remote !== false : Boolean(cfg.pg?.tunnel)
+}
+
+/** The SSH fields a connection actually uses: its profile's when it references one, else its own. */
+export function resolveSshProfile(cfg: ConnectionConfig, profiles: SshProfile[]): ConnectionConfig {
+  if (!cfg.sshProfileId) return cfg
+  const p = profiles.find((x) => x.id === cfg.sshProfileId)
+  if (!p) return cfg
+  const { id: _id, name: _name, createdAt: _c, lastUsedAt: _l, ...ssh } = p
+  return { ...cfg, ssh }
 }
 
 /** Parse a libpq-style URL such as postgres://user:pass@host:5432/db?sslmode=require. */

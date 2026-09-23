@@ -73,7 +73,11 @@
         "dmg",
         "zip"
       ],
-      "identity": null,
+      "hardenedRuntime": true,
+      "gatekeeperAssess": false,
+      "entitlements": "build/entitlements.mac.plist",
+      "entitlementsInherit": "build/entitlements.mac.plist",
+      "notarize": true,
       "darkModeSupport": true
     },
     "win": {
@@ -87,7 +91,8 @@
         "deb"
       ],
       "category": "Development"
-    }
+    },
+    "artifactName": "${productName}-${version}-${arch}.${ext}"
   },
   "homepage": "https://portsidelabs.io/sagittarion"
 }

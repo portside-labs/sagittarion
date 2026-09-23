@@ -1,4 +1,3 @@
-import { EventEmitter } from 'node:events'
 import { randomBytes } from 'node:crypto'
 import { promises as fs } from 'node:fs'
 import net from 'node:net'
@@ -6,19 +5,10 @@ import os from 'node:os'
 import path from 'node:path'
 import { Client, type ClientChannel, type ConnectConfig, type SFTPWrapper } from 'ssh2'
 import { AgentError, PythonAgent } from './agent'
-import type {
-  ConnectProgress,
-  FileEntry,
-  PendingChange,
-  QueryOptions,
-  QueryResponse,
-  ReaddirResult,
-  RowsRequest,
-  RowsResponse,
-  SchemaInfo,
-  SshConfig,
-  TableDetails
-} from '@shared/types'
+import { AgentSession, type SqliteOpenInfo } from './agent-session'
+
+export type { SqliteOpenInfo }
+import type { ConnectProgress, FileEntry, ReaddirResult, SshConfig } from '@shared/types'
 
 export interface SessionOptions {
   /** Source of sqlite_agent.py, shipped to the remote host when a database is opened. */
@@ -35,21 +25,6 @@ export interface ExecResult {
   stdout: string
   stderr: string
   code: number | null
-}
-
-/** What sqlite_agent.py reports after opening a file. */
-export interface SqliteOpenInfo {
-  path: string
-  readonly: boolean
-  sqliteVersion: string
-  pythonVersion: string
-  fileSize: number
-  pageSize: number
-  pageCount: number
-  journalMode: string
-  home: string
-  hostname: string
-  writable: boolean
 }
 
 /** A local TCP listener whose connections are forwarded through the SSH connection. */
@@ -111,20 +86,14 @@ export function friendlyConnectError(err: any, ssh: SshConfig): Error {
  * database open, browse files over SFTP, and forward local TCP connections
  * (used for Postgres tunnels).
  */
-export class Session extends EventEmitter {
-  readonly id = randomBytes(8).toString('hex')
+export class Session extends AgentSession {
   readonly ssh: SshConfig
   private readonly opts: SessionOptions
   private readonly client = new Client()
-  private agent: PythonAgent | null = null
   private sftp: SFTPWrapper | null = null
   private sftpPromise: Promise<SFTPWrapper> | null = null
   private forwards = new Set<net.Server>()
-  interpreter: string | null = null
   serverBanner = ''
-  homeDir: string | null = null
-  db: SqliteOpenInfo | null = null
-  closed = false
   /** The most recent failure to open a forwarded channel, for diagnostics. */
   lastForwardError: Error | null = null
 
@@ -132,9 +101,15 @@ export class Session extends EventEmitter {
     super()
     this.ssh = ssh
     this.opts = opts
+    this.onProgress = opts.onProgress
   }
 
-  private progress(stage: ConnectProgress['stage'], message: string): void {
+  get where(): string {
+    return this.ssh.host
+  }
+
+  /** Read at call time so a progress listener attached after construction still hears every stage. */
+  protected override progress(stage: ConnectProgress['stage'], message: string): void {
     this.opts.onProgress?.({ stage, message })
   }
 
@@ -381,8 +356,7 @@ export class Session extends EventEmitter {
     )
   }
 
-  async startAgent(): Promise<PythonAgent> {
-    if (this.agent && !this.agent.hasExited) return this.agent
+  protected async spawnAgent(): Promise<PythonAgent> {
     const interpreter = await this.probeInterpreter()
     this.progress('starting-agent', `Starting helper with ${interpreter}…`)
     const token = randomBytes(12).toString('hex')
@@ -390,105 +364,8 @@ export class Session extends EventEmitter {
     const command = `${interpreter} -c "import sys,base64;exec(base64.b64decode(sys.argv[1]))" ${b64} ${token}`
     const stream = await this.execStream(command)
     const agent = new PythonAgent(stream, token)
-    agent.on('exit', (info) => {
-      if (this.agent === agent) {
-        this.agent = null
-        this.db = null
-        this.emit('agent-exit', info)
-      }
-    })
-    this.agent = agent
     await agent.waitReady(this.opts.agentStartTimeoutMs ?? 30_000)
     return agent
-  }
-
-  private requireAgent(): PythonAgent {
-    if (!this.agent || this.agent.hasExited) {
-      throw new AgentError('Not connected to a database. Reconnect to continue.')
-    }
-    return this.agent
-  }
-
-  // ---------------------------------------------------------------------
-  // Database operations
-  // ---------------------------------------------------------------------
-
-  async openDatabase(remotePath: string, readonly = false, create = false): Promise<SqliteOpenInfo> {
-    const agent = await this.startAgent()
-    this.progress('opening', `Opening ${remotePath}…`)
-    const res = await agent.request<SqliteOpenInfo & { id: number; ok: true }>('open', {
-      path: remotePath,
-      readonly,
-      create
-    })
-    const { id: _id, ok: _ok, ...info } = res as any
-    this.db = info as SqliteOpenInfo
-    this.homeDir = this.db.home
-    return this.db
-  }
-
-  async schema(includeSystem = false): Promise<SchemaInfo> {
-    const res = await this.requireAgent().request('schema', { include_system: includeSystem })
-    return { kind: 'sqlite', tables: res.tables, views: res.views, indexes: res.indexes, triggers: res.triggers, relations: res.relations ?? [] }
-  }
-
-  async tableDetails(table: string): Promise<TableDetails> {
-    const { id: _id, ok: _ok, durationMs: _d, tx: _tx, ...rest } = await this.requireAgent().request('table_details', { table })
-    return rest as TableDetails
-  }
-
-  async count(table: string, where?: string): Promise<number> {
-    const res = await this.requireAgent().request('count', { table, where })
-    return res.total
-  }
-
-  async rows(req: RowsRequest): Promise<RowsResponse> {
-    const res = await this.requireAgent().request('rows', {
-      table: req.table,
-      offset: req.offset,
-      limit: req.limit,
-      order_by: req.orderBy,
-      order_dir: req.orderDir,
-      where: req.where,
-      with_count: req.withCount ?? false
-    })
-    return {
-      table: res.table,
-      columns: res.columns,
-      rows: res.rows,
-      rowids: res.rowids,
-      rowidAlias: res.rowidAlias,
-      pk: res.pk,
-      isView: res.isView,
-      total: res.total,
-      sql: res.sql,
-      durationMs: res.durationMs,
-      tx: res.tx
-    }
-  }
-
-  async query(sql: string, params: unknown[] = [], maxRows = 1000, options?: QueryOptions): Promise<QueryResponse> {
-    const res = await this.requireAgent().request('query', { sql, params, max_rows: maxRows, read_only: Boolean(options?.readOnly) })
-    return { results: res.results, durationMs: res.durationMs, tx: res.tx }
-  }
-
-  cancel(): void {
-    this.agent?.cancel()
-  }
-
-  async apply(changes: PendingChange[]): Promise<number> {
-    const res = await this.requireAgent().request('apply', { changes })
-    return res.applied
-  }
-
-  async ping(): Promise<boolean> {
-    if (!this.agent || this.agent.hasExited) return false
-    try {
-      await this.agent.request('ping')
-      return true
-    } catch {
-      return false
-    }
   }
 
   // ---------------------------------------------------------------------

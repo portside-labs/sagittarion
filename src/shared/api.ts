@@ -16,6 +16,7 @@ import type {
   RowsResponse,
   SearchResult,
   SessionInfo,
+  SshProfile,
   TableDetails,
   TableRef
 } from './types'
@@ -48,6 +49,16 @@ export interface Api {
     list(): Promise<ConnectionConfig[]>
     save(cfg: ConnectionConfig): Promise<ConnectionConfig>
     remove(id: string): Promise<void>
+    /** Puts the given connections in a group, or in none when null: how a group is renamed or dissolved. */
+    setGroup(ids: string[], group: string | null): Promise<void>
+    /** A copy of a saved connection, secrets included, under a new name. */
+    duplicate(id: string): Promise<ConnectionConfig>
+  }
+  /** Saved SSH hosts, reusable by any connection. */
+  sshProfiles: {
+    list(): Promise<SshProfile[]>
+    save(profile: SshProfile): Promise<SshProfile>
+    remove(id: string): Promise<void>
   }
   session: {
     open(cfg: ConnectionConfig, opts?: OpenOptions): Promise<SessionInfo>
@@ -79,6 +90,8 @@ export interface Api {
   }
   dialog: {
     pickPrivateKey(): Promise<string | null>
+    /** Native picker for a database file on this computer. */
+    pickSqliteFile(current?: string): Promise<string | null>
   }
   exportData(req: ExportRequest): Promise<{ saved: boolean; path?: string }>
   settings: {

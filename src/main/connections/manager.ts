@@ -1,16 +1,22 @@
 import { EventEmitter } from 'node:events'
 import { randomBytes } from 'node:crypto'
-import type { ConnectProgress, ConnectionConfig, SessionInfo, SshConfig } from '@shared/types'
-import { describeTarget, normalizeConnection } from '@shared/connections'
+import type { ConnectProgress, ConnectionConfig, SessionInfo, SshConfig, SshProfile } from '@shared/types'
+import { describeSsh, describeTarget, normalizeConnection, resolveSshProfile, usesSsh } from '@shared/connections'
 import { Session, type LocalForward } from '../ssh/session'
+import { LocalSession } from '../ssh/local-session'
+import type { AgentSession } from '../ssh/agent-session'
 import type { DatabaseDriver } from '../db/driver'
 import { SqliteSshDriver } from '../db/sqlite-ssh'
 import { PostgresDriver } from '../db/postgres'
 
 export interface ActiveConnection {
   id: string
+  /** The configuration as opened, with any SSH profile already resolved into `ssh`. */
   config: ConnectionConfig
+  /** The SSH connection in use: a remote SQLite host or a Postgres tunnel. */
   ssh: Session | null
+  /** The helper session behind a SQLite connection, local or remote. */
+  session: AgentSession | null
   forward: LocalForward | null
   driver: DatabaseDriver | null
   closed: boolean
@@ -19,6 +25,8 @@ export interface ActiveConnection {
 export interface ManagerDeps {
   agentSource: string
   verifyHostKey: (ssh: SshConfig, key: Buffer) => Promise<boolean>
+  /** Looks up a saved SSH profile by id. */
+  resolveSshProfile?: (id: string) => Promise<SshProfile | undefined>
 }
 
 export interface OpenParams {
@@ -49,27 +57,42 @@ export class ConnectionManager extends EventEmitter {
     return conn.driver
   }
 
-  /** The SSH session behind a SQLite connection (file browser, opening files). */
-  sshSession(id: string): Session {
+  /** The helper session behind a SQLite connection (file browser, opening files), local or over SSH. */
+  fileSession(id: string): AgentSession {
     const conn = this.get(id)
-    if (conn.config.kind !== 'sqlite' || !conn.ssh) throw new Error('This feature is only available for SQLite over SSH connections.')
-    return conn.ssh
+    if (conn.config.kind !== 'sqlite' || !conn.session) throw new Error('This feature is only available for SQLite connections.')
+    return conn.session
+  }
+
+  /** The SSH fields a connection uses, with a referenced profile resolved. */
+  private async sshFor(config: ConnectionConfig): Promise<ConnectionConfig> {
+    if (!config.sshProfileId || !usesSsh(config)) return config
+    const profile = await this.deps.resolveSshProfile?.(config.sshProfileId)
+    if (!profile) throw new Error('The SSH profile this connection uses no longer exists. Edit the connection and pick another one.')
+    return resolveSshProfile(config, [profile])
   }
 
   async open(rawConfig: ConnectionConfig, params: OpenParams = {}): Promise<ActiveConnection> {
-    const config = normalizeConnection(rawConfig)
-    const conn: ActiveConnection = { id: randomBytes(8).toString('hex'), config, ssh: null, forward: null, driver: null, closed: false }
+    const config = await this.sshFor(normalizeConnection(rawConfig))
+    const conn: ActiveConnection = { id: randomBytes(8).toString('hex'), config, ssh: null, session: null, forward: null, driver: null, closed: false }
     const onProgress = params.onProgress
     try {
       if (config.kind === 'sqlite') {
-        const session = this.makeSession(config.ssh, onProgress)
-        conn.ssh = session
+        let session: AgentSession
+        if (config.remote) {
+          const ssh = this.makeSession(config.ssh, onProgress)
+          conn.ssh = ssh
+          session = ssh
+        } else {
+          session = new LocalSession({ agentSource: this.deps.agentSource, onProgress })
+        }
+        conn.session = session
         this.wireSession(conn, session)
         await session.connect()
         const driver = new SqliteSshDriver(session)
         conn.driver = driver
         if (params.openDatabase !== false) {
-          if (!config.remotePath?.trim()) throw new Error('No remote database path given.')
+          if (!config.remotePath?.trim()) throw new Error(config.remote ? 'No remote database path given.' : 'No database file chosen.')
           await driver.open(config.remotePath.trim(), Boolean(config.readOnly))
         }
       } else {
@@ -146,10 +169,10 @@ export class ConnectionManager extends EventEmitter {
       color: cfg.color,
       target: describeTarget(cfg),
       db: conn.driver?.info() ?? null,
-      interpreter: s?.interpreter ?? undefined,
+      interpreter: conn.session?.interpreter ?? undefined,
       serverBanner: s?.serverBanner,
-      homeDir: s?.homeDir ?? null,
-      tunnel: cfg.kind === 'postgres' && cfg.pg?.tunnel ? `${cfg.ssh.username}@${cfg.ssh.host}` : null
+      homeDir: conn.session?.homeDir ?? null,
+      tunnel: cfg.kind === 'postgres' && cfg.pg?.tunnel ? describeSsh(cfg.ssh) : null
     }
   }
 
@@ -161,7 +184,7 @@ export class ConnectionManager extends EventEmitter {
     })
   }
 
-  private wireSession(conn: ActiveConnection, session: Session): void {
+  private wireSession(conn: ActiveConnection, session: AgentSession): void {
     session.on('close', ({ reason }: { reason: string }) => this.markClosed(conn, reason))
     session.on('agent-exit', (info: { stderr?: string }) => {
       const detail = info?.stderr?.trim() ? `: ${info.stderr.trim().slice(-300)}` : ''
@@ -189,6 +212,7 @@ export class ConnectionManager extends EventEmitter {
       /* ignore */
     }
     conn.forward?.close()
+    conn.session?.close()
     conn.ssh?.close()
   }
 }

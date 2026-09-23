@@ -58,6 +58,7 @@ export class SettingsStore {
     const provider: AiProviderKind = s.provider && s.provider in AI_PRESETS ? s.provider : 'openai'
     const preset = AI_PRESETS[provider]
     const key = await this.apiKeyFor(provider)
+    const configuredProviders = (Object.keys(AI_PRESETS) as AiProviderKind[]).filter((p) => !AI_PRESETS[p].needsKey || Boolean(s.keys?.[p]))
     return {
       provider,
       baseUrl: s.baseUrl ?? preset.baseUrl,
@@ -68,7 +69,8 @@ export class SettingsStore {
       sendSampleValues: Boolean(s.sendSampleValues),
       autoRun: s.autoRun ?? true,
       schemaBudgetTokens: s.schemaBudgetTokens ?? 8000,
-      encryptionAvailable: this.codec.available
+      encryptionAvailable: this.codec.available,
+      configuredProviders
     }
   }
 

@@ -97,7 +97,7 @@ export function ResultsView({
       {current.kind === 'rows' ? (
         <div className="grid-area">
           <DataGrid
-            columns={current.columns.map((c) => ({ name: c.name, declType: c.declType }))}
+            columns={current.columns.map((c) => ({ name: c.name, declType: c.declType, inferred: c.inferred }))}
             rows={current.rows}
             selection={selection}
             onSelect={setSelection}

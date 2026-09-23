@@ -1,4 +1,5 @@
 import { useStore } from '@/store'
+import { KIND_LABELS } from '@shared/types'
 
 export function StatusBar() {
   const session = useStore((s) => s.session)
@@ -8,10 +9,12 @@ export function StatusBar() {
   const db = session.db
   return (
     <div className="statusbar">
-      <span className="status-item">
-        <span className="dot ok" />
-        {session.target}
+      <span className="status-item status-session" title={session.name}>
+        <span className="dot ok" style={session.color ? { background: session.color, boxShadow: 'none' } : undefined} />
+        <strong>{session.name}</strong>
+        <span className="status-kind">({KIND_LABELS[session.kind]})</span>
       </span>
+      <span className="status-item">{session.target}</span>
       {db ? (
         <>
           <span className="status-item mono" title={db.label}>
