@@ -1,7 +1,7 @@
 {
   "name": "sagittarion",
   "productName": "Sagittarion",
-  "version": "0.6.0",
+  "version": "0.7.0",
   "description": "Desktop GUI for browsing and editing SQLite databases on remote hosts over SSH",
   "main": "./out/main/index.js",
   "author": {
