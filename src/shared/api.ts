@@ -22,7 +22,7 @@ import type {
   TableRef,
   WorkspaceState
 } from './types'
-import type { AiProgressEvent, AiResult, AiSettings, AiSettingsUpdate, AiTurn } from './ai'
+import type { AiConnectionInput, AiProgressEvent, AiResult, AiSettings, AiSettingsUpdate, AiTurn } from './ai'
 
 export interface OpenOptions {
   /** Open the configured database after connecting (default true). SQLite only; Postgres always opens. */
@@ -110,9 +110,9 @@ export interface Api {
   settings: {
     get(): Promise<AiSettings>
     update(u: AiSettingsUpdate): Promise<AiSettings>
-    /** Checks that the provider answers with the given overrides on top of the saved settings. */
-    testProvider(overrides?: AiSettingsUpdate): Promise<{ ok: boolean; message: string }>
-    listModels(overrides?: AiSettingsUpdate): Promise<string[]>
+    /** Checks that a connection answers: the active one, or one as typed into Settings before saving. */
+    testProvider(input?: AiConnectionInput): Promise<{ ok: boolean; message: string }>
+    listModels(input?: AiConnectionInput): Promise<string[]>
   }
   ai: {
     /** Turn a plain-English question into a verified read-only query for the open database. */

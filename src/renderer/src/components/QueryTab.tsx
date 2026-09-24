@@ -63,11 +63,14 @@ export function QueryTab({ tab, active }: { tab: Extract<Tab, { kind: 'query' }>
   const setStatus = useSession((s) => s.setStatus)
   const setInTransaction = useSession((s) => s.setInTransaction)
   const updateQuerySnapshot = useSession((s) => s.updateQuerySnapshot)
+  const setTabDirty = useSession((s) => s.setTabDirty)
   const toast = useStore((s) => s.toast)
+  const confirm = useStore((s) => s.confirm)
   const layout = useStore((s) => s.queryLayout)
   const setLayout = useStore((s) => s.setQueryLayout)
   const chatOpen = useStore((s) => s.chatOpen)
   const setChatOpen = useStore((s) => s.setChatOpen)
+  const ui = useStore((s) => s.ui)
 
   const editorRef = useRef<SqlEditorHandle>(null)
   /** What this tab held when the app last ran, if it is being brought back. Read once, when the tab mounts. */
@@ -80,6 +83,9 @@ export function QueryTab({ tab, active }: { tab: Extract<Tab, { kind: 'query' }>
   const [running, setRunning] = useState(false)
   const [error, setError] = useState<string | null>(snapshot?.lastRun?.error ?? null)
   const [maxRows, setMaxRows] = useState(snapshot?.limit ?? 1000)
+  const resultsDirty = useRef(false)
+  /** Counts runs, so the results view can tell a new run from rows edited in place. */
+  const [runKey, setRunKey] = useState(0)
   const [lastRun, setLastRun] = useState<{ ms: number; statements: number; restored?: boolean; dropped?: boolean } | null>(
     snapshot?.lastRun ? { ms: snapshot.lastRun.ms, statements: snapshot.lastRun.statements, restored: true, dropped: Boolean(snapshot.lastRun.resultsDropped) } : null
   )
@@ -116,13 +122,21 @@ export function QueryTab({ tab, active }: { tab: Extract<Tab, { kind: 'query' }>
     }
   }, [catalog, names, store])
 
-  const run = async (sqlOverride?: string) => {
+  /**
+   * Runs the selection when there is one, otherwise the block of lines the cursor is in; blank lines
+   * separate blocks, and a trailing semicolon is optional. `all` runs the whole editor.
+   */
+  const run = async (sqlOverride?: string, all = false) => {
     if (running) return
     const ed = editorRef.current
     if (!ed) return
     const selected = sqlOverride ? '' : ed.getSelection()
-    const text = sqlOverride ?? (selected.trim() ? selected : ed.getValue())
+    const text = sqlOverride ?? (all ? ed.getValue() : selected.trim() ? selected : ed.getBlockAtCursor())
     if (!text.trim()) return
+    if (resultsDirty.current) {
+      const ok = await confirm('Discard staged edits?', 'Edits staged in the results have not been applied to the database.', 'Discard', true)
+      if (!ok) return
+    }
     setRunning(true)
     setError(null)
     const t0 = performance.now()
@@ -130,6 +144,7 @@ export function QueryTab({ tab, active }: { tab: Extract<Tab, { kind: 'query' }>
       const res = await window.api.db.query(session.sessionId, text, [], maxRows)
       const ms = performance.now() - t0
       setResults(res.results)
+      setRunKey((k) => k + 1)
       setInTransaction(res.tx)
       setLastRun({ ms, statements: res.results.length })
       const keep = JSON.stringify(res.results).length <= SNAPSHOT_RESULT_BYTES
@@ -151,6 +166,7 @@ export function QueryTab({ tab, active }: { tab: Extract<Tab, { kind: 'query' }>
     } catch (e) {
       setError(errorMessage(e))
       setResults(null)
+      setRunKey((k) => k + 1)
       updateQuerySnapshot(tab.id, { sql: sqlRef.current, limit: maxRows, lastRun: { sql: text, at: Date.now(), ms: performance.now() - t0, statements: 0, results: null, error: errorMessage(e) } })
     } finally {
       setRunning(false)
@@ -199,7 +215,9 @@ export function QueryTab({ tab, active }: { tab: Extract<Tab, { kind: 'query' }>
                 updateQuerySnapshot(tab.id, { sql: v })
               }}
               onRun={() => void run()}
+              onRunAll={() => void run(undefined, true)}
               completion={completion}
+              prefs={{ keywordCase: ui.keywordCase, autocomplete: ui.autocomplete, autoAlias: ui.autoAlias, acceptKeys: ui.acceptKeys }}
               dialect={session.kind}
               placeholder="SELECT * FROM …"
             />
@@ -212,7 +230,28 @@ export function QueryTab({ tab, active }: { tab: Extract<Tab, { kind: 'query' }>
         <div className="pane" data-testid="pane-results">
           <PaneHeader title="Results" handle={handle} testId="results-header" />
           <div className="pane-body">
-            <ResultsView results={results} running={running} error={error} onExport={(r) => void exportResult(r)} />
+            <ResultsView
+              sessionId={session.sessionId}
+              runKey={runKey}
+              results={results}
+              running={running}
+              error={error}
+              onExport={(r) => void exportResult(r)}
+              onEdited={(index, rows) => {
+                setResults((prev) => {
+                  if (!prev) return prev
+                  const next = prev.map((r, i) => (i === index && r.kind === 'rows' ? { ...r, rows } : r))
+                  const keep = JSON.stringify(next).length <= SNAPSHOT_RESULT_BYTES
+                  const snap = store.getState().querySnapshots[tab.id]?.lastRun
+                  if (snap) updateQuerySnapshot(tab.id, { lastRun: { ...snap, results: keep ? next : null, resultsDropped: !keep } })
+                  return next
+                })
+              }}
+              onDirty={(dirty) => {
+                resultsDirty.current = dirty
+                setTabDirty(tab.id, dirty)
+              }}
+            />
           </div>
         </div>
       )
@@ -242,7 +281,12 @@ export function QueryTab({ tab, active }: { tab: Extract<Tab, { kind: 'query' }>
             <Icon name="stop" /> Stop
           </button>
         ) : (
-          <button className="btn small primary" onClick={() => void run()} title={`Run (${modKey}↩). With a selection, runs only the selected text.`} data-testid="run-button">
+          <button
+            className="btn small primary"
+            onClick={() => void run()}
+            title={`Run the statement block at the cursor (${modKey}↩). A selection runs on its own; ${modKey}⇧↩ runs everything.`}
+            data-testid="run-button"
+          >
             <Icon name="play" /> Run <span className="kbd">{modKey}↩</span>
           </button>
         )}

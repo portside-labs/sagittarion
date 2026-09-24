@@ -1,20 +1,21 @@
 import { create } from 'zustand'
 import type { AppInfo, ConnectionConfig, DatabaseKind, GroupStyle, SessionInfo, SshProfile, WorkspaceConnection, WorkspaceState } from '@shared/types'
-import type { AiSettings, AiProviderKind } from '@shared/ai'
+import type { AiSettings, ProviderId } from '@shared/ai'
 import { describeTarget, resolveSshProfile } from '@shared/connections'
 import { errorMessage } from './lib/util'
 import { defaultLayout, isValidLayout, type LayoutNode } from './lib/layout'
 import { createSessionStore, snapshotSession, type SessionStore } from './session-store'
+import { ACCEPT_KEY_OPTIONS, type KeywordCase } from './lib/sql-complete'
 
 export type { Tab, SearchState } from './session-store'
 
-export type SettingsTab = 'appearance' | 'ai'
+export type SettingsTab = 'appearance' | 'editor' | 'ai'
 
 /** What the settings dialog should start on when opened for a reason. */
 export interface SettingsIntent {
   tab?: SettingsTab
   /** A model whose provider needs setting up: the AI tab opens on that provider with the model filled in. */
-  provider?: AiProviderKind
+  provider?: ProviderId
   model?: string
 }
 
@@ -24,6 +25,14 @@ export type ConnectionTabsMode = 'horizontal' | 'vertical'
 export interface UiPrefs {
   /** Where open connections are listed: a strip across the top or a rail down the left. */
   connectionTabs: ConnectionTabsMode
+  /** Re-case SQL keywords as they are typed. */
+  keywordCase: KeywordCase
+  /** Suggest tables, columns and keywords while typing. */
+  autocomplete: boolean
+  /** Give tables an alias as they are typed or picked. */
+  autoAlias: boolean
+  /** Keys that take the highlighted suggestion. */
+  acceptKeys: string[]
 }
 
 export type OpenTabStatus = 'pending' | 'connecting' | 'live' | 'error'
@@ -134,12 +143,20 @@ function loadLayout(): LayoutNode {
   return defaultLayout()
 }
 
+const DEFAULT_UI: UiPrefs = { connectionTabs: 'horizontal', keywordCase: 'upper', autocomplete: true, autoAlias: false, acceptKeys: ['Tab', 'Enter'] }
+
 function loadUiPrefs(): UiPrefs {
   try {
-    const parsed = JSON.parse(localStorage.getItem(UI_KEY) ?? 'null')
-    return { connectionTabs: parsed?.connectionTabs === 'vertical' ? 'vertical' : 'horizontal' }
+    const parsed = JSON.parse(localStorage.getItem(UI_KEY) ?? 'null') ?? {}
+    return {
+      connectionTabs: parsed.connectionTabs === 'vertical' ? 'vertical' : 'horizontal',
+      keywordCase: parsed.keywordCase === 'lower' || parsed.keywordCase === 'off' ? parsed.keywordCase : 'upper',
+      autocomplete: parsed.autocomplete !== false,
+      autoAlias: parsed.autoAlias === true,
+      acceptKeys: Array.isArray(parsed.acceptKeys) ? parsed.acceptKeys.filter((k: unknown) => ACCEPT_KEY_OPTIONS.some((o) => o.key === k)) : ['Tab', 'Enter']
+    }
   } catch {
-    return { connectionTabs: 'horizontal' }
+    return { ...DEFAULT_UI }
   }
 }
 

@@ -3,6 +3,7 @@ import type { ObjectKind, ObjectSummary } from '@shared/types'
 import { tableKey } from '@shared/connections'
 import { useSession } from '@/session-store'
 import { Icon, type IconName } from './Icons'
+import { TypeGlyph } from './TypeGlyph'
 import { buildRows, KIND_LABELS, ROW_HEIGHT, type TreeRow } from '@/lib/tree'
 
 const ICONS: Record<ObjectKind, IconName> = { table: 'table', view: 'view', function: 'function', index: 'index', trigger: 'trigger' }
@@ -144,7 +145,7 @@ export function Sidebar({ width }: { width: number }) {
           <div key={row.key} className={`tree-col tree-row ${row.hit ? 'hit' : ''}`} style={indent} title={`${c.name} ${c.type}${c.notnull ? ' NOT NULL' : ''}${c.pk ? ' PRIMARY KEY' : ''}${c.extra ? ` ${c.extra}` : ''}`}>
             {c.pk ? <Icon className="tree-icon" name="key" size={11} /> : <span style={{ width: 11, flex: '0 0 auto' }} />}
             <span className="col-name">{c.name}</span>
-            <span className="col-type">{c.type || '—'}</span>
+            <TypeGlyph declType={c.type} className="col-type" fallback="—" />
           </div>
         )
       }

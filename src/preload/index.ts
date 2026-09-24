@@ -63,8 +63,8 @@ const api: Api = {
   settings: {
     get: () => ipcRenderer.invoke('settings:get'),
     update: (u) => ipcRenderer.invoke('settings:update', u),
-    testProvider: (overrides) => ipcRenderer.invoke('settings:testProvider', overrides ?? {}),
-    listModels: (overrides) => ipcRenderer.invoke('settings:listModels', overrides ?? {})
+    testProvider: (input) => ipcRenderer.invoke('settings:testProvider', input ?? null),
+    listModels: (input) => ipcRenderer.invoke('settings:listModels', input ?? null)
   },
   ai: {
     ask: (sessionId, question, history, requestId) => ipcRenderer.invoke('ai:ask', sessionId, question, history ?? [], requestId ?? ''),

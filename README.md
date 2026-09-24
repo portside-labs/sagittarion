@@ -49,6 +49,18 @@ time you connect.
   and highlighted, then applied together in a single transaction. Rows are
   addressed by `rowid` (or the primary key for `WITHOUT ROWID` tables) and each
   statement must affect exactly one row or everything rolls back.
+- **Run what you mean**: ⌘↩ runs the statement block under the cursor,
+  blank lines separate blocks, a selection runs on its own, and ⌘⇧↩ runs
+  the whole editor; a trailing semicolon is optional.
+- **Editable results**: rows of a plain single-table `SELECT` can be edited
+  in place with a double-click, staged, and applied through the same
+  transaction path as the Data tab.
+- **Editor settings**: keyword casing (upper, lower or as typed) applied as
+  you finish each keyword, suggestions on or off, which keys accept a
+  suggestion (Tab and Enter by default), and automatic table aliases
+  (`FROM phone_numbers` becomes `FROM phone_numbers pn`). Suggestions follow
+  the statement: tables after FROM and JOIN, columns after SELECT, WHERE, ON,
+  SET and ORDER BY, keywords only where one can follow.
 - **SQL editor**: CodeMirror with SQLite syntax highlighting and table/column
   autocomplete. Runs multiple statements, shows a result per statement, reports
   affected rows and errors, runs only the selection if there is one, and can
@@ -145,6 +157,16 @@ and any repair round. A *Cancel* button stops the run. When it finishes, the
 steps collapse into a one-line summary under the answer that expands on click.
 
 ### Providers
+
+Settings → AI starts with the kind of connection: *Bring your own key*
+(OpenAI, Anthropic, Google Gemini, OpenRouter, Groq; requests go straight
+from the app to the provider with your key), *Local or custom* (Ollama,
+LM Studio, vLLM, LiteLLM or any OpenAI-compatible server; nothing leaves your
+machine or network), or *Managed AI*, which is on its way and will be the only
+part of the app that needs an account. Keys are stored encrypted with the OS
+keychain and referenced from the settings, never written in plain text. The
+database agent's own options, the schema context budget and query safety, are
+the same whichever model answers.
 
 Settings lets you pick any standard provider and bring your own key: OpenAI,
 Anthropic, Google Gemini, Groq, OpenRouter, a local Ollama server, or any

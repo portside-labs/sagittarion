@@ -1,9 +1,9 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type KeyboardEvent, type MouseEvent } from 'react'
 import type { CellValue } from '@shared/types'
-import { classifyType } from '@shared/coltypes'
 import { cellText, displayCell, parseCellInput, valuesEqual } from '@/lib/format'
 import { copyText, hasOwn, isModKey } from '@/lib/util'
 import { Icon } from './Icons'
+import { TypeGlyph } from './TypeGlyph'
 
 export interface GridColumn {
   name: string
@@ -261,15 +261,7 @@ export function DataGrid(props: DataGridProps) {
                     {c.pk ? <Icon className="th-key" name="key" size={11} /> : null}
                     <span className="th-name">{c.name}</span>
                     {sort?.column === c.name ? <span className="th-sort">{sort.dir === 'asc' ? '▲' : '▼'}</span> : null}
-                    {(() => {
-                      const g = classifyType(c.declType)
-                      if (!g) return null
-                      return (
-                        <span className={`th-type family-${g.family}`} title={c.inferred ? `${g.label} (from the values)` : g.label}>
-                          {g.icon ? <Icon name={g.icon} size={11} /> : g.glyph}
-                        </span>
-                      )
-                    })()}
+                    <TypeGlyph declType={c.declType} inferred={c.inferred} />
                   </div>
                   <span className={`col-resizer ${resizing === c.name ? 'active' : ''}`} onMouseDown={(e) => startResize(e, c.name)} onClick={(e) => e.stopPropagation()} />
                 </th>

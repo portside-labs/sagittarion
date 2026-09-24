@@ -1,4 +1,4 @@
-import { app, BrowserWindow, dialog, ipcMain, Menu, safeStorage, shell, type MenuItemConstructorOptions } from 'electron'
+import { app, BrowserWindow, dialog, ipcMain, Menu, safeStorage, screen, shell, type MenuItemConstructorOptions } from 'electron'
 import { promises as fs } from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
@@ -8,11 +8,13 @@ import { ConnectionManager } from './connections/manager'
 import { humanKeyType, KnownHostsStore } from './ssh/hostkeys'
 import { ConnectionStore, noopCodec, type SecretCodec } from './store/connections'
 import { SettingsStore } from './store/settings'
+import { CredentialStore } from './store/credentials'
 import { SshProfileStore } from './store/ssh-profiles'
 import { WorkspaceStore } from './store/workspace'
 import { qi, qualify } from './db/pg-values'
 import { cellToPlainText } from '@shared/export'
-import { AI_PRESETS, type AiProgressEvent, type AiProgressStep, type AiSettings, type AiSettingsUpdate, type AiTurn } from '@shared/ai'
+import type { AiConnectionInput, AiProgressEvent, AiProgressStep, AiSettingsUpdate, AiTurn } from '@shared/ai'
+import { PROVIDERS } from '@shared/ai'
 import { createProvider, providerConfigFor } from './ai/providers/factory'
 import { ProviderError } from './ai/providers/types'
 import { SchemaIndex, type SchemaSource } from './ai/schema-index'
@@ -27,6 +29,7 @@ const isMac = process.platform === 'darwin'
 let mainWindow: BrowserWindow | null = null
 let connectionStore: ConnectionStore
 let settingsStore: SettingsStore
+let credentialStore: CredentialStore
 let sshProfileStore: SshProfileStore
 let workspaceStore: WorkspaceStore
 let knownHosts: KnownHostsStore
@@ -69,17 +72,17 @@ function schemaIndexFor(sessionId: string, driver: DatabaseDriver, kind: 'sqlite
   return pending
 }
 
-async function providerFor(overrides: AiSettingsUpdate = {}) {
-  const saved = await settingsStore.get()
-  const merged: AiSettings = { ...saved, ...(overrides.provider ? { provider: overrides.provider } : {}) }
-  const preset = AI_PRESETS[merged.provider]
-  const switching = overrides.provider && overrides.provider !== saved.provider
-  merged.baseUrl = overrides.baseUrl ?? (switching ? preset.baseUrl : saved.baseUrl)
-  merged.model = overrides.model ?? (switching ? preset.defaultModel : saved.model)
-  merged.embeddingModel = overrides.embeddingModel ?? (switching ? '' : saved.embeddingModel)
-  const apiKey = typeof overrides.apiKey === 'string' && overrides.apiKey.trim() ? overrides.apiKey : await settingsStore.apiKeyFor(merged.provider)
+/** The provider behind the active connection, or behind one as typed into Settings, with its key. */
+async function providerFor(input?: AiConnectionInput) {
+  const { connection, apiKey } = await settingsStore.resolve(input)
+  const preset = PROVIDERS[connection.provider]
+  if (!preset.available) throw new Error(`${preset.label} is not available yet.`)
   if (preset.needsKey && !apiKey) throw new Error(`Add an API key for ${preset.label} in Settings to ask questions in plain English.`)
-  return { settings: merged, provider: createProvider(providerConfigFor(merged, apiKey)) }
+  const settings = await settingsStore.get()
+  const provider = createProvider(
+    providerConfigFor({ provider: connection.provider, baseUrl: connection.baseUrl, model: connection.defaultModel, embeddingModel: connection.embeddingModel }, apiKey)
+  )
+  return { settings, connection, provider }
 }
 
 async function distinctValuesFor(driver: DatabaseDriver, kind: 'sqlite' | 'postgres', ref: TableRef, column: string): Promise<string[] | null> {
@@ -97,9 +100,11 @@ async function distinctValuesFor(driver: DatabaseDriver, kind: 'sqlite' | 'postg
 // ---------------------------------------------------------------------------
 
 function createWindow(): BrowserWindow {
+  // A roomy default that still fits on the screen it opens on.
+  const area = screen.getPrimaryDisplay().workAreaSize
   const win = new BrowserWindow({
-    width: 1320,
-    height: 860,
+    width: Math.min(1584, area.width - 40),
+    height: Math.min(1032, area.height - 40),
     minWidth: 900,
     minHeight: 560,
     show: false,
@@ -351,28 +356,28 @@ function registerIpc(): void {
   })
   ipcMain.handle('settings:get', () => settingsStore.get())
   ipcMain.handle('settings:update', (_e, u: AiSettingsUpdate) => settingsStore.update(u))
-  ipcMain.handle('settings:testProvider', async (_e, overrides: AiSettingsUpdate) => {
+  ipcMain.handle('settings:testProvider', async (_e, overrides: AiConnectionInput | null) => {
     try {
-      const { provider, settings } = await providerFor(overrides)
+      const { provider, connection } = await providerFor(overrides ?? undefined)
       try {
         const models = await provider.listModels()
-        const known = settings.model && models.includes(settings.model)
+        const known = connection.defaultModel && models.includes(connection.defaultModel)
         return {
           ok: true,
-          message: `Connected. ${models.length} model${models.length === 1 ? '' : 's'} available${settings.model ? (known ? `, including ${settings.model}.` : `; "${settings.model}" is not in the list, check the name.`) : '.'}`
+          message: `Connected. ${models.length} model${models.length === 1 ? '' : 's'} available${connection.defaultModel ? (known ? `, including ${connection.defaultModel}.` : `; "${connection.defaultModel}" is not in the list, check the name.`) : '.'}`
         }
       } catch (err) {
         // Some servers have no model listing; a tiny completion still proves the connection.
         if (!(err instanceof ProviderError) || err.errorKind === 'auth' || err.errorKind === 'network') throw err
         const res = await provider.complete({ system: [{ text: 'Reply with the single word OK.' }], messages: [{ role: 'user', content: 'ping' }] })
-        return { ok: true, message: `Connected to ${res.model || settings.model}.` }
+        return { ok: true, message: `Connected to ${res.model || connection.defaultModel}.` }
       }
     } catch (err: any) {
       return { ok: false, message: err?.message ?? String(err) }
     }
   })
-  ipcMain.handle('settings:listModels', async (_e, overrides: AiSettingsUpdate) => {
-    const { provider } = await providerFor(overrides)
+  ipcMain.handle('settings:listModels', async (_e, overrides: AiConnectionInput | null) => {
+    const { provider } = await providerFor(overrides ?? undefined)
     return provider.listModels()
   })
 
@@ -389,7 +394,7 @@ function registerIpc(): void {
       send('ai:progress', event)
     }
     try {
-      const { provider, settings } = await providerFor()
+      const { provider, settings, connection } = await providerFor()
       let index: SchemaIndex
       const cached = schemaIndexes.get(sessionId)
       if (cached) index = await cached
@@ -409,7 +414,7 @@ function registerIpc(): void {
           serverVersion: conn.driver?.info()?.serverVersion ?? kind,
           index,
           provider,
-          settings: { sendSampleValues: settings.sendSampleValues, autoRun: settings.autoRun, schemaBudgetTokens: settings.schemaBudgetTokens, embeddingModel: settings.embeddingModel },
+          settings: { ...settings.agent, embeddingModel: connection.embeddingModel },
           runQuery: (sql, maxRows) => driver.query(sql, [], maxRows, { readOnly: true }),
           distinctValues: (ref, column) => distinctValuesFor(driver, kind, ref, column),
           embeddingCache,
@@ -473,7 +478,8 @@ if (!app.requestSingleInstanceLock()) {
     const userData = app.getPath('userData')
     const codec = makeCodec()
     connectionStore = new ConnectionStore(path.join(userData, 'connections.json'), codec)
-    settingsStore = new SettingsStore(path.join(userData, 'settings.json'), codec)
+    credentialStore = new CredentialStore(path.join(userData, 'credentials.json'), codec)
+    settingsStore = new SettingsStore(path.join(userData, 'settings.json'), credentialStore)
     sshProfileStore = new SshProfileStore(path.join(userData, 'ssh-profiles.json'), codec)
     workspaceStore = new WorkspaceStore(path.join(userData, 'workspace.json'))
     embeddingCache = new EmbeddingCache(path.join(userData, 'ai-cache', 'embeddings.json'))

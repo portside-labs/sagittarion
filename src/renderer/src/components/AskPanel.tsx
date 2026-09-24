@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties, type ReactNode } from 'react'
 import { createPortal } from 'react-dom'
-import type { AiProgressEvent, AiProviderKind, AiResult, AiTurn, CatalogModel } from '@shared/ai'
-import { AI_PRESETS, MODEL_CATALOG, modelTitle } from '@shared/ai'
+import type { AiProgressEvent, AiResult, AiTurn, CatalogModel } from '@shared/ai'
+import { BYOK_PROVIDERS, LOCAL_PROVIDERS, MODEL_CATALOG, PROVIDERS, activeConnection, connectionReady, modelTitle, vendorOf } from '@shared/ai'
 import { useStore } from '@/store'
 import { useSession } from '@/session-store'
 import { Icon } from './Icons'
@@ -9,6 +9,9 @@ import { PaneHeader, type DragHandleProps } from './PaneLayout'
 import { errorMessage } from '@/lib/util'
 
 type Step = AiProgressEvent & { endedAt?: number }
+
+/** A catalogue model as listed in the menu, tied to a saved connection when one offers it. */
+type MenuModel = CatalogModel & { connectionId?: string; connectionName?: string }
 
 export type ChatMessage =
   | { id: string; role: 'user'; text: string; ts: number }
@@ -65,12 +68,12 @@ export function AskPanel({ sessionId, chat, setChat, handle, onSql, running, onC
   /** Where the open menu sits; it renders at the document root so no pane can clip it. */
   const [menuStyle, setMenuStyle] = useState<CSSProperties | null>(null)
   /** A model that needs a provider set up first, with the message shown above the input. */
-  const [notice, setNotice] = useState<{ model: CatalogModel; text: string } | null>(null)
+  const [notice, setNotice] = useState<{ model: MenuModel; text: string } | null>(null)
   const { messages, input } = chat
 
   const asking = messages.some((m) => m.role === 'assistant' && m.status === 'working')
-  const preset = settings ? AI_PRESETS[settings.provider] : null
-  const providerReady = Boolean(settings && preset && (settings.hasKey || !preset.needsKey) && settings.model)
+  const active = activeConnection(settings)
+  const providerReady = Boolean(settings && active && connectionReady(active) && settings.activeModel)
   const lastAssistant = [...messages].reverse().find((m): m is Extract<ChatMessage, { role: 'assistant' }> => m.role === 'assistant')
   const awaitingReply = lastAssistant?.status === 'done' && lastAssistant.result?.kind === 'clarify'
 
@@ -187,35 +190,56 @@ export function AskPanel({ sessionId, chat, setChat, handle, onSql, running, onC
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [menuOpen])
 
-  const menuModels = useMemo<CatalogModel[]>(() => {
-    if (!settings) return MODEL_CATALOG
-    const out: CatalogModel[] = []
+  const menuModels = useMemo<MenuModel[]>(() => {
+    if (!settings) return MODEL_CATALOG.map((m) => ({ ...m }))
+    const out: MenuModel[] = []
     const seen = new Set<string>()
-    const add = (m: CatalogModel) => {
-      const key = `${m.provider}:${m.id}`
+    const add = (m: MenuModel) => {
+      const key = `${m.connectionId ?? m.provider}:${m.id}`
       if (seen.has(key)) return
       seen.add(key)
       out.push(m)
     }
-    for (const m of MODEL_CATALOG) add(m)
-    if (settings.model) add({ provider: settings.provider, id: settings.model, label: modelTitle(settings.provider, settings.model) })
-    for (const id of liveModels ?? []) add({ provider: settings.provider, id, label: modelTitle(settings.provider, id) })
+    // Saved connections: their catalogue models, plus the active one's current model and whatever it lists.
+    for (const c of settings.connections) {
+      for (const m of MODEL_CATALOG) if (m.provider === c.provider) add({ ...m, connectionId: c.id, connectionName: c.name })
+      if (c.id !== settings.activeConnectionId) continue
+      if (settings.activeModel) add({ provider: c.provider, vendor: vendorOf(settings.activeModel), id: settings.activeModel, label: modelTitle(c.provider, settings.activeModel), connectionId: c.id, connectionName: c.name })
+      for (const id of liveModels ?? []) add({ provider: c.provider, vendor: vendorOf(id), id, label: modelTitle(c.provider, id), connectionId: c.id, connectionName: c.name })
+    }
+    // Providers with no connection yet still show their models, with a way to set them up.
+    for (const m of MODEL_CATALOG) if (!settings.connections.some((c) => c.provider === m.provider)) add({ ...m })
     return out
   }, [settings, liveModels])
 
-  const chooseModel = async (m: CatalogModel) => {
+  /** Menu sections: one per saved connection, then providers that are not set up. */
+  const menuGroups = useMemo(() => {
+    const groups: { key: string; title: string; note?: string; items: MenuModel[] }[] = []
+    for (const c of settings?.connections ?? []) {
+      const items = menuModels.filter((m) => m.connectionId === c.id)
+      if (items.length) groups.push({ key: c.id, title: c.name, note: connectionReady(c) ? undefined : 'not set up', items })
+    }
+    for (const p of [...BYOK_PROVIDERS, ...LOCAL_PROVIDERS]) {
+      if (settings?.connections.some((c) => c.provider === p)) continue
+      const items = menuModels.filter((m) => !m.connectionId && m.provider === p)
+      if (items.length) groups.push({ key: p, title: PROVIDERS[p].label, note: 'not set up', items })
+    }
+    return groups
+  }, [menuModels, settings])
+
+  const chooseModel = async (m: MenuModel) => {
     setMenuOpen(false)
     if (!settings) return
-    const configured = settings.configuredProviders.includes(m.provider)
-    if (!configured) {
-      const preset = AI_PRESETS[m.provider]
+    const conn = m.connectionId ? settings.connections.find((c) => c.id === m.connectionId) : undefined
+    if (!conn || !connectionReady(conn)) {
+      const preset = PROVIDERS[m.provider]
       const needs = preset.needsKey ? `${preset.label} API key` : `${preset.label} server details`
       setNotice({ model: m, text: `${m.label} needs ${/^[aeiou]/i.test(needs) ? 'an' : 'a'} ${needs} before it can answer.` })
       return
     }
     setNotice(null)
     try {
-      await window.api.settings.update({ provider: m.provider, model: m.id })
+      await window.api.settings.update({ activeConnectionId: conn.id, activeModel: m.id })
       await loadSettings()
       setLiveModels(null)
     } catch (e) {
@@ -444,7 +468,7 @@ export function AskPanel({ sessionId, chat, setChat, handle, onSql, running, onC
             }}
             data-testid="model-notice-settings"
           >
-            <Icon name="settings" /> Set up {AI_PRESETS[notice.model.provider].label}
+            <Icon name="settings" /> Set up {PROVIDERS[notice.model.provider].label}
           </button>
           <button className="btn ghost icon small notice-close" onClick={() => setNotice(null)} title="Dismiss">
             <Icon name="x" size={12} />
@@ -481,38 +505,33 @@ export function AskPanel({ sessionId, chat, setChat, handle, onSql, running, onC
             ref={modelButtonRef}
             className={`model-button ${menuOpen ? 'open' : ''}`}
             onClick={() => setMenuOpen((v) => !v)}
-            title={settings?.model ? `${settings.model} · choose the model that answers questions` : 'Choose the model that answers questions'}
+            title={settings?.activeModel ? `${settings.activeModel} via ${active?.name ?? 'the active connection'} · choose the model that answers questions` : 'Choose the model that answers questions'}
             data-testid="model-button"
           >
-            <span className="model-name">{settings?.model ? modelTitle(settings.provider, settings.model) : 'Choose a model'}</span>
+            <span className="model-name">{settings?.activeModel && active ? modelTitle(active.provider, settings.activeModel) : 'Choose a model'}</span>
             <Icon name={menuOpen ? 'chevron-down' : 'chevron-right'} size={11} />
           </button>
           {menuOpen && menuStyle ? (
             createPortal(
             <div className="model-menu" role="menu" style={menuStyle} ref={menuRef} data-testid="model-menu">
-              {(['anthropic', 'openai', 'google', 'groq', 'openrouter', 'ollama', 'custom'] as AiProviderKind[]).map((provider) => {
-                const items = menuModels.filter((m) => m.provider === provider)
-                if (!items.length) return null
-                const configured = settings?.configuredProviders.includes(provider)
-                return (
-                  <div className="model-group" key={provider}>
-                    <div className="model-group-title">
-                      {AI_PRESETS[provider].label}
-                      {!configured ? <span className="model-group-note">not set up</span> : null}
-                    </div>
-                    {items.map((m) => {
-                      const current = settings?.provider === m.provider && settings?.model === m.id
-                      return (
-                        <button key={`${m.provider}:${m.id}`} className={`model-item ${current ? 'current' : ''} ${configured ? '' : 'unavailable'}`} role="menuitem" onClick={() => void chooseModel(m)} data-testid={`model-${m.id}`}>
-                          <span className="model-item-label">{m.label}</span>
-                          {m.label !== m.id ? <span className="model-item-id">{m.id}</span> : null}
-                          {current ? <Icon name="check" size={12} /> : null}
-                        </button>
-                      )
-                    })}
+              {menuGroups.map((g) => (
+                <div className="model-group" key={g.key}>
+                  <div className="model-group-title">
+                    {g.title}
+                    {g.note ? <span className="model-group-note">{g.note}</span> : null}
                   </div>
-                )
-              })}
+                  {g.items.map((m) => {
+                    const current = Boolean(m.connectionId) && m.connectionId === settings?.activeConnectionId && settings?.activeModel === m.id
+                    return (
+                      <button key={`${g.key}:${m.id}`} className={`model-item ${current ? 'current' : ''} ${g.note ? 'unavailable' : ''}`} role="menuitem" onClick={() => void chooseModel(m)} data-testid={`model-${m.id}`}>
+                        <span className="model-item-label">{m.label}</span>
+                        {m.label !== m.id ? <span className="model-item-id">{m.id}</span> : null}
+                        {current ? <Icon name="check" size={12} /> : null}
+                      </button>
+                    )
+                  })}
+                </div>
+              ))}
               <button
                 className="model-item manage"
                 role="menuitem"
