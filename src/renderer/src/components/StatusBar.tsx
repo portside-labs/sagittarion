@@ -1,10 +1,10 @@
-import { useStore } from '@/store'
+import { useSession } from '@/session-store'
 import { KIND_LABELS } from '@shared/types'
 
 export function StatusBar() {
-  const session = useStore((s) => s.session)
-  const inTransaction = useStore((s) => s.inTransaction)
-  const status = useStore((s) => s.status)
+  const session = useSession((s) => s.session)
+  const inTransaction = useSession((s) => s.inTransaction)
+  const status = useSession((s) => s.status)
   if (!session) return null
   const db = session.db
   return (

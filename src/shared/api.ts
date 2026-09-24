@@ -5,6 +5,7 @@ import type {
   ConnectionConfig,
   DatabaseInfo,
   ExportRequest,
+  GroupStyle,
   ListObjectsRequest,
   ObjectDefinition,
   ObjectPage,
@@ -18,7 +19,8 @@ import type {
   SessionInfo,
   SshProfile,
   TableDetails,
-  TableRef
+  TableRef,
+  WorkspaceState
 } from './types'
 import type { AiProgressEvent, AiResult, AiSettings, AiSettingsUpdate, AiTurn } from './ai'
 
@@ -53,6 +55,10 @@ export interface Api {
     setGroup(ids: string[], group: string | null): Promise<void>
     /** A copy of a saved connection, secrets included, under a new name. */
     duplicate(id: string): Promise<ConnectionConfig>
+    /** Looks of the groups, keyed by group name. */
+    groupStyles(): Promise<Record<string, GroupStyle>>
+    /** Colours a group in the list; null clears it. */
+    setGroupColor(name: string, color: string | null): Promise<void>
   }
   /** Saved SSH hosts, reusable by any connection. */
   sshProfiles: {
@@ -94,6 +100,13 @@ export interface Api {
     pickSqliteFile(current?: string): Promise<string | null>
   }
   exportData(req: ExportRequest): Promise<{ saved: boolean; path?: string }>
+  /** The open connections and their tabs, kept between launches. */
+  workspace: {
+    load(): Promise<WorkspaceState | null>
+    save(state: WorkspaceState): Promise<void>
+    /** Blocks until written: for the moment the window closes, when nothing asynchronous is safe. */
+    flush(state: WorkspaceState): void
+  }
   settings: {
     get(): Promise<AiSettings>
     update(u: AiSettingsUpdate): Promise<AiSettings>

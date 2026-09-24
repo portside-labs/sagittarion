@@ -225,13 +225,17 @@ function SshSection({
 
 export function ConnectScreen() {
   const connections = useStore((s) => s.connections)
+  const groupStyles = useStore((s) => s.groupStyles)
   const sshProfiles = useStore((s) => s.sshProfiles)
   const sshProfilesLoaded = useStore((s) => s.sshProfilesLoaded)
   const loadSshProfiles = useStore((s) => s.loadSshProfiles)
   const appInfo = useStore((s) => s.appInfo)
   const toast = useStore((s) => s.toast)
-  const setSession = useStore((s) => s.setSession)
-  const refreshSchema = useStore((s) => s.refreshSchema)
+  const openTabs = useStore((s) => s.tabs)
+  const openSession = useStore((s) => s.openSession)
+  const activateTab = useStore((s) => s.activateTab)
+  const connectSelect = useStore((s) => s.connectSelect)
+  const setConnectSelect = useStore((s) => s.setConnectSelect)
   const loadConnections = useStore((s) => s.loadConnections)
   const confirm = useStore((s) => s.confirm)
   const setSettingsOpen = useStore((s) => s.setSettingsOpen)
@@ -257,10 +261,20 @@ export function ConnectScreen() {
   const renameInFlight = useRef(false)
   const groups = useMemo(() => groupConnections(connections), [connections])
   const names = useMemo(() => groupNames(connections), [connections])
+  /** Saved connections with a session open right now. */
+  const openIds = useMemo(() => new Set(openTabs.map((t) => t.connectionId)), [openTabs])
 
   // Open the most recent connection once both it and the profile list are known.
   useEffect(() => {
     if (initialised || !sshProfilesLoaded) return
+    // Asked to open on a particular connection, e.g. to fix one whose tab could not connect.
+    const wanted = connectSelect ? connections.find((c) => c.id === connectSelect) : undefined
+    if (wanted) {
+      select(wanted)
+      setConnectSelect(null)
+      setInitialised(true)
+      return
+    }
     if (connections.length > 0) {
       select(connections[0])
       setInitialised(true)
@@ -413,11 +427,12 @@ export function ConnectScreen() {
   async function connect() {
     const v = validate()
     if (v) return setError(v)
+    // A saved connection that already has a tab just comes to the front (connecting first if it never did).
+    if (selectedId && !dirty && openTabs.some((t) => t.connectionId === selectedId)) return activateTab(selectedId)
     await withProgress('connect', async (requestId) => {
       const cfg = await saveOnly()
       const info = await window.api.session.open(cfg, { openDatabase: true, requestId })
-      setSession(info)
-      void refreshSchema()
+      openSession(info)
     })
   }
 
@@ -460,6 +475,13 @@ export function ConnectScreen() {
   }
 
   const connMenuItems = (c: ConnectionConfig): MenuItem[] => [
+    {
+      label: 'Edit',
+      onClick: () => {
+        select(c)
+        requestAnimationFrame(() => nameInputRef.current?.focus())
+      }
+    },
     { label: 'Duplicate', onClick: () => void duplicate(c) },
     { separator: true },
     { label: 'Delete…', danger: true, onClick: () => void remove(c) }
@@ -500,6 +522,12 @@ export function ConnectScreen() {
     try {
       const members = groups.find((g) => g.name === from)?.connections ?? []
       await moveToGroup(members, name)
+      const color = groupStyles[from]?.color
+      if (color) {
+        await window.api.connections.setGroupColor(name, color)
+        await window.api.connections.setGroupColor(from, null)
+        await loadConnections()
+      }
       setCollapsedGroups((prev) => {
         if (!prev.has(from)) return prev
         const next = new Set(prev)
@@ -521,12 +549,56 @@ export function ConnectScreen() {
     if (!ok) return
     try {
       await moveToGroup(members, null)
+      if (groupStyles[name]) await setGroupColor(name, null)
     } catch (e) {
       toast('error', 'Could not remove the group', errorMessage(e))
     }
   }
 
+  async function setGroupColor(name: string, color: string | null) {
+    try {
+      await window.api.connections.setGroupColor(name, color)
+      await loadConnections()
+    } catch (e) {
+      toast('error', 'Could not colour the group', errorMessage(e))
+    }
+  }
+
   const groupMenuItems = (name: string): MenuItem[] => [
+    {
+      custom: (close) => {
+        const current = groupStyles[name]?.color
+        return (
+          <div className="menu-color-row">
+            <span className="menu-color-label">Colour</span>
+            <div className="swatches" data-testid="group-color-swatches">
+              <button
+                type="button"
+                className={`swatch none ${!current ? 'active' : ''}`}
+                title="No colour"
+                onClick={() => {
+                  close()
+                  void setGroupColor(name, null)
+                }}
+              />
+              {COLORS.map((c) => (
+                <button
+                  key={c}
+                  type="button"
+                  className={`swatch ${current === c ? 'active' : ''}`}
+                  style={{ background: c }}
+                  onClick={() => {
+                    close()
+                    void setGroupColor(name, c)
+                  }}
+                />
+              ))}
+            </div>
+          </div>
+        )
+      }
+    },
+    { separator: true },
     { label: 'Rename group…', onClick: () => setRenamingGroup({ from: name, value: name }) },
     {
       label: 'New connection in this group',
@@ -585,10 +657,6 @@ export function ConnectScreen() {
               <Icon name="plus" /> New
             </button>
           </div>
-          <div className="conn-section-header tree-section-header">
-            <span>Connections</span>
-            {connections.length ? <span className="count">{connections.length}</span> : null}
-          </div>
           <div className="conn-items">
             {connections.length === 0 ? (
               <div className="conn-empty">
@@ -601,7 +669,12 @@ export function ConnectScreen() {
                 const collapsed = g.name !== null && collapsedGroups.has(g.name)
                 const renaming = g.name !== null && renamingGroup?.from === g.name ? renamingGroup : null
                 return (
-                  <div key={g.name ?? '\u0000'} className={`conn-group ${g.name !== null ? 'named' : ''}`} data-group={g.name ?? undefined}>
+                  <div
+                    key={g.name ?? '\u0000'}
+                    className={`conn-group ${g.name !== null ? 'named' : ''} ${g.name !== null && groupStyles[g.name]?.color ? 'tinted' : ''}`}
+                    style={g.name !== null && groupStyles[g.name]?.color ? ({ '--group-color': groupStyles[g.name].color } as React.CSSProperties) : undefined}
+                    data-group={g.name ?? undefined}
+                  >
                     {g.name === null ? null : renaming ? (
                       <div className="conn-group-header renaming">
                         <Icon name="folder" size={13} />
@@ -631,7 +704,6 @@ export function ConnectScreen() {
                       >
                         <Icon name={collapsed ? 'chevron-right' : 'chevron-down'} size={12} />
                         <span className="conn-group-name">{g.name}</span>
-                        <span className="count">{g.connections.length}</span>
                         <button
                           className="btn ghost icon small conn-group-menu"
                           title="Group options"
@@ -659,7 +731,7 @@ export function ConnectScreen() {
                     setConnMenu({ x: e.clientX, y: e.clientY, conn: c })
                   }}
                 >
-                  <span className="conn-dot" style={c.color ? { background: c.color } : undefined} />
+                  <span className={`conn-dot ${openIds.has(c.id) ? 'connected' : ''}`} style={c.color ? { background: c.color } : undefined} title={openIds.has(c.id) ? 'Connected' : undefined} />
                   <div className="conn-text">
                     <div className="conn-name">{c.name}</div>
                     <div className="conn-sub">{describeTarget(resolveSshProfile(c, sshProfiles))}</div>
@@ -668,12 +740,6 @@ export function ConnectScreen() {
                   <span className={`conn-kind ${c.kind}`}>
                     <DbLogo kind={c.kind} size={20} />
                   </span>
-                  <button className="btn ghost icon small conn-duplicate" title="Duplicate" onClick={(e) => void duplicate(c, e)} data-testid="conn-duplicate">
-                    <Icon name="copy" />
-                  </button>
-                  <button className="btn ghost icon small conn-delete" title="Delete" onClick={(e) => void remove(c, e)} data-testid="conn-delete">
-                    <Icon name="trash" />
-                  </button>
                 </div>
                         ))}
                   </div>

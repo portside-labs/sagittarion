@@ -1,18 +1,49 @@
 import { create } from 'zustand'
-import type { AppInfo, Catalog, ConnectionConfig, ObjectKind, ObjectRef, SearchResult, SessionInfo, SshProfile, TableRef } from '@shared/types'
+import type { AppInfo, ConnectionConfig, DatabaseKind, GroupStyle, SessionInfo, SshProfile, WorkspaceConnection, WorkspaceState } from '@shared/types'
 import type { AiSettings, AiProviderKind } from '@shared/ai'
-import { sameTable, tableKey, tableLabel } from '@shared/connections'
+import { describeTarget, resolveSshProfile } from '@shared/connections'
 import { errorMessage } from './lib/util'
-import { appendNames, emptyNames, groupKey, type GroupState, type NameIndex, type TableState } from './lib/tree'
 import { defaultLayout, isValidLayout, type LayoutNode } from './lib/layout'
+import { createSessionStore, snapshotSession, type SessionStore } from './session-store'
 
-export type Tab =
-  | { id: string; kind: 'table'; schema?: string; table: string; title: string }
-  | { id: string; kind: 'query'; title: string; initialSql: string }
+export type { Tab, SearchState } from './session-store'
 
+export type SettingsTab = 'appearance' | 'ai'
+
+/** What the settings dialog should start on when opened for a reason. */
 export interface SettingsIntent {
-  provider: AiProviderKind
+  tab?: SettingsTab
+  /** A model whose provider needs setting up: the AI tab opens on that provider with the model filled in. */
+  provider?: AiProviderKind
   model?: string
+}
+
+export type ConnectionTabsMode = 'horizontal' | 'vertical'
+
+/** Preferences about the look of the app, kept on this machine. */
+export interface UiPrefs {
+  /** Where open connections are listed: a strip across the top or a rail down the left. */
+  connectionTabs: ConnectionTabsMode
+}
+
+export type OpenTabStatus = 'pending' | 'connecting' | 'live' | 'error'
+
+/** One connection tab. It may still be waiting to connect, which is how tabs come back after a launch. */
+export interface OpenTab {
+  /** The saved connection behind the tab; one tab per saved connection. */
+  connectionId: string
+  name: string
+  kind: DatabaseKind
+  color?: string
+  target: string
+  status: OpenTabStatus
+  session: SessionInfo | null
+  error?: string
+  /** The latest progress line while connecting. */
+  progress?: string
+  progressId?: string
+  /** Tabs to bring back once the connection is made. */
+  restore?: WorkspaceConnection
 }
 
 export interface Toast {
@@ -32,46 +63,27 @@ export interface ConfirmRequest {
   resolve: (ok: boolean) => void
 }
 
-export interface SearchState {
-  query: string
-  result: SearchResult | null
-  loading: boolean
-}
-
-/** How many table detail records the sidebar keeps around. */
-const TABLE_CACHE_LIMIT = 300
-const NAMES_PAGE = 4000
-
 interface State {
   appInfo: AppInfo | null
   connections: ConnectionConfig[]
+  /** How each connection group looks, keyed by name. */
+  groupStyles: Record<string, GroupStyle>
   /** Saved SSH hosts, reusable by any connection. */
   sshProfiles: SshProfile[]
   /** True once the profile list has been read, so a connection's profile can be checked against it. */
   sshProfilesLoaded: boolean
-  session: SessionInfo | null
-  /** Schema names and counts; the rest of the tree loads on demand. */
-  catalog: Catalog | null
-  catalogError: string | null
-  catalogLoading: boolean
-  /** Every table and view name, streamed in pages right after the catalog. */
-  names: NameIndex
-  /** Lazily loaded index, trigger and function lists, keyed by groupKey. */
-  groups: Record<string, GroupState>
-  /** Column details for expanded or opened tables, keyed by tableKey. */
-  tables: Record<string, TableState>
-  search: SearchState
-  tabs: Tab[]
-  activeTabId: string | null
-  dirtyTabs: Record<string, boolean>
+  /** Connection tabs in order. A live one has a session store of its own; see getSessionStore. */
+  tabs: OpenTab[]
+  activeConnectionId: string | null
+  /** Show the connect screen although connections are open: the "+" tab. */
+  showConnect: boolean
+  /** A saved connection the connect screen should open on next, e.g. after "Edit connection" on a failed tab. */
+  connectSelect: string | null
+  ui: UiPrefs
   toasts: Toast[]
   confirmRequest: ConfirmRequest | null
-  inTransaction: boolean
-  status: string
-  queryCounter: number
   settings: AiSettings | null
   settingsOpen: boolean
-  /** What the settings dialog should start on when opened from a model choice. */
   settingsIntent: SettingsIntent | null
   /** Arrangement of the editor, chat and results panes in query tabs. */
   queryLayout: LayoutNode
@@ -79,6 +91,7 @@ interface State {
 
   setQueryLayout(layout: LayoutNode): void
   setChatOpen(open: boolean): void
+  setUiPref(patch: Partial<UiPrefs>): void
   init(): Promise<void>
   loadSettings(): Promise<void>
   setSettingsOpen(open: boolean, intent?: SettingsIntent): void
@@ -86,31 +99,30 @@ interface State {
   resolveConfirm(ok: boolean): void
   loadConnections(): Promise<void>
   loadSshProfiles(): Promise<void>
-  setSession(s: SessionInfo | null): void
-  /** Reload the catalog and restart the name stream; drops every cached list. */
-  refreshSchema(): Promise<void>
-  loadNames(sessionId: string, epoch: number): Promise<void>
-  loadGroup(schema: string | undefined, kind: ObjectKind, more?: boolean): Promise<void>
-  loadTable(ref: TableRef): Promise<void>
-  runSearch(query: string): Promise<void>
-  openDefinition(ref: ObjectRef): Promise<void>
-  openTable(ref: TableRef): void
-  newQueryTab(sql?: string, title?: string): void
-  closeTab(id: string): Promise<void>
-  setActiveTab(id: string): void
-  setTabDirty(id: string, dirty: boolean): void
-  disconnect(): Promise<void>
+  /** A freshly opened connection becomes a live tab; `restore` brings back tabs from a previous launch. */
+  openSession(info: SessionInfo, restore?: WorkspaceConnection, activate?: boolean): void
+  /** Brings a tab to the front, connecting it first when it has not been connected yet. */
+  activateTab(connectionId: string): void
+  connectTab(connectionId: string): Promise<void>
+  /** Disconnects a live tab, or just drops one that never connected. */
+  closeTab(connectionId: string): Promise<void>
+  /** Called once a live session is closed; the tab goes away. */
+  removeSession(sessionId: string): Promise<void>
+  removeTab(connectionId: string): Promise<void>
+  /** Bring up the connect screen beside the open connections, on a given saved connection if asked. */
+  showConnectScreen(selectConnectionId?: string): void
+  setConnectSelect(id: string | null): void
+  /** Tabs from the previous launch: the one in front reconnects now, the others when opened. */
+  restoreWorkspace(state: WorkspaceState): void
   toast(kind: Toast['kind'], message: string, detail?: string): void
   dismissToast(id: number): void
-  setInTransaction(v: boolean): void
-  setStatus(text: string): void
 }
 
 let initialized = false
 let toastSeq = 0
-let namesEpoch = 0
 
 const LAYOUT_KEY = 'queryLayout.v2'
+const UI_KEY = 'uiPrefs.v1'
 
 function loadLayout(): LayoutNode {
   try {
@@ -122,313 +134,343 @@ function loadLayout(): LayoutNode {
   return defaultLayout()
 }
 
-const emptySearch: SearchState = { query: '', result: null, loading: false }
-
-const emptySession = {
-  session: null,
-  catalog: null,
-  catalogError: null,
-  catalogLoading: false,
-  names: emptyNames(),
-  groups: {} as Record<string, GroupState>,
-  tables: {} as Record<string, TableState>,
-  search: emptySearch,
-  tabs: [] as Tab[],
-  activeTabId: null,
-  dirtyTabs: {} as Record<string, boolean>,
-  inTransaction: false,
-  status: '',
-  queryCounter: 0
+function loadUiPrefs(): UiPrefs {
+  try {
+    const parsed = JSON.parse(localStorage.getItem(UI_KEY) ?? 'null')
+    return { connectionTabs: parsed?.connectionTabs === 'vertical' ? 'vertical' : 'horizontal' }
+  } catch {
+    return { connectionTabs: 'horizontal' }
+  }
 }
 
-export const useStore = create<State>()((set, get) => ({
-  appInfo: null,
-  connections: [],
-  sshProfiles: [],
-  sshProfilesLoaded: false,
-  ...emptySession,
-  toasts: [],
-  confirmRequest: null,
-  settings: null,
-  settingsOpen: false,
-  settingsIntent: null,
-  queryLayout: loadLayout(),
-  chatOpen: localStorage.getItem('askPanelOpen') !== 'false',
+/** Session stores live outside React state: they are identified by session id and carry functions. */
+const sessionStores = new Map<string, SessionStore>()
 
-  setQueryLayout(layout) {
-    set({ queryLayout: layout })
-    try {
-      localStorage.setItem(LAYOUT_KEY, JSON.stringify(layout))
-    } catch {
-      /* storage is optional */
-    }
-  },
+export function getSessionStore(sessionId: string): SessionStore | undefined {
+  return sessionStores.get(sessionId)
+}
 
-  setChatOpen(open) {
-    set({ chatOpen: open })
-    try {
-      localStorage.setItem('askPanelOpen', String(open))
-    } catch {
-      /* storage is optional */
-    }
-  },
+function tabFromConfig(cfg: ConnectionConfig, profiles: SshProfile[]): Pick<OpenTab, 'connectionId' | 'name' | 'kind' | 'color' | 'target'> {
+  return { connectionId: cfg.id, name: cfg.name, kind: cfg.kind, color: cfg.color, target: describeTarget(resolveSshProfile(cfg, profiles)) }
+}
 
-  async loadSettings() {
-    try {
-      set({ settings: await window.api.settings.get() })
-    } catch (e) {
-      get().toast('error', 'Could not load settings', errorMessage(e))
-    }
-  },
+export const useStore = create<State>()((set, get) => {
+  const patchTab = (connectionId: string, patch: Partial<OpenTab>) => set({ tabs: get().tabs.map((t) => (t.connectionId === connectionId ? { ...t, ...patch } : t)) })
 
-  setSettingsOpen(open, intent) {
-    set({ settingsOpen: open, settingsIntent: open ? (intent ?? null) : null })
-  },
+  return {
+    appInfo: null,
+    connections: [],
+    groupStyles: {},
+    sshProfiles: [],
+    sshProfilesLoaded: false,
+    tabs: [],
+    activeConnectionId: null,
+    showConnect: false,
+    connectSelect: null,
+    ui: loadUiPrefs(),
+    toasts: [],
+    confirmRequest: null,
+    settings: null,
+    settingsOpen: false,
+    settingsIntent: null,
+    queryLayout: loadLayout(),
+    chatOpen: localStorage.getItem('askPanelOpen') !== 'false',
 
-  confirm(message, detail, confirmLabel = 'OK', destructive = false) {
-    get().confirmRequest?.resolve(false)
-    return new Promise<boolean>((resolve) => {
-      set({ confirmRequest: { message, detail, confirmLabel, destructive, resolve } })
-    })
-  },
-
-  resolveConfirm(ok) {
-    const req = get().confirmRequest
-    set({ confirmRequest: null })
-    req?.resolve(ok)
-  },
-
-  async init() {
-    if (initialized) return
-    initialized = true
-    try {
-      const info = await window.api.app.info()
-      set({ appInfo: info })
-    } catch (e) {
-      get().toast('error', 'Could not initialise', errorMessage(e))
-    }
-    // Profiles and connections arrive together: a connection's profile is checked against the list on select.
-    await Promise.all([get().loadSshProfiles(), get().loadConnections()])
-    await get().loadSettings()
-    window.api.session.onClosed((e) => {
-      const s = get().session
-      if (s && s.sessionId === e.sessionId) {
-        get().toast('error', 'Connection closed', e.reason)
-        void get().loadConnections().then(() => set({ ...emptySession }))
+    setQueryLayout(layout) {
+      set({ queryLayout: layout })
+      try {
+        localStorage.setItem(LAYOUT_KEY, JSON.stringify(layout))
+      } catch {
+        /* storage is optional */
       }
-    })
-  },
+    },
 
-  async loadConnections() {
-    try {
-      set({ connections: await window.api.connections.list() })
-    } catch (e) {
-      get().toast('error', 'Could not load saved connections', errorMessage(e))
+    setChatOpen(open) {
+      set({ chatOpen: open })
+      try {
+        localStorage.setItem('askPanelOpen', String(open))
+      } catch {
+        /* storage is optional */
+      }
+    },
+
+    setUiPref(patch) {
+      const ui = { ...get().ui, ...patch }
+      set({ ui })
+      try {
+        localStorage.setItem(UI_KEY, JSON.stringify(ui))
+      } catch {
+        /* storage is optional */
+      }
+    },
+
+    async loadSettings() {
+      try {
+        set({ settings: await window.api.settings.get() })
+      } catch (e) {
+        get().toast('error', 'Could not load settings', errorMessage(e))
+      }
+    },
+
+    setSettingsOpen(open, intent) {
+      set({ settingsOpen: open, settingsIntent: open ? (intent ?? null) : null })
+    },
+
+    confirm(message, detail, confirmLabel = 'OK', destructive = false) {
+      get().confirmRequest?.resolve(false)
+      return new Promise<boolean>((resolve) => {
+        set({ confirmRequest: { message, detail, confirmLabel, destructive, resolve } })
+      })
+    },
+
+    resolveConfirm(ok) {
+      const req = get().confirmRequest
+      set({ confirmRequest: null })
+      req?.resolve(ok)
+    },
+
+    async init() {
+      if (initialized) return
+      initialized = true
+      try {
+        const info = await window.api.app.info()
+        set({ appInfo: info })
+      } catch (e) {
+        get().toast('error', 'Could not initialise', errorMessage(e))
+      }
+      // Profiles and connections arrive together: a connection's profile is checked against the list on select.
+      await Promise.all([get().loadSshProfiles(), get().loadConnections()])
+      await get().loadSettings()
+      window.api.session.onClosed((e) => {
+        const gone = get().tabs.find((t) => t.session?.sessionId === e.sessionId)
+        if (!gone) return
+        get().toast('error', `${gone.name} was disconnected`, e.reason)
+        void get().removeSession(e.sessionId)
+      })
+      window.api.session.onProgress((e) => {
+        if (!e.requestId) return
+        const tab = get().tabs.find((t) => t.progressId === e.requestId)
+        if (tab) patchTab(tab.connectionId, { progress: e.message })
+      })
+      try {
+        const saved = await window.api.workspace.load()
+        if (saved) get().restoreWorkspace(saved)
+      } catch {
+        /* start with nothing open */
+      }
+      startPersistence()
+    },
+
+    async loadConnections() {
+      try {
+        const [connections, groupStyles] = await Promise.all([window.api.connections.list(), window.api.connections.groupStyles()])
+        set({ connections, groupStyles })
+      } catch (e) {
+        get().toast('error', 'Could not load saved connections', errorMessage(e))
+      }
+    },
+
+    async loadSshProfiles() {
+      try {
+        set({ sshProfiles: await window.api.sshProfiles.list(), sshProfilesLoaded: true })
+      } catch (e) {
+        get().toast('error', 'Could not load SSH profiles', errorMessage(e))
+      }
+    },
+
+    openSession(info, restore, activate = true) {
+      const store = createSessionStore(
+        info,
+        {
+          toast: (kind, message, detail) => get().toast(kind, message, detail),
+          confirm: (message, detail, label, destructive) => get().confirm(message, detail, label, destructive),
+          remove: (sessionId) => get().removeSession(sessionId)
+        },
+        restore
+      )
+      sessionStores.set(info.sessionId, store)
+      watchSessionStore(store)
+      const live: OpenTab = { connectionId: info.connectionId, name: info.name, kind: info.kind, color: info.color, target: info.target, status: 'live', session: info }
+      const tabs = get().tabs
+      const idx = tabs.findIndex((t) => t.connectionId === info.connectionId)
+      set({
+        tabs: idx >= 0 ? tabs.map((t, i) => (i === idx ? live : t)) : [...tabs, live],
+        ...(activate ? { activeConnectionId: info.connectionId, showConnect: false } : {})
+      })
+      void store.getState().refreshSchema()
+    },
+
+    activateTab(connectionId) {
+      const tab = get().tabs.find((t) => t.connectionId === connectionId)
+      if (!tab) return
+      set({ activeConnectionId: connectionId, showConnect: false })
+      if (tab.status === 'pending' || tab.status === 'error') void get().connectTab(connectionId)
+    },
+
+    async connectTab(connectionId) {
+      const tab = get().tabs.find((t) => t.connectionId === connectionId)
+      if (!tab || tab.status === 'live' || tab.status === 'connecting') return
+      let cfg = get().connections.find((c) => c.id === connectionId)
+      if (!cfg) {
+        await get().loadConnections()
+        cfg = get().connections.find((c) => c.id === connectionId)
+      }
+      if (!cfg) {
+        patchTab(connectionId, { status: 'error', error: 'This saved connection no longer exists.' })
+        return
+      }
+      const requestId = crypto.randomUUID()
+      patchTab(connectionId, { status: 'connecting', error: undefined, progress: '', progressId: requestId })
+      try {
+        const info = await window.api.session.open(cfg, { openDatabase: true, requestId })
+        if (!get().tabs.some((t) => t.connectionId === connectionId)) {
+          // Closed while it was connecting.
+          void window.api.session.close(info.sessionId)
+          return
+        }
+        get().openSession(info, tab.restore, false)
+      } catch (e) {
+        patchTab(connectionId, { status: 'error', error: errorMessage(e), progress: undefined })
+      }
+    },
+
+    async closeTab(connectionId) {
+      const tab = get().tabs.find((t) => t.connectionId === connectionId)
+      if (!tab) return
+      if (tab.status === 'live' && tab.session) {
+        const store = sessionStores.get(tab.session.sessionId)
+        if (store) {
+          await store.getState().disconnect()
+          return
+        }
+      }
+      await get().removeTab(connectionId)
+    },
+
+    async removeSession(sessionId) {
+      sessionStores.get(sessionId)?.getState().markClosed()
+      sessionStores.delete(sessionId)
+      const tab = get().tabs.find((t) => t.session?.sessionId === sessionId)
+      if (tab) await get().removeTab(tab.connectionId)
+    },
+
+    async removeTab(connectionId) {
+      const { tabs, activeConnectionId } = get()
+      const idx = tabs.findIndex((t) => t.connectionId === connectionId)
+      if (idx < 0) return
+      const next = tabs.filter((t) => t.connectionId !== connectionId)
+      let active = activeConnectionId
+      if (active === connectionId) active = next[Math.min(idx, next.length - 1)]?.connectionId ?? null
+      // With nothing left open, the connect screen appears; refresh the list first so it opens on the most recent connection.
+      if (!next.length) await get().loadConnections()
+      set({ tabs: next, activeConnectionId: active, showConnect: next.length ? get().showConnect : false })
+      // A neighbour that never connected does so now that it is in front.
+      if (active && active !== activeConnectionId && !get().showConnect) {
+        const neighbour = next.find((t) => t.connectionId === active)
+        if (neighbour && (neighbour.status === 'pending' || neighbour.status === 'error')) void get().connectTab(active)
+      }
+    },
+
+    showConnectScreen(selectConnectionId) {
+      set({ showConnect: true, connectSelect: selectConnectionId ?? null })
+    },
+
+    setConnectSelect(id) {
+      set({ connectSelect: id })
+    },
+
+    restoreWorkspace(state) {
+      const { connections, sshProfiles } = get()
+      const tabs: OpenTab[] = []
+      for (const saved of state.connections) {
+        const cfg = connections.find((c) => c.id === saved.connectionId)
+        if (!cfg || tabs.some((t) => t.connectionId === saved.connectionId)) continue
+        tabs.push({ ...tabFromConfig(cfg, sshProfiles), status: 'pending', session: null, restore: saved })
+      }
+      if (!tabs.length) return
+      const active = tabs.some((t) => t.connectionId === state.activeConnectionId) ? state.activeConnectionId : tabs[0].connectionId
+      set({ tabs, activeConnectionId: active, showConnect: Boolean(state.showConnect) })
+      if (!state.showConnect && active) void get().connectTab(active)
+    },
+
+    toast(kind, message, detail) {
+      const id = ++toastSeq
+      set({ toasts: [...get().toasts, { id, kind, message, detail }] })
+      setTimeout(() => get().dismissToast(id), kind === 'error' ? 12_000 : 4_500)
+    },
+
+    dismissToast(id) {
+      const current = get().toasts.find((t) => t.id === id)
+      if (!current || current.leaving) return
+      set({ toasts: get().toasts.map((t) => (t.id === id ? { ...t, leaving: true } : t)) })
+      setTimeout(() => set({ toasts: get().toasts.filter((t) => t.id !== id) }), 160)
     }
-  },
-
-  async loadSshProfiles() {
-    try {
-      set({ sshProfiles: await window.api.sshProfiles.list(), sshProfilesLoaded: true })
-    } catch (e) {
-      get().toast('error', 'Could not load SSH profiles', errorMessage(e))
-    }
-  },
-
-  setSession(session) {
-    set({ ...emptySession, session })
-  },
-
-  async refreshSchema() {
-    const session = get().session
-    if (!session) return
-    const epoch = ++namesEpoch
-    set({ catalogLoading: true, catalogError: null, groups: {}, tables: {}, search: emptySearch })
-    try {
-      const catalog = await window.api.db.catalog(session.sessionId)
-      if (get().session?.sessionId !== session.sessionId || epoch !== namesEpoch) return
-      set({ catalog, catalogLoading: false, names: emptyNames(epoch, catalog.totalTables) })
-      void get().loadNames(session.sessionId, epoch)
-    } catch (e) {
-      set({ catalogError: errorMessage(e), catalogLoading: false })
-    }
-  },
-
-  async loadNames(sessionId, epoch) {
-    let cursor: string | null = null
-    try {
-      do {
-        const page = await window.api.db.listObjects(sessionId, { kinds: ['table', 'view'], cursor, limit: NAMES_PAGE })
-        const cur = get()
-        if (cur.session?.sessionId !== sessionId || cur.names.epoch !== epoch) return
-        cursor = page.cursor
-        set({ names: appendNames(cur.names, page.items, cursor === null) })
-      } while (cursor)
-    } catch (e) {
-      const cur = get()
-      if (cur.session?.sessionId !== sessionId || cur.names.epoch !== epoch) return
-      cur.toast('error', 'Could not list tables', errorMessage(e))
-      set({ names: { ...cur.names, complete: true } })
-    }
-  },
-
-  async loadGroup(schema, kind, more = false) {
-    const session = get().session
-    if (!session) return
-    const key = groupKey(schema ?? '', kind)
-    const existing = get().groups[key]
-    if (existing?.loading) return
-    if (existing && !more) return
-    if (more && !existing?.cursor) return
-    set({ groups: { ...get().groups, [key]: { items: existing?.items ?? [], cursor: existing?.cursor ?? null, loading: true, error: null } } })
-    try {
-      const page = await window.api.db.listObjects(session.sessionId, { schema, kinds: [kind], cursor: more ? existing!.cursor : null, limit: 1000 })
-      if (get().session?.sessionId !== session.sessionId) return
-      const prev = get().groups[key]
-      if (!prev) return
-      set({ groups: { ...get().groups, [key]: { items: more ? [...prev.items, ...page.items] : page.items, cursor: page.cursor, loading: false, error: null } } })
-    } catch (e) {
-      if (get().session?.sessionId !== session.sessionId) return
-      set({ groups: { ...get().groups, [key]: { items: existing?.items ?? [], cursor: null, loading: false, error: errorMessage(e) } } })
-    }
-  },
-
-  async loadTable(ref) {
-    const session = get().session
-    if (!session) return
-    const key = tableKey(ref)
-    if (get().tables[key]) return
-    set({ tables: { ...get().tables, [key]: { status: 'loading' } } })
-    try {
-      const details = await window.api.db.tableDetails(session.sessionId, ref)
-      if (get().session?.sessionId !== session.sessionId) return
-      const next: Record<string, TableState> = { ...get().tables, [key]: { status: 'ready', details } }
-      const keys = Object.keys(next)
-      if (keys.length > TABLE_CACHE_LIMIT) for (const k of keys.slice(0, keys.length - TABLE_CACHE_LIMIT)) if (k !== key) delete next[k]
-      set({ tables: next })
-    } catch (e) {
-      if (get().session?.sessionId !== session.sessionId) return
-      set({ tables: { ...get().tables, [key]: { status: 'error', error: errorMessage(e) } } })
-    }
-  },
-
-  async runSearch(query) {
-    const session = get().session
-    const q = query.trim()
-    if (!session || q.length < 2) {
-      if (get().search.query !== q || get().search.result) set({ search: { query: q, result: null, loading: false } })
-      return
-    }
-    if (get().search.query === q && (get().search.result || get().search.loading)) return
-    set({ search: { query: q, result: get().search.result, loading: true } })
-    try {
-      const result = await window.api.db.searchObjects(session.sessionId, q, 200)
-      if (get().session?.sessionId !== session.sessionId || get().search.query !== q) return
-      set({ search: { query: q, result, loading: false } })
-    } catch (e) {
-      if (get().search.query !== q) return
-      set({ search: { query: q, result: null, loading: false } })
-      get().toast('error', 'Search failed', errorMessage(e))
-    }
-  },
-
-  async openDefinition(ref) {
-    const session = get().session
-    if (!session) return
-    try {
-      const def = await window.api.db.definition(session.sessionId, ref)
-      const sql = def.sql?.trim()
-      get().newQueryTab(sql ? (sql.endsWith(';') ? sql : `${sql};`) : `-- No definition available for ${ref.name}`, ref.name)
-    } catch (e) {
-      get().toast('error', `Could not load ${ref.name}`, errorMessage(e))
-    }
-  },
-
-  openTable(ref) {
-    const { tabs, catalog } = get()
-    const existing = tabs.find((t) => t.kind === 'table' && sameTable({ schema: t.schema, name: t.table }, ref))
-    if (existing) {
-      set({ activeTabId: existing.id })
-      return
-    }
-    const tab: Tab = {
-      id: crypto.randomUUID(),
-      kind: 'table',
-      schema: ref.schema,
-      table: ref.name,
-      title: tableLabel(ref, catalog?.defaultSchema)
-    }
-    set({ tabs: [...tabs, tab], activeTabId: tab.id })
-  },
-
-  newQueryTab(sql = '', title) {
-    const n = get().queryCounter + 1
-    const tab: Tab = { id: crypto.randomUUID(), kind: 'query', title: title ?? `Query ${n}`, initialSql: sql }
-    set({ tabs: [...get().tabs, tab], activeTabId: tab.id, queryCounter: n })
-  },
-
-  async closeTab(id) {
-    const { dirtyTabs } = get()
-    if (dirtyTabs[id]) {
-      const ok = await get().confirm('Discard staged changes?', 'This tab has edits that have not been applied to the database.', 'Discard', true)
-      if (!ok) return
-    }
-    const { tabs, activeTabId } = get()
-    const idx = tabs.findIndex((t) => t.id === id)
-    if (idx < 0) return
-    const next = tabs.filter((t) => t.id !== id)
-    let active = activeTabId
-    if (active === id) active = next[Math.min(idx, next.length - 1)]?.id ?? null
-    const rest = { ...get().dirtyTabs }
-    delete rest[id]
-    set({ tabs: next, activeTabId: active, dirtyTabs: rest })
-  },
-
-  setActiveTab(id) {
-    set({ activeTabId: id })
-  },
-
-  setTabDirty(id, dirty) {
-    const current = get().dirtyTabs
-    if (Boolean(current[id]) === dirty) return
-    set({ dirtyTabs: { ...current, [id]: dirty } })
-  },
-
-  async disconnect() {
-    const { session, dirtyTabs } = get()
-    if (!session) return
-    if (Object.values(dirtyTabs).some(Boolean)) {
-      const ok = await get().confirm('Disconnect and discard staged changes?', 'Some tabs have edits that have not been applied to the database.', 'Disconnect', true)
-      if (!ok) return
-    }
-    try {
-      await window.api.session.close(session.sessionId)
-    } catch {
-      /* already gone */
-    }
-    // Refresh the list first so the connect screen opens on the connection that was just used.
-    await get().loadConnections()
-    set({ ...emptySession })
-  },
-
-  toast(kind, message, detail) {
-    const id = ++toastSeq
-    set({ toasts: [...get().toasts, { id, kind, message, detail }] })
-    setTimeout(() => get().dismissToast(id), kind === 'error' ? 12_000 : 4_500)
-  },
-
-  dismissToast(id) {
-    const current = get().toasts.find((t) => t.id === id)
-    if (!current || current.leaving) return
-    set({ toasts: get().toasts.map((t) => (t.id === id ? { ...t, leaving: true } : t)) })
-    setTimeout(() => set({ toasts: get().toasts.filter((t) => t.id !== id) }), 160)
-  },
-
-  setInTransaction(v) {
-    if (get().inTransaction !== v) set({ inTransaction: v })
-  },
-
-  setStatus(text) {
-    set({ status: text })
   }
-}))
+})
+
+// ---------------------------------------------------------------------------
+// Keeping the workspace between launches
+// ---------------------------------------------------------------------------
+
+let persistenceOn = false
+let persistTimer: ReturnType<typeof setTimeout> | null = null
+let lastSaved = ''
+
+/** Everything worth bringing back next time: the tabs, and for live ones their query tabs as they stand. */
+export function snapshotWorkspace(): WorkspaceState {
+  const { tabs, activeConnectionId, showConnect } = useStore.getState()
+  return {
+    version: 1,
+    activeConnectionId,
+    showConnect,
+    connections: tabs.map((t) => {
+      const store = t.session ? sessionStores.get(t.session.sessionId) : undefined
+      return store ? snapshotSession(store.getState()) : (t.restore ?? { connectionId: t.connectionId, activeTabId: null, queryCounter: 0, tabs: [] })
+    })
+  }
+}
+
+function schedulePersist(): void {
+  if (!persistenceOn) return
+  if (persistTimer) clearTimeout(persistTimer)
+  persistTimer = setTimeout(() => {
+    persistTimer = null
+    void persistNow()
+  }, 400)
+}
+
+async function persistNow(): Promise<void> {
+  const state = snapshotWorkspace()
+  const json = JSON.stringify(state)
+  if (json === lastSaved) return
+  lastSaved = json
+  try {
+    await window.api.workspace.save(state)
+  } catch {
+    /* the next change tries again */
+  }
+}
+
+function watchSessionStore(store: SessionStore): void {
+  store.subscribe((next, prev) => {
+    if (next.tabs !== prev.tabs || next.activeTabId !== prev.activeTabId || next.querySnapshots !== prev.querySnapshots || next.queryCounter !== prev.queryCounter) schedulePersist()
+  })
+}
+
+function startPersistence(): void {
+  if (persistenceOn) return
+  persistenceOn = true
+  useStore.subscribe((next, prev) => {
+    if (next.tabs !== prev.tabs || next.activeConnectionId !== prev.activeConnectionId || next.showConnect !== prev.showConnect) schedulePersist()
+  })
+  // The window is closing: write whatever the debounce has not written yet, synchronously on the other side.
+  window.addEventListener('beforeunload', () => {
+    if (persistTimer) clearTimeout(persistTimer)
+    const state = snapshotWorkspace()
+    const json = JSON.stringify(state)
+    if (json !== lastSaved) {
+      lastSaved = json
+      window.api.workspace.flush(state)
+    }
+  })
+}

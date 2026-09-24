@@ -9,6 +9,7 @@ import { humanKeyType, KnownHostsStore } from './ssh/hostkeys'
 import { ConnectionStore, noopCodec, type SecretCodec } from './store/connections'
 import { SettingsStore } from './store/settings'
 import { SshProfileStore } from './store/ssh-profiles'
+import { WorkspaceStore } from './store/workspace'
 import { qi, qualify } from './db/pg-values'
 import { cellToPlainText } from '@shared/export'
 import { AI_PRESETS, type AiProgressEvent, type AiProgressStep, type AiSettings, type AiSettingsUpdate, type AiTurn } from '@shared/ai'
@@ -20,13 +21,14 @@ import { EmbeddingCache } from './ai/embeddings'
 import type { DatabaseDriver } from './db/driver'
 import { toCsv, toJson, toSqlInserts } from '@shared/export'
 import type { OpenOptions } from '@shared/api'
-import type { AppInfo, ConnectionConfig, ExportRequest, ListObjectsRequest, ObjectRef, PendingChange, RowsRequest, SessionInfo, SshConfig, SshProfile, TableRef } from '@shared/types'
+import type { AppInfo, ConnectionConfig, ExportRequest, ListObjectsRequest, ObjectRef, PendingChange, RowsRequest, SessionInfo, SshConfig, SshProfile, TableRef, WorkspaceState } from '@shared/types'
 
 const isMac = process.platform === 'darwin'
 let mainWindow: BrowserWindow | null = null
 let connectionStore: ConnectionStore
 let settingsStore: SettingsStore
 let sshProfileStore: SshProfileStore
+let workspaceStore: WorkspaceStore
 let knownHosts: KnownHostsStore
 let manager: ConnectionManager
 let embeddingCache: EmbeddingCache
@@ -279,6 +281,8 @@ function registerIpc(): void {
   ipcMain.handle('connections:remove', (_e, id: string) => connectionStore.remove(id))
   ipcMain.handle('connections:setGroup', (_e, ids: string[], group: string | null) => connectionStore.setGroup(ids, group))
   ipcMain.handle('connections:duplicate', (_e, id: string) => connectionStore.duplicate(id))
+  ipcMain.handle('connections:groupStyles', () => connectionStore.groupStyles())
+  ipcMain.handle('connections:setGroupColor', (_e, name: string, color: string | null) => connectionStore.setGroupColor(name, color))
   ipcMain.handle('sshProfiles:list', () => sshProfileStore.list())
   ipcMain.handle('sshProfiles:save', (_e, p: SshProfile) => sshProfileStore.save(p))
   ipcMain.handle('sshProfiles:remove', (_e, id: string) => sshProfileStore.remove(id))
@@ -335,6 +339,16 @@ function registerIpc(): void {
     return r.canceled || !r.filePaths[0] ? null : r.filePaths[0]
   })
 
+  ipcMain.handle('workspace:load', () => workspaceStore.load())
+  ipcMain.handle('workspace:save', (_e, state: WorkspaceState) => workspaceStore.save(state))
+  ipcMain.on('workspace:flush', (e, state: WorkspaceState) => {
+    try {
+      workspaceStore.saveSync(state)
+    } catch {
+      /* best effort while closing */
+    }
+    e.returnValue = true
+  })
   ipcMain.handle('settings:get', () => settingsStore.get())
   ipcMain.handle('settings:update', (_e, u: AiSettingsUpdate) => settingsStore.update(u))
   ipcMain.handle('settings:testProvider', async (_e, overrides: AiSettingsUpdate) => {
@@ -461,6 +475,7 @@ if (!app.requestSingleInstanceLock()) {
     connectionStore = new ConnectionStore(path.join(userData, 'connections.json'), codec)
     settingsStore = new SettingsStore(path.join(userData, 'settings.json'), codec)
     sshProfileStore = new SshProfileStore(path.join(userData, 'ssh-profiles.json'), codec)
+    workspaceStore = new WorkspaceStore(path.join(userData, 'workspace.json'))
     embeddingCache = new EmbeddingCache(path.join(userData, 'ai-cache', 'embeddings.json'))
     knownHosts = new KnownHostsStore(path.join(userData, 'known_hosts.json'), path.join(os.homedir(), '.ssh', 'known_hosts'))
     manager = new ConnectionManager({ agentSource, verifyHostKey, resolveSshProfile: (id) => sshProfileStore.get(id) })

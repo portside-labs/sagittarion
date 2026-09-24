@@ -22,6 +22,14 @@ time you connect.
 - **SSH profiles**: tick *Save as an SSH profile* once and any later
   connection, SQLite or a Postgres tunnel, picks the host from a dropdown
   instead of retyping it. Profiles are edited in place and can be forgotten.
+- **Picks up where you left off**: the connection tabs, their table and
+  query tabs, each query's text, last results and chat come back on the
+  next launch. The connection that was in front reconnects at once; the
+  others connect when you open them.
+- **Several connections at once**: every open connection is a tab, across
+  the top of the window or down its left edge (Settings → Appearance).
+  Switching is instant and keeps each connection's tabs, results and chat;
+  closing one leaves the others alone.
 - **Groups and copies**: put connections into groups from the *Group* field,
   one per app, one per environment, whatever fits; groups fold up in the
   list and are renamed or dissolved from their header. Any connection can be

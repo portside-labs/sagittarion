@@ -3,6 +3,7 @@ import { createPortal } from 'react-dom'
 import type { AiProgressEvent, AiProviderKind, AiResult, AiTurn, CatalogModel } from '@shared/ai'
 import { AI_PRESETS, MODEL_CATALOG, modelTitle } from '@shared/ai'
 import { useStore } from '@/store'
+import { useSession } from '@/session-store'
 import { Icon } from './Icons'
 import { PaneHeader, type DragHandleProps } from './PaneLayout'
 import { errorMessage } from '@/lib/util'
@@ -49,7 +50,7 @@ const EXAMPLES = ['top 10 customers by revenue last quarter', 'orders from this 
 export function AskPanel({ sessionId, chat, setChat, handle, onSql, running, onCollapse }: AskPanelProps) {
   const settings = useStore((s) => s.settings)
   const setSettingsOpen = useStore((s) => s.setSettingsOpen)
-  const setStatus = useStore((s) => s.setStatus)
+  const setStatus = useSession((s) => s.setStatus)
   const toast = useStore((s) => s.toast)
 
   const listRef = useRef<HTMLDivElement>(null)
@@ -237,7 +238,7 @@ export function AskPanel({ sessionId, chat, setChat, handle, onSql, running, onC
     if (!question || asking) return
     if (!providerReady) {
       toast('info', 'Set up a language model first', 'Plain-English questions are answered by a provider of your choice with your own key. Open Settings to pick one.')
-      setSettingsOpen(true)
+      setSettingsOpen(true, { tab: 'ai' })
       return
     }
     const requestId = crypto.randomUUID()
@@ -416,7 +417,7 @@ export function AskPanel({ sessionId, chat, setChat, handle, onSql, running, onC
                 ))}
               </div>
             ) : (
-              <button className="btn small" onClick={() => setSettingsOpen(true)} title="Plain-English questions need a language model provider" data-testid="ask-needs-key">
+              <button className="btn small" onClick={() => setSettingsOpen(true, { tab: 'ai' })} title="Plain-English questions need a language model provider" data-testid="ask-needs-key">
                 <Icon name="settings" /> Set up provider
               </button>
             )}
@@ -517,7 +518,7 @@ export function AskPanel({ sessionId, chat, setChat, handle, onSql, running, onC
                 role="menuitem"
                 onClick={() => {
                   setMenuOpen(false)
-                  setSettingsOpen(true)
+                  setSettingsOpen(true, { tab: 'ai' })
                 }}
               >
                 <Icon name="settings" size={12} /> Manage providers…

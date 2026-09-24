@@ -1,4 +1,4 @@
-import { useEffect, useLayoutEffect, useRef, useState } from 'react'
+import { useEffect, useLayoutEffect, useRef, useState, type ReactNode } from 'react'
 
 export interface MenuItem {
   label?: string
@@ -7,6 +7,8 @@ export interface MenuItem {
   disabled?: boolean
   danger?: boolean
   separator?: boolean
+  /** A row of the menu's own choosing, such as colour swatches; it closes the menu itself when done. */
+  custom?: (close: () => void) => ReactNode
 }
 
 export function ContextMenu({ x, y, items, onClose }: { x: number; y: number; items: MenuItem[]; onClose: () => void }) {
@@ -47,6 +49,10 @@ export function ContextMenu({ x, y, items, onClose }: { x: number; y: number; it
       {items.map((item, i) =>
         item.separator ? (
           <div key={i} className="context-menu-sep" />
+        ) : item.custom ? (
+          <div key={i} className="context-menu-custom">
+            {item.custom(onClose)}
+          </div>
         ) : (
           <div
             key={i}

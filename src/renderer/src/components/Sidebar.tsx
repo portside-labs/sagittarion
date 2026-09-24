@@ -1,7 +1,7 @@
 import { useDeferredValue, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import type { ObjectKind, ObjectSummary } from '@shared/types'
 import { tableKey } from '@shared/connections'
-import { useStore } from '@/store'
+import { useSession } from '@/session-store'
 import { Icon, type IconName } from './Icons'
 import { buildRows, KIND_LABELS, ROW_HEIGHT, type TreeRow } from '@/lib/tree'
 
@@ -18,22 +18,22 @@ function functionMeta(o: ObjectSummary): string {
 }
 
 export function Sidebar({ width }: { width: number }) {
-  const session = useStore((s) => s.session)
-  const catalog = useStore((s) => s.catalog)
-  const catalogError = useStore((s) => s.catalogError)
-  const catalogLoading = useStore((s) => s.catalogLoading)
-  const names = useStore((s) => s.names)
-  const groups = useStore((s) => s.groups)
-  const tables = useStore((s) => s.tables)
-  const search = useStore((s) => s.search)
-  const refreshSchema = useStore((s) => s.refreshSchema)
-  const loadGroup = useStore((s) => s.loadGroup)
-  const loadTable = useStore((s) => s.loadTable)
-  const runSearch = useStore((s) => s.runSearch)
-  const openTable = useStore((s) => s.openTable)
-  const openDefinition = useStore((s) => s.openDefinition)
-  const tabs = useStore((s) => s.tabs)
-  const activeTabId = useStore((s) => s.activeTabId)
+  const session = useSession((s) => s.session)
+  const catalog = useSession((s) => s.catalog)
+  const catalogError = useSession((s) => s.catalogError)
+  const catalogLoading = useSession((s) => s.catalogLoading)
+  const names = useSession((s) => s.names)
+  const groups = useSession((s) => s.groups)
+  const tables = useSession((s) => s.tables)
+  const search = useSession((s) => s.search)
+  const refreshSchema = useSession((s) => s.refreshSchema)
+  const loadGroup = useSession((s) => s.loadGroup)
+  const loadTable = useSession((s) => s.loadTable)
+  const runSearch = useSession((s) => s.runSearch)
+  const openTable = useSession((s) => s.openTable)
+  const openDefinition = useSession((s) => s.openDefinition)
+  const tabs = useSession((s) => s.tabs)
+  const activeTabId = useSession((s) => s.activeTabId)
 
   const [filter, setFilter] = useState('')
   const deferredFilter = useDeferredValue(filter)

@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { CellValue, PendingChange, RowKey, RowsResponse } from '@shared/types'
 import { useStore, type Tab } from '@/store'
+import { useSession } from '@/session-store'
 import { DataGrid, type CellPos, type GridColumn } from './DataGrid'
 import { CellInspector } from './CellInspector'
 import { StructureView } from './StructureView'
@@ -14,11 +15,11 @@ import { cellToPlainText } from '@shared/export'
 const PAGE_SIZES = [100, 200, 500, 1000]
 
 export function TableTab({ tab, active }: { tab: Extract<Tab, { kind: 'table' }>; active: boolean }) {
-  const session = useStore((s) => s.session)!
-  const setTabDirty = useStore((s) => s.setTabDirty)
+  const session = useSession((s) => s.session)!
+  const setTabDirty = useSession((s) => s.setTabDirty)
   const toast = useStore((s) => s.toast)
-  const setStatus = useStore((s) => s.setStatus)
-  const setInTransaction = useStore((s) => s.setInTransaction)
+  const setStatus = useSession((s) => s.setStatus)
+  const setInTransaction = useSession((s) => s.setInTransaction)
   const confirm = useStore((s) => s.confirm)
 
   const [view, setView] = useState<'data' | 'structure'>('data')

@@ -1,9 +1,14 @@
 import { useLayoutEffect, useState } from 'react'
 import { AI_PRESETS, SCHEMA_BUDGETS, type AiProviderKind, type AiSettingsUpdate } from '@shared/ai'
-import { useStore } from '@/store'
+import { useStore, type SettingsTab } from '@/store'
 import { Modal } from './Modal'
 import { Icon } from './Icons'
 import { errorMessage } from '@/lib/util'
+
+const SETTINGS_TABS = [
+  { id: 'appearance' as const, label: 'Appearance', icon: 'layout' as const },
+  { id: 'ai' as const, label: 'AI', icon: 'chat' as const }
+]
 
 const PROVIDER_ORDER: AiProviderKind[] = ['openai', 'anthropic', 'google', 'groq', 'openrouter', 'ollama', 'custom']
 
@@ -24,6 +29,16 @@ export function SettingsDialog() {
   const [autoRun, setAutoRun] = useState(true)
   const [budget, setBudget] = useState<number>(8000)
   const [models, setModels] = useState<string[] | null>(null)
+  const [tab, setTab] = useState<SettingsTab>('appearance')
+  const ui = useStore((s) => s.ui)
+  const setUiPref = useStore((s) => s.setUiPref)
+
+  // A dialog opened for a reason starts on the relevant tab; otherwise it stays where it was left.
+  useLayoutEffect(() => {
+    if (!open) return
+    if (intent?.tab) setTab(intent.tab)
+    else if (intent?.provider) setTab('ai')
+  }, [open, intent])
   const [busy, setBusy] = useState<null | 'save' | 'test' | 'remove' | 'models'>(null)
 
   // Load the saved values each time the dialog opens, before the first paint so no stale draft shows.
@@ -39,7 +54,7 @@ export function SettingsDialog() {
     setBudget(settings.schemaBudgetTokens)
     setModels(null)
     // Opened from the model picker: start on that provider with the model filled in.
-    if (intent && intent.provider !== settings.provider) {
+    if (intent?.provider && intent.provider !== settings.provider) {
       const p = AI_PRESETS[intent.provider]
       setProvider(intent.provider)
       setBaseUrl(p.baseUrl)
@@ -151,23 +166,36 @@ export function SettingsDialog() {
   }
 
   return (
-    <Modal
-      title="Settings"
-      onClose={close}
-      width={600}
-      footer={
-        <>
-          <span className="spacer" />
-          <button className="btn" onClick={close}>
-            Close
-          </button>
-          <button className="btn primary" onClick={() => void save()} disabled={busy !== null || !dirty} data-testid="settings-save">
-            {busy === 'save' ? <span className="spinner" /> : null} Save
-          </button>
-        </>
-      }
-    >
+    <Modal title="Settings" onClose={close} width={760} header={false} className="settings-modal">
       <div className="settings-body" data-testid="settings-dialog">
+        <nav className="settings-nav" aria-label="Settings sections">
+          {SETTINGS_TABS.map((t) => (
+            <button key={t.id} className={`settings-nav-item ${tab === t.id ? 'active' : ''}`} onClick={() => setTab(t.id)} data-testid={`settings-tab-${t.id}`}>
+              <Icon name={t.icon} /> {t.label}
+            </button>
+          ))}
+        </nav>
+        <div className="settings-content">
+        <div className="settings-scroll">
+        {tab === 'appearance' ? (
+          <section data-testid="settings-appearance">
+            <h2>
+              <Icon name="layout" /> Appearance
+            </h2>
+            <div className="field">
+              <label>Connection tabs</label>
+              <div className="segmented" data-testid="connection-tabs-mode">
+                <button type="button" className={ui.connectionTabs === 'horizontal' ? 'active' : ''} onClick={() => setUiPref({ connectionTabs: 'horizontal' })}>
+                  Horizontal
+                </button>
+                <button type="button" className={ui.connectionTabs === 'vertical' ? 'active' : ''} onClick={() => setUiPref({ connectionTabs: 'vertical' })}>
+                  Vertical
+                </button>
+              </div>
+              <span className="hint">Open connections are listed as tabs across the top of the window, or as a rail down its left edge.</span>
+            </div>
+          </section>
+        ) : (
         <section>
           <h2>
             <Icon name="chat" /> Ask in plain English
@@ -314,6 +342,20 @@ export function SettingsDialog() {
             </span>
           </div>
         </section>
+        )}
+        </div>
+        <div className="settings-actions">
+          <span className="spacer" />
+          <button className="btn" onClick={close}>
+            Close
+          </button>
+          {tab === 'ai' ? (
+            <button className="btn primary" onClick={() => void save()} disabled={busy !== null || !dirty} data-testid="settings-save">
+              {busy === 'save' ? <span className="spinner" /> : null} Save
+            </button>
+          ) : null}
+        </div>
+        </div>
       </div>
     </Modal>
   )

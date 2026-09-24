@@ -47,6 +47,22 @@ describe('ConnectionStore.duplicate', () => {
     }
   })
 
+  it('keeps group colours with the connections', async () => {
+    const dir = mkdtempSync(path.join(tmpdir(), 'conn-store-'))
+    try {
+      const store = new ConnectionStore(path.join(dir, 'connections.json'), noopCodec)
+      await store.save({ ...newConnection('sqlite'), name: 'A', group: 'Acme', remotePath: '/tmp/a.db' })
+      await store.setGroupColor('Acme', '#3ecf8e')
+      expect(await store.groupStyles()).toEqual({ Acme: { color: '#3ecf8e' } })
+      const reread = new ConnectionStore(path.join(dir, 'connections.json'), noopCodec)
+      expect((await reread.groupStyles()).Acme?.color).toBe('#3ecf8e')
+      await reread.setGroupColor('Acme', null)
+      expect(await reread.groupStyles()).toEqual({})
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
   it('still copies when secrets cannot be stored', async () => {
     const dir = mkdtempSync(path.join(tmpdir(), 'conn-store-'))
     try {

@@ -62,6 +62,11 @@ export interface ConnectionConfig {
   pg?: PostgresConfig
 }
 
+/** How a connection group looks in the list. Groups themselves are implied by the connections in them. */
+export interface GroupStyle {
+  color?: string
+}
+
 /** SSH details saved once and reused by any number of connections. */
 export interface SshProfile extends SshConfig {
   id: string
@@ -460,4 +465,44 @@ export interface AppInfo {
   encryptionAvailable: boolean
   homeDir: string
   sshDir: string
+}
+
+// ---------------------------------------------------------------------------
+// Workspace kept between launches
+// ---------------------------------------------------------------------------
+
+/** What a query tab needs to reopen as it was: its text, row limit, last run and chat. */
+export interface QueryTabSnapshot {
+  sql: string
+  limit: number
+  lastRun?: {
+    sql: string
+    at: number
+    ms: number
+    statements: number
+    /** null when the run failed, or when the results were too large to keep. */
+    results: StatementResult[] | null
+    error: string | null
+    resultsDropped?: boolean
+  }
+  chat?: { messages: unknown[]; input: string }
+}
+
+export type WorkspaceTab =
+  | { id: string; kind: 'table'; schema?: string; table: string; title: string }
+  | { id: string; kind: 'query'; title: string; snapshot: QueryTabSnapshot }
+
+/** One open connection's tabs. */
+export interface WorkspaceConnection {
+  connectionId: string
+  activeTabId: string | null
+  queryCounter: number
+  tabs: WorkspaceTab[]
+}
+
+export interface WorkspaceState {
+  version: 1
+  activeConnectionId: string | null
+  showConnect: boolean
+  connections: WorkspaceConnection[]
 }

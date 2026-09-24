@@ -1,7 +1,7 @@
 import { promises as fs } from 'node:fs'
 import path from 'node:path'
 import { randomUUID } from 'node:crypto'
-import type { ConnectionConfig, StoredConnection } from '@shared/types'
+import type { ConnectionConfig, GroupStyle, StoredConnection } from '@shared/types'
 import { describeTarget, normalizeConnection } from '@shared/connections'
 
 export interface SecretCodec {
@@ -35,6 +35,8 @@ export function migrateStored(raw: any): StoredConnection | null {
 
 export class ConnectionStore {
   private cache: StoredConnection[] | null = null
+  /** How each group looks, keyed by its name; kept in the same file as the connections. */
+  private groups: Record<string, GroupStyle> = {}
 
   constructor(
     private readonly file: string,
@@ -47,6 +49,7 @@ export class ConnectionStore {
       const raw = await fs.readFile(this.file, 'utf8')
       const parsed = JSON.parse(raw)
       const list = Array.isArray(parsed?.connections) ? parsed.connections : []
+      this.groups = parsed?.groups && typeof parsed.groups === 'object' ? parsed.groups : {}
       this.cache = list.map(migrateStored).filter((c: StoredConnection | null): c is StoredConnection => c !== null)
     } catch {
       this.cache = []
@@ -58,7 +61,7 @@ export class ConnectionStore {
     this.cache = list
     await fs.mkdir(path.dirname(this.file), { recursive: true })
     const tmp = this.file + '.tmp'
-    await fs.writeFile(tmp, JSON.stringify({ version: 2, connections: list }, null, 2), 'utf8')
+    await fs.writeFile(tmp, JSON.stringify({ version: 2, connections: list, groups: this.groups }, null, 2), 'utf8')
     await fs.rename(tmp, this.file)
   }
 
@@ -158,6 +161,21 @@ export class ConnectionStore {
     list.push(copy)
     await this.persist(list)
     return this.toConfig(copy)
+  }
+
+  async groupStyles(): Promise<Record<string, GroupStyle>> {
+    await this.load()
+    return { ...this.groups }
+  }
+
+  /** Colours a group in the list, or clears its colour when null. */
+  async setGroupColor(name: string, color: string | null): Promise<void> {
+    const list = await this.load()
+    const key = name.trim()
+    if (!key) return
+    if (color) this.groups[key] = { ...this.groups[key], color }
+    else delete this.groups[key]
+    await this.persist(list)
   }
 
   /** Moves connections into a group, or out of any group when it is null. */

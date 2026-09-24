@@ -399,19 +399,31 @@ select.select {
   white-space: nowrap;
   font-family: var(--mono);
 }
-.conn-item .conn-delete,
-.conn-item .conn-duplicate {
-  opacity: 0;
-}
-.conn-item:hover .conn-delete,
-.conn-item:hover .conn-duplicate,
-.conn-item .conn-delete:focus-visible,
-.conn-item .conn-duplicate:focus-visible {
-  opacity: 1;
-}
 /* ---- connection groups ---- */
 .conn-group + .conn-group {
-  margin-top: 6px;
+  margin-top: 8px;
+}
+/* A coloured group: a soft tint and a hairline in its colour, with the name in the colour too. */
+.conn-group.tinted {
+  padding: 2px;
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--group-color) 9%, transparent);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--group-color) 38%, transparent);
+}
+.conn-group.tinted .conn-group-name {
+  color: var(--group-color);
+}
+.context-menu-custom {
+  padding: 4px 10px 6px;
+}
+.menu-color-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.menu-color-label {
+  font-size: 12px;
+  color: var(--text-muted);
 }
 .conn-group-header {
   display: flex;
@@ -437,10 +449,6 @@ select.select {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-.conn-group-header .count {
-  color: var(--text-faint);
-  font-weight: 500;
-}
 .conn-group-header .conn-group-menu {
   opacity: 0;
 }
@@ -456,9 +464,6 @@ select.select {
   flex: 1;
   height: 24px;
   font-size: 12.5px;
-}
-.conn-group.named .conn-item {
-  margin-left: 12px;
 }
 .group-new {
   display: flex;
@@ -1582,6 +1587,12 @@ table.struct {
   flex-direction: column;
   overflow: hidden;
 }
+.modal-close-floating {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  z-index: 1;
+}
 .modal-header {
   display: flex;
   align-items: center;
@@ -1909,11 +1920,75 @@ table.struct {
 }
 
 /* ---------------------------------------------------------------- settings + ask */
+/* The settings dialog keeps one height whichever tab is showing; each tab scrolls inside it. */
+.modal.settings-modal {
+  position: relative;
+  height: 620px;
+}
 .settings-body {
-  padding: 16px 18px 18px;
+  display: flex;
+  flex: 1;
+  min-height: 0;
+}
+.settings-nav {
+  width: 156px;
+  flex: 0 0 auto;
   display: flex;
   flex-direction: column;
-  gap: 18px;
+  gap: 2px;
+  padding: 12px 8px;
+  border-right: 1px solid var(--border);
+  background: var(--bg-panel);
+}
+.settings-nav-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  height: 30px;
+  padding: 0 10px;
+  border: none;
+  border-radius: var(--radius);
+  background: transparent;
+  color: var(--text-muted);
+  font: inherit;
+  font-size: 12.5px;
+  text-align: left;
+  cursor: pointer;
+}
+.settings-nav-item:hover {
+  background: var(--bg-hover);
+  color: var(--text);
+}
+.settings-nav-item.active {
+  background: var(--bg-active);
+  color: var(--text);
+}
+.settings-content {
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+.settings-scroll {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  padding: 16px 40px 18px 18px;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+.settings-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 12px 18px;
+  border-top: 1px solid var(--border);
+  flex: 0 0 auto;
+}
+.settings-actions .spacer {
+  flex: 1;
 }
 .settings-body h2 {
   margin: 0 0 6px;
@@ -2170,6 +2245,7 @@ table.struct {
   align-items: center;
   justify-content: center;
   flex: 0 0 auto;
+  margin-left: auto;
   background: var(--bg-active);
 }
 .conn-item .conn-kind.postgres {
@@ -2640,10 +2716,6 @@ html.mac .conn-list-header {
   color: var(--text-muted);
 }
 
-.conn-list .conn-section-header {
-  margin: 0 8px;
-  cursor: default;
-}
 .conn-list-header .spacer {
   flex: 1;
 }
@@ -2896,4 +2968,275 @@ html.mac .conn-list-header {
   position: absolute;
   top: 4px;
   right: 4px;
+}
+
+
+/* ---------------------------------------------------------------- app shell: open connections as tabs */
+.app-shell {
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+  width: 100vw;
+  overflow: hidden;
+}
+.app-shell.tabs-vertical {
+  flex-direction: row;
+}
+.app-view {
+  flex: 1;
+  min-height: 0;
+  min-width: 0;
+  display: flex;
+}
+/* Inside the shell a screen fills its slot, not the window. */
+.app-view .app-frame {
+  flex: 1;
+  min-width: 0;
+  height: 100%;
+  width: auto;
+}
+.session-slot {
+  flex: 1;
+  min-width: 0;
+  height: 100%;
+  display: flex;
+}
+.session-slot[hidden] {
+  display: none;
+}
+.conn-tabs {
+  display: flex;
+  align-items: flex-end;
+  gap: 4px;
+  height: var(--titlebar-h);
+  padding: 0 8px;
+  flex: 0 0 auto;
+  background: var(--bg);
+  border-bottom: 1px solid var(--border);
+  overflow: hidden;
+  -webkit-app-region: drag;
+}
+html.mac .conn-tabs {
+  padding-left: 84px;
+}
+.conn-tab {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  height: 30px;
+  margin-bottom: 4px;
+  padding: 0 6px 0 10px;
+  border-radius: 8px;
+  color: var(--text-muted);
+  font-size: 12.5px;
+  cursor: pointer;
+  max-width: 220px;
+  user-select: none;
+  -webkit-app-region: no-drag;
+}
+.conn-tab:hover {
+  background: var(--bg-hover);
+  color: var(--text);
+}
+/* Active state changes colour and background only: a heavier weight would widen the tab. */
+.conn-tab.active {
+  background: var(--bg-elev);
+  color: var(--text);
+  box-shadow: inset 0 0 0 1px var(--border-strong);
+}
+.conn-tab-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex: 0 0 auto;
+  background: var(--tab-color, var(--text-faint));
+}
+.conn-tab-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.conn-tab-close {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  border: none;
+  border-radius: 4px;
+  background: transparent;
+  color: inherit;
+  opacity: 0;
+  cursor: pointer;
+  flex: 0 0 auto;
+}
+.conn-tab:hover .conn-tab-close,
+.conn-tab.active .conn-tab-close {
+  opacity: 0.7;
+}
+.conn-tab-close:hover {
+  opacity: 1 !important;
+  background: var(--bg-hover);
+}
+.conn-tab-add {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  margin-bottom: 5px;
+  border: none;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+  flex: 0 0 auto;
+  -webkit-app-region: no-drag;
+}
+.conn-tab-add:hover {
+  background: var(--bg-hover);
+  color: var(--text);
+}
+.conn-tab-add.active {
+  background: var(--bg-elev);
+  color: var(--text);
+  box-shadow: inset 0 0 0 1px var(--border-strong);
+}
+.conn-rail {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+  width: 68px;
+  padding: 8px 0;
+  flex: 0 0 auto;
+  background: var(--bg);
+  border-right: 1px solid var(--border);
+  overflow-y: auto;
+  overflow-x: hidden;
+  -webkit-app-region: drag;
+}
+html.mac .conn-rail {
+  padding-top: calc(var(--titlebar-h) + 2px);
+}
+.conn-rail .conn-tab {
+  position: relative;
+  flex-direction: column;
+  gap: 4px;
+  width: 58px;
+  height: auto;
+  margin: 0;
+  padding: 6px 3px 5px;
+  border-radius: 10px;
+  font-size: 10px;
+  max-width: none;
+}
+.conn-rail .conn-tab.active::before {
+  content: '';
+  position: absolute;
+  left: -5px;
+  top: 12px;
+  bottom: 12px;
+  width: 3px;
+  border-radius: 2px;
+  background: var(--accent);
+}
+.conn-rail .conn-tab-logo {
+  width: 34px;
+  height: 34px;
+  border-radius: 9px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--bg-elev);
+  box-shadow: inset 0 0 0 1.5px var(--tab-color, transparent);
+}
+.conn-rail .conn-tab-name {
+  width: 100%;
+  text-align: center;
+}
+.conn-rail .conn-tab-close {
+  position: absolute;
+  top: 1px;
+  right: 1px;
+  width: 16px;
+  height: 16px;
+  background: var(--bg-elev);
+}
+.conn-rail .conn-tab-add {
+  width: 34px;
+  height: 34px;
+  margin: 2px 0 0;
+}
+/* The strip or rail is the title bar now, so the inner headers give up their traffic-light inset. */
+html.mac .app-shell.has-tabs .sidebar-header {
+  padding-left: 10px;
+}
+html.mac .app-shell.has-tabs .conn-list-header {
+  padding-left: 14px;
+}
+.conn-item .conn-dot.connected {
+  box-shadow: 0 0 0 2px var(--bg-panel), 0 0 0 3.5px #3ecf8e;
+}
+
+/* ---- a connection tab that is not connected yet ---- */
+.connecting-pane {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--bg);
+}
+.connecting-card {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+  max-width: 440px;
+  padding: 24px;
+  text-align: center;
+}
+.connecting-card h3 {
+  margin: 8px 0 0;
+  font-size: 16px;
+}
+.connecting-status {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 10px;
+  color: var(--text-muted);
+}
+.connecting-error {
+  margin-top: 10px;
+  color: var(--danger);
+  line-height: 1.5;
+}
+.connecting-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 8px;
+  margin-top: 12px;
+}
+.conn-tab.status-pending .conn-tab-name,
+.conn-tab.status-connecting .conn-tab-name,
+.conn-tab.status-error .conn-tab-name {
+  opacity: 0.65;
+}
+.conn-tab.status-error .conn-tab-dot,
+.conn-tab.status-error .conn-tab-logo {
+  box-shadow: 0 0 0 1.5px var(--danger);
+}
+.conn-tab.status-connecting .conn-tab-dot,
+.conn-tab.status-connecting .conn-tab-logo {
+  animation: pulse-dot 1s ease-in-out infinite;
+}
+@keyframes pulse-dot {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.35;
+  }
 }

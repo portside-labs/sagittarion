@@ -1,11 +1,11 @@
 import { useEffect, useState } from 'react'
 import type { TableDetails, TableRef } from '@shared/types'
-import { useStore } from '@/store'
+import { useSession } from '@/session-store'
 import { SqlEditor } from './SqlEditor'
 import { errorMessage } from '@/lib/util'
 
 export function StructureView({ table, refreshKey }: { table: TableRef; refreshKey: number }) {
-  const session = useStore((s) => s.session)!
+  const session = useSession((s) => s.session)!
   const [details, setDetails] = useState<TableDetails | null>(null)
   const [error, setError] = useState<string | null>(null)
 

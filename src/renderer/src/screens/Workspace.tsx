@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react'
 import { useStore } from '@/store'
+import { useSession } from '@/session-store'
 import { Sidebar } from '@/components/Sidebar'
 import { Splitter } from '@/components/Splitter'
 import { TabBar } from '@/components/TabBar'
@@ -11,14 +12,15 @@ import { clamp, isModKey, modKey } from '@/lib/util'
 
 export const REFRESH_EVENT = 'sagittarion:refresh'
 
-export function Workspace() {
-  const session = useStore((s) => s.session)!
-  const tabs = useStore((s) => s.tabs)
-  const activeTabId = useStore((s) => s.activeTabId)
-  const newQueryTab = useStore((s) => s.newQueryTab)
-  const closeTab = useStore((s) => s.closeTab)
-  const refreshSchema = useStore((s) => s.refreshSchema)
-  const disconnect = useStore((s) => s.disconnect)
+/** One open connection: sidebar, tabs and status bar. Stays mounted while another connection is in front. */
+export function Workspace({ active }: { active: boolean }) {
+  const session = useSession((s) => s.session)
+  const tabs = useSession((s) => s.tabs)
+  const activeTabId = useSession((s) => s.activeTabId)
+  const newQueryTab = useSession((s) => s.newQueryTab)
+  const closeTab = useSession((s) => s.closeTab)
+  const refreshSchema = useSession((s) => s.refreshSchema)
+  const disconnect = useSession((s) => s.disconnect)
   const setSettingsOpen = useStore((s) => s.setSettingsOpen)
   const [sidebarWidth, setSidebarWidth] = useState(() => Number(localStorage.getItem('sidebarWidth')) || 260)
 
@@ -26,7 +28,9 @@ export function Workspace() {
     localStorage.setItem('sidebarWidth', String(sidebarWidth))
   }, [sidebarWidth])
 
+  // Shortcuts belong to the connection in front only.
   useEffect(() => {
+    if (!active) return
     const onKey = (e: KeyboardEvent) => {
       if (!isModKey(e)) return
       const k = e.key.toLowerCase()
@@ -44,7 +48,7 @@ export function Workspace() {
     }
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
-  }, [activeTabId, newQueryTab, closeTab, refreshSchema])
+  }, [active, activeTabId, newQueryTab, closeTab, refreshSchema])
 
   return (
     <div className="app-frame workspace">

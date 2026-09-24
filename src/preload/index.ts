@@ -18,7 +18,9 @@ const api: Api = {
     save: (cfg) => ipcRenderer.invoke('connections:save', cfg),
     remove: (id) => ipcRenderer.invoke('connections:remove', id),
     setGroup: (ids, group) => ipcRenderer.invoke('connections:setGroup', ids, group),
-    duplicate: (id) => ipcRenderer.invoke('connections:duplicate', id)
+    duplicate: (id) => ipcRenderer.invoke('connections:duplicate', id),
+    groupStyles: () => ipcRenderer.invoke('connections:groupStyles'),
+    setGroupColor: (name, color) => ipcRenderer.invoke('connections:setGroupColor', name, color)
   },
   sshProfiles: {
     list: () => ipcRenderer.invoke('sshProfiles:list'),
@@ -53,6 +55,11 @@ const api: Api = {
     pickSqliteFile: (current) => ipcRenderer.invoke('dialog:pickSqliteFile', current)
   },
   exportData: (req) => ipcRenderer.invoke('export:save', req),
+  workspace: {
+    load: () => ipcRenderer.invoke('workspace:load'),
+    save: (state) => ipcRenderer.invoke('workspace:save', state),
+    flush: (state) => ipcRenderer.sendSync('workspace:flush', state)
+  },
   settings: {
     get: () => ipcRenderer.invoke('settings:get'),
     update: (u) => ipcRenderer.invoke('settings:update', u),

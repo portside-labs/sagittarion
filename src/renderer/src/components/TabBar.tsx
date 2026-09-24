@@ -1,14 +1,14 @@
-import { useStore } from '@/store'
+import { useSession } from '@/session-store'
 import { Icon } from './Icons'
 import { modKey } from '@/lib/util'
 
 export function TabBar() {
-  const tabs = useStore((s) => s.tabs)
-  const activeTabId = useStore((s) => s.activeTabId)
-  const setActiveTab = useStore((s) => s.setActiveTab)
-  const closeTab = useStore((s) => s.closeTab)
-  const newQueryTab = useStore((s) => s.newQueryTab)
-  const dirtyTabs = useStore((s) => s.dirtyTabs)
+  const tabs = useSession((s) => s.tabs)
+  const activeTabId = useSession((s) => s.activeTabId)
+  const setActiveTab = useSession((s) => s.setActiveTab)
+  const closeTab = useSession((s) => s.closeTab)
+  const newQueryTab = useSession((s) => s.newQueryTab)
+  const dirtyTabs = useSession((s) => s.dirtyTabs)
 
   return (
     <div className="tabbar">
