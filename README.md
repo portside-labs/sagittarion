@@ -16,9 +16,9 @@ time you connect.
 - **Connections**: SQLite files on this computer by default, or on another
   machine with *connect over SSH* ticked; PostgreSQL directly or through an
   SSH tunnel. Password, private key (with passphrase) or SSH agent
-  authentication. Saved connections with per-connection colour; passwords and
-  passphrases are stored encrypted with the OS keychain (Electron
-  `safeStorage`) only when you tick *Save*.
+  authentication. Passwords and passphrases of saved connections are stored
+  encrypted with the OS keychain (Electron `safeStorage`) only when you tick
+  *Save*.
 - **SSH profiles**: tick *Save as an SSH profile* once and any later
   connection, SQLite or a Postgres tunnel, picks the host from a dropdown
   instead of retyping it. Profiles are edited in place and can be forgotten.
@@ -30,9 +30,16 @@ time you connect.
   the top of the window or down its left edge (Settings → Appearance).
   Switching is instant and keeps each connection's tabs, results and chat;
   closing one leaves the others alone.
+- **Idle disconnects taken in stride**: when the server or the network drops
+  a connection, its tab stays as it was, a notice says so and the dot at the
+  bottom left turns from green to red. The next action
+  that needs the database reconnects by itself; a read the drop cut short runs
+  again, while a statement that may write is never repeated.
 - **Groups and copies**: put connections into groups from the *Group* field,
   one per app, one per environment, whatever fits; groups fold up in the
-  list and are renamed or dissolved from their header. Any connection can be
+  list and are renamed, coloured or dissolved from their header. A group's
+  colour marks its tabs and tints the window while one of its connections is
+  in front, so production can look like production. Any connection can be
   duplicated from the list, settings and saved secrets included, to make a
   variant.
 - **Host key verification**: trust-on-first-use with a fingerprint prompt, plus
@@ -45,6 +52,11 @@ time you connect.
 - **Table browsing**: paging, sorting by column, raw `WHERE` filters, row
   counts, column resizing, keyboard navigation, cell inspector with hex dumps
   for blobs.
+- **Select and copy like a spreadsheet**: drag across cells, Shift-click or
+  Shift+arrows to stretch, ⌘/Ctrl-click to add, row numbers for whole rows,
+  a column header for the column (⌥/Alt-click where a click sorts), ⌘A for
+  everything. ⌘C copies the selection as tab-separated text that pastes cell
+  for cell into Excel, Numbers or Sheets; ⌘⇧C adds the column names.
 - **Editing**: inline cell edits, `NULL`s, new rows and deletions are *staged*
   and highlighted, then applied together in a single transaction. Rows are
   addressed by `rowid` (or the primary key for `WITHOUT ROWID` tables) and each
@@ -160,10 +172,10 @@ steps collapse into a one-line summary under the answer that expands on click.
 
 Settings → AI starts with the kind of connection: *Bring your own key*
 (OpenAI, Anthropic, Google Gemini, OpenRouter, Groq; requests go straight
-from the app to the provider with your key), *Local or custom* (Ollama,
+from the app to the provider with your key) or *Local or custom* (Ollama,
 LM Studio, vLLM, LiteLLM or any OpenAI-compatible server; nothing leaves your
-machine or network), or *Managed AI*, which is on its way and will be the only
-part of the app that needs an account. Keys are stored encrypted with the OS
+machine or network). *Managed AI* is on its way and will be the only part of
+the app that needs an account. Keys are stored encrypted with the OS
 keychain and referenced from the settings, never written in plain text. The
 database agent's own options, the schema context budget and query safety, are
 the same whichever model answers.
@@ -213,7 +225,68 @@ and SQL are sent to the provider. Turning on *Send sample column values* in
 Settings also sends up to 20 distinct values of short text columns of the
 tables in context so words like "paid" can be matched to a status; it is off by
 default and skipped for tables estimated at over two million rows. Query
-results are never sent.
+results are never sent. With Local AI Privacy on (the default), sensitive values
+in all of these are replaced with placeholders before they leave the computer.
+
+### Local AI Privacy
+
+When the model runs somewhere else, sensitive values are replaced with
+placeholders before a request is sent and put back when the answer arrives. It
+is on by default (Settings → AI → *Privacy & data protection*), runs entirely on
+this computer and needs no account.
+
+- **What is found.** Emails, phone numbers, card and bank numbers (confirmed
+  with the Luhn, mod-97 and ABA checksums), government, health and vehicle ids,
+  IP and MAC addresses, URLs, API keys, tokens, passwords and private keys,
+  dates of birth, street addresses, and person names from titles, relations
+  ("my son Jonathan"), introductions and a list of common names. Columns such as
+  `email`, `date_of_birth` or `card_number` are recognised by name, and so are
+  labelled values in JSON, logs, SQL and CSV. A value protected once in a chat
+  is protected wherever it turns up again, database errors included.
+- **An optional on-device model** finds what patterns cannot: names without a
+  title or a telling phrase, places, employers and other organizations, a
+  misspelled "pasword:". It is GLiNER PII base (Knowledgator and Wordcab,
+  Apache-2.0), a 196 MB download from Settings, checked against a pinned
+  SHA-256 before it runs. It runs with ONNX Runtime in a process of its own on
+  this computer; nothing it reads leaves, and nothing Python is involved. It
+  loads when a question needs it and unloads when idle. If it is switched on
+  but cannot run, asks stop rather than go out less protected.
+- **What happens to it** is decided by a versioned policy, *General PII* (v2).
+  Names, contact details, addresses, organizations and ids become placeholders such as
+  `<|PII:PERSON:A81F32|>`, which the model can reason about and copy into SQL.
+  Card numbers are masked to the last four digits. Passwords, keys, tokens and
+  card security codes are removed. Cities, states, countries and ages are sent
+  as they are.
+- **Answers are restored here.** The model's SQL gets its values back with each
+  one escaped for where it sits, so a value can never change the statement; the
+  read-only check and `EXPLAIN` then run as before. The chat shows real values,
+  and a chip on each answer says how many were protected.
+- **Nothing unverified leaves.** Everything a request would carry is scanned
+  again just before it is sent. If a protected kind of value is still there, the
+  request is stopped and the chat says what kind of value was found and where,
+  never the value itself.
+- **The mapping stays behind.** Which placeholder stands for which value is
+  kept in memory in the main process, per chat, and is never sent, saved or
+  logged. Follow-up questions replay the earlier exchange exactly as the model
+  saw it, even after a relaunch.
+- Models on this computer (`localhost`) see data as it is unless *Also protect
+  models on this computer* is on. Everything else, LAN servers and company
+  gateways included, is protected.
+- **See for yourself.** *What was sent* under each answer (or the "protected"
+  chip) opens every request exactly as it went over the network and every
+  response as it came back, readable or raw. Each protected value is listed
+  with its placeholder, where it came from, and a check that the value itself
+  appears nowhere in what was sent, counted on the exact bytes; a search box
+  checks any other text the same way. Values are shown only if you ask, only
+  for ones the chat shows anyway, never secrets. Headers are left out because
+  they carry your API key. These records stay in memory for recent answers and
+  go when the chat is reset or the connection closes.
+
+This is a technical safeguard: deterministic rules, and optionally a model on
+this computer. On its own it does not make the app, or the way it is used,
+compliant with HIPAA, PCI DSS or GDPR.
+[docs/LOCAL_AI_PRIVACY.md](docs/LOCAL_AI_PRIVACY.md) has the design, the
+evaluation (with and without the model) and the roadmap.
 
 ## Requirements
 
@@ -242,8 +315,11 @@ without keeping the connection.
 
 Keyboard shortcuts: `⌘T`/`Ctrl+T` new query tab, `⌘↩`/`Ctrl+Enter` run,
 `⌘R`/`Ctrl+R` refresh the current tab, `⌘⇧R` refresh the schema, `⌘W` close
-tab, `⌘⌫`/`Ctrl+Del` set the selected cell to `NULL`, `Enter`/`F2` or typing
-starts editing a cell.
+tab, `⌘⌫`/`Ctrl+Del` set the selected cells to `NULL`, `Enter`/`F2` or typing
+starts editing a cell. In a grid, `Shift`+arrows stretch the selection,
+`⌘`/`Ctrl`+arrows jump to the edge, `⌘A`/`Ctrl+A` selects everything,
+`Shift+Space` whole rows, `Ctrl+Space` whole columns, `⌘C`/`Ctrl+C` copies and
+`⌘⇧C`/`Ctrl+Shift+C` copies with column names.
 
 ## How it works
 
@@ -288,6 +364,9 @@ src/main/ssh/        Session (ssh2): exec, SFTP, local port forwarding; host key
 src/main/db/         DatabaseDriver interface, SQLite-over-SSH adapter, PostgreSQL driver
 src/main/connections/ ConnectionManager: opens either kind, tunnels, lifecycle
 src/main/ai/         plain-English queries: provider adapters, schema index and retrieval, read-only guard, orchestrator
+src/main/privacy/    Local AI Privacy: detectors, policies, placeholder vault, restoration, verification, provider boundary
+src/main/privacy/semantic/ The on-device model: pinned manifest, download and checks, tokenizer, ONNX Runtime process
+scripts/             Developer tools: golden fixtures for the on-device model (Python, never shipped)
 src/main/agent/      sqlite_agent.py – runs on the remote host
 src/main/store/      saved connections (secrets encrypted with safeStorage)
 src/preload/         contextBridge API exposed as window.api
@@ -318,6 +397,20 @@ recreate their own tables in that database, so use a scratch database.
 The query-builder tests script the model's answers, so they need no key. Set
 `TYPESAFE_API_KEY` to also run one live interpretation against the real API.
 
+The Local AI Privacy tests (`test/privacy/`) include security regression tests
+that inspect the exact HTTP bodies sent to every remote provider, and an
+evaluation corpus that reports precision, recall and false-positive rates. Set
+`PRIVACY_HOLDOUT` to a JSONL file of held-out cases kept outside this repository
+to measure against data that was never used for tuning
+(`PRIVACY_HOLDOUT_MIN_RECALL` turns its recall into an assertion).
+
+The on-device model's TypeScript port is checked against the reference GLiNER
+implementation with golden fixtures (`scripts/gliner-golden.py` regenerates
+them). Tests that need the model's files run when `SAGITTARION_GLINER_DIR`
+points at a directory holding them (`gliner_config.json`, `tokenizer.json`,
+`onnx/model_quint8.onnx`), and `npm run test:e2e:model` drives the built app
+with it.
+
 `npm run dev:server` starts the mock SSH server on port 2222 (user `test`,
 password `test`) serving `test/fixtures/sample.db`, which is handy for trying
 the UI without a real host.
@@ -333,6 +426,11 @@ the UI without a real host.
 - The `WHERE` filter box takes raw SQL by design, exactly like the query tab.
 - The renderer runs with `contextIsolation`, `sandbox` and a strict CSP; it can
   only reach the main process through the small typed API in `src/shared/api.ts`.
+- Provider adapters accept only requests that passed Local AI Privacy or carry
+  an explicit exemption (privacy off, a model on this computer, fixed text such
+  as the connection test); the types in `src/main/privacy/boundary.ts` enforce
+  it. Privacy errors name kinds of values and places, never values, because
+  Electron prints IPC errors to the console.
 
 ## Limitations and ideas
 

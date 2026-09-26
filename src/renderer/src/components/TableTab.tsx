@@ -2,13 +2,14 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { CellValue, PendingChange, RowKey, RowsResponse } from '@shared/types'
 import { useStore, type Tab } from '@/store'
 import { useSession } from '@/session-store'
-import { DataGrid, type CellPos, type GridColumn } from './DataGrid'
+import { DataGrid, type GridColumn, type GridMenuContext, type GridSelection } from './DataGrid'
 import { CellInspector } from './CellInspector'
 import { StructureView } from './StructureView'
 import { ContextMenu, type MenuItem } from './ContextMenu'
 import { Icon } from './Icons'
 import { REFRESH_EVENT } from '@/screens/Workspace'
-import { cellText, valuesEqual } from '@/lib/format'
+import { valuesEqual } from '@/lib/format'
+import { activeCell, clampSelection, selectedRows, single } from '@/lib/grid-selection'
 import { copyText, errorMessage, formatDuration, formatNumber, hasOwn, isMac, modKey } from '@/lib/util'
 import { cellToPlainText } from '@shared/export'
 
@@ -34,9 +35,10 @@ export function TableTab({ tab, active }: { tab: Extract<Tab, { kind: 'table' }>
   const [updates, setUpdates] = useState<Map<number, Record<string, CellValue>>>(new Map())
   const [deletes, setDeletes] = useState<Set<number>>(new Set())
   const [inserts, setInserts] = useState<Record<string, CellValue>[]>([])
-  const [selection, setSelection] = useState<CellPos | null>(null)
+  const [selection, setSelection] = useState<GridSelection>([])
   const [inspector, setInspector] = useState(false)
-  const [menu, setMenu] = useState<{ x: number; y: number; pos: CellPos } | null>(null)
+  /** The cell editing and the inspector act on. */
+  const activePos = activeCell(selection)
   const [exportMenu, setExportMenu] = useState<{ x: number; y: number } | null>(null)
   const [applying, setApplying] = useState(false)
   const [structureKey, setStructureKey] = useState(0)
@@ -72,7 +74,7 @@ export function TableTab({ tab, active }: { tab: Extract<Tab, { kind: 'table' }>
       setInTransaction(res.tx)
       setStatus(`${formatNumber(res.rows.length)} rows fetched in ${formatDuration(res.durationMs)}`)
       clearPending()
-      setSelection((s) => (s && s.row < res.rows.length ? s : null))
+      setSelection((s) => clampSelection(s, res.rows.length))
     } catch (e) {
       if (seq === reqSeq.current) setError(errorMessage(e))
     } finally {
@@ -162,21 +164,29 @@ export function TableTab({ tab, active }: { tab: Extract<Tab, { kind: 'table' }>
   const addRow = () => {
     if (!editable || !data) return
     setInserts((list) => [...list, {}])
-    setSelection({ row: allRows.length, col: 0 })
+    setSelection([single({ row: allRows.length, col: 0 })])
   }
 
-  const toggleDelete = (row?: number) => {
-    const r = row ?? selection?.row
-    if (r === undefined || !editable) return
-    if (r >= baseRowCount) {
-      setInserts((list) => list.filter((_, i) => i !== r - baseRowCount))
-      setSelection(null)
-      return
+  /** The rows the selection touches. */
+  const pickedRows = () => selectedRows(clampSelection(selection, allRows.length))
+
+  /** Stages rows for deletion, or takes them back when every one already is; staged inserts among them are dropped. */
+  const toggleDelete = (target: number[] = pickedRows()) => {
+    if (!target.length || !editable) return
+    const inserted = new Set(target.filter((r) => r >= baseRowCount).map((r) => r - baseRowCount))
+    const existing = target.filter((r) => r < baseRowCount)
+    if (inserted.size) {
+      setInserts((list) => list.filter((_, i) => !inserted.has(i)))
+      setSelection([])
     }
+    if (!existing.length) return
     setDeletes((s) => {
       const next = new Set(s)
-      if (next.has(r)) next.delete(r)
-      else next.add(r)
+      const undo = existing.every((r) => next.has(r))
+      for (const r of existing) {
+        if (undo) next.delete(r)
+        else next.add(r)
+      }
       return next
     })
   }
@@ -229,30 +239,28 @@ export function TableTab({ tab, active }: { tab: Extract<Tab, { kind: 'table' }>
   const canPrev = page > 0
   const canNext = total !== null ? to < total : baseRowCount === pageSize
 
-  const selectedValue = selection && data ? (selection.row < baseRowCount ? (updates.get(selection.row) && hasOwn(updates.get(selection.row)!, columns[selection.col]?.name) ? updates.get(selection.row)![columns[selection.col].name] : data.rows[selection.row]?.[selection.col]) : allRows[selection.row]?.[selection.col]) : undefined
+  const selectedValue = activePos && data ? (activePos.row < baseRowCount ? (updates.get(activePos.row) && hasOwn(updates.get(activePos.row)!, columns[activePos.col]?.name) ? updates.get(activePos.row)![columns[activePos.col].name] : data.rows[activePos.row]?.[activePos.col]) : allRows[activePos.row]?.[activePos.col]) : undefined
 
-  const menuItems = (pos: CellPos): MenuItem[] => {
-    const col = columns[pos.col]
-    const v = allRows[pos.row]?.[pos.col] ?? null
-    const rowJson = () => {
-      const o: Record<string, unknown> = {}
-      columns.forEach((c, i) => (o[c.name] = allRows[pos.row]?.[i] ?? null))
-      return JSON.stringify(o, null, 2)
-    }
-    const isInsert = pos.row >= baseRowCount
+  /** The grid's context menu, after its Copy items: acts on every row the selection touches. */
+  const menuItems = ({ pos, setNull }: GridMenuContext): MenuItem[] => {
+    const picked = pickedRows()
+    const target = picked.length ? picked : [pos.row]
+    const n = target.length
+    const rowObject = (r: number) => Object.fromEntries(columns.map((c, i) => [c.name, allRows[r]?.[i] ?? null]))
+    const inserted = target.filter((r) => r >= baseRowCount).length
+    const undo = inserted < n && target.every((r) => r >= baseRowCount || deletes.has(r))
     return [
-      { label: 'Copy value', shortcut: `${modKey}C`, onClick: () => void copyText(cellText(v)) },
-      { label: 'Copy row as JSON', onClick: () => void copyText(rowJson()) },
-      { label: 'Copy row as CSV', onClick: () => void copyText(allRows[pos.row].map((c) => cellToPlainText(c)).join(',')) },
+      { label: n > 1 ? `Copy ${n} rows as JSON` : 'Copy row as JSON', onClick: () => void copyText(JSON.stringify(n > 1 ? target.map(rowObject) : rowObject(target[0]), null, 2)) },
+      { label: n > 1 ? `Copy ${n} rows as CSV` : 'Copy row as CSV', onClick: () => void copyText(target.map((r) => allRows[r].map((c) => cellToPlainText(c)).join(',')).join('\n')) },
       { label: 'Inspect value', onClick: () => setInspector(true) },
       { separator: true },
-      { label: 'Set NULL', shortcut: isMac ? '⌘⌫' : 'Ctrl+Del', disabled: !editable || col?.readOnly, onClick: () => onEdit(pos.row, col.name, null) },
+      { label: 'Set NULL', shortcut: isMac ? '⌘⌫' : 'Ctrl+Del', disabled: !setNull, onClick: setNull },
       { label: 'Add row', disabled: !editable, onClick: addRow },
       {
-        label: isInsert ? 'Remove new row' : deletes.has(pos.row) ? 'Undo delete' : 'Delete row',
+        label: inserted === n ? (n > 1 ? `Remove ${n} new rows` : 'Remove new row') : undo ? 'Undo delete' : n > 1 ? `Delete ${n} rows` : 'Delete row',
         disabled: !editable,
-        danger: !isInsert && !deletes.has(pos.row),
-        onClick: () => toggleDelete(pos.row)
+        danger: inserted < n && !undo,
+        onClick: () => toggleDelete(target)
       }
     ]
   }
@@ -323,7 +331,7 @@ export function TableTab({ tab, active }: { tab: Extract<Tab, { kind: 'table' }>
                 <button className="btn ghost icon small" title="Add row" onClick={addRow} data-testid="add-row">
                   <Icon name="plus" />
                 </button>
-                <button className="btn ghost icon small" title="Delete selected row" disabled={!selection} onClick={() => toggleDelete()} data-testid="delete-row">
+                <button className="btn ghost icon small" title="Delete selected rows" disabled={!activePos} onClick={() => toggleDelete()} data-testid="delete-row">
                   <Icon name="minus" />
                 </button>
                 <span className="sep" />
@@ -413,10 +421,11 @@ export function TableTab({ tab, active }: { tab: Extract<Tab, { kind: 'table' }>
                 })
               }
               selection={selection}
-              onSelect={setSelection}
+              onSelectionChange={setSelection}
               onEdit={editable ? onEdit : undefined}
-              onContextMenu={(e, pos) => setMenu({ x: e.clientX, y: e.clientY, pos })}
+              menuItems={menuItems}
               onActivate={() => setInspector(true)}
+              onCopied={setStatus}
               emptyMessage={where ? 'No rows match the filter' : 'This table is empty'}
               testId="table-grid"
             />
@@ -425,17 +434,16 @@ export function TableTab({ tab, active }: { tab: Extract<Tab, { kind: 'table' }>
           )}
           {inspector ? (
             <CellInspector
-              column={selection ? columns[selection.col] ?? null : null}
+              column={activePos ? columns[activePos.col] ?? null : null}
               value={selectedValue}
-              editable={editable && !!selection && !deletes.has(selection.row)}
-              onStage={selection ? (v) => onEdit(selection.row, columns[selection.col].name, v) : undefined}
+              editable={editable && !!activePos && !deletes.has(activePos.row)}
+              onStage={activePos ? (v) => onEdit(activePos.row, columns[activePos.col].name, v) : undefined}
               onClose={() => setInspector(false)}
-              rowLabel={selection ? (selection.row >= baseRowCount ? 'new row' : `#${formatNumber(page * pageSize + selection.row + 1)}`) : undefined}
+              rowLabel={activePos ? (activePos.row >= baseRowCount ? 'new row' : `#${formatNumber(page * pageSize + activePos.row + 1)}`) : undefined}
             />
           ) : null}
         </div>
       )}
-      {menu ? <ContextMenu x={menu.x} y={menu.y} items={menuItems(menu.pos)} onClose={() => setMenu(null)} /> : null}
       {exportMenu ? (
         <ContextMenu
           x={exportMenu.x}

@@ -2,10 +2,13 @@ import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, typ
 import { createPortal } from 'react-dom'
 import type { AiProgressEvent, AiResult, AiTurn, CatalogModel } from '@shared/ai'
 import { BYOK_PROVIDERS, LOCAL_PROVIDERS, MODEL_CATALOG, PROVIDERS, activeConnection, connectionReady, modelTitle, vendorOf } from '@shared/ai'
+import { describeCounts, type AiPrivacyReport } from '@shared/privacy'
 import { useStore } from '@/store'
 import { useSession } from '@/session-store'
+import { SqlCode } from './SqlCode'
 import { Icon } from './Icons'
 import { PaneHeader, type DragHandleProps } from './PaneLayout'
+import { ExchangeInspector } from './ExchangeInspector'
 import { errorMessage } from '@/lib/util'
 
 type Step = AiProgressEvent & { endedAt?: number }
@@ -15,17 +18,52 @@ type MenuModel = CatalogModel & { connectionId?: string; connectionName?: string
 
 export type ChatMessage =
   | { id: string; role: 'user'; text: string; ts: number }
-  | { id: string; role: 'assistant'; question: string; ts: number; status: 'working' | 'done'; steps: Step[]; result?: AiResult; error?: string; stepsOpen?: boolean; endedAt?: number }
+  | {
+      id: string
+      role: 'assistant'
+      question: string
+      ts: number
+      status: 'working' | 'done'
+      steps: Step[]
+      result?: AiResult
+      error?: string
+      stepsOpen?: boolean
+      endedAt?: number
+      /** The ask behind this answer, for "What was sent". Not kept across relaunches: that record lives in memory. */
+      requestId?: string
+    }
 
 /** Conversation state lives in the query tab so the pane can be moved or hidden without losing it. */
 export interface ChatState {
   messages: ChatMessage[]
   input: string
   requestId: string | null
+  /** Scopes Local AI Privacy's placeholders to this chat. New for every chat and after a relaunch; never saved. */
+  conversationId: string
 }
 
 export function emptyChat(): ChatState {
-  return { messages: [], input: '', requestId: null }
+  return { messages: [], input: '', requestId: null, conversationId: crypto.randomUUID() }
+}
+
+/** "3 values protected", with the kinds in the tooltip; opens what was sent. Nothing when the answer was not protected. */
+function privacyChip(p: AiPrivacyReport | undefined, onOpen?: () => void): ReactNode {
+  if (!p?.protected) return null
+  const n = Object.values(p.counts).reduce((sum, c) => sum + (c ?? 0), 0)
+  const title = [
+    n ? `Replaced with placeholders before sending: ${describeCounts(p.counts, 8)}.` : 'Nothing sensitive was found in what was sent.',
+    `Checked again before each of ${p.requests} request${p.requests === 1 ? '' : 's'} to ${p.host}.`,
+    p.restoration.restored ? `${p.restoration.restored} placeholder${p.restoration.restored === 1 ? '' : 's'} in the answer restored on this computer.` : '',
+    p.policy ? `Policy: ${p.policy.id} v${p.policy.version}.` : '',
+    onOpen ? 'Click to see exactly what was sent.' : ''
+  ]
+    .filter(Boolean)
+    .join(' ')
+  return (
+    <button type="button" className="ask-chip privacy" title={title} onClick={onOpen} disabled={!onOpen} data-testid="ask-privacy">
+      <Icon name="shield" size={11} /> {n ? `${n} protected` : 'checked'}
+    </button>
+  )
 }
 
 export interface AskPanelProps {
@@ -54,6 +92,7 @@ export function AskPanel({ sessionId, chat, setChat, handle, onSql, running, onC
   const settings = useStore((s) => s.settings)
   const setSettingsOpen = useStore((s) => s.setSettingsOpen)
   const setStatus = useSession((s) => s.setStatus)
+  const dialect = useSession((s) => s.session?.kind) ?? 'sqlite'
   const toast = useStore((s) => s.toast)
 
   const listRef = useRef<HTMLDivElement>(null)
@@ -69,6 +108,8 @@ export function AskPanel({ sessionId, chat, setChat, handle, onSql, running, onC
   const [menuStyle, setMenuStyle] = useState<CSSProperties | null>(null)
   /** A model that needs a provider set up first, with the message shown above the input. */
   const [notice, setNotice] = useState<{ model: MenuModel; text: string } | null>(null)
+  /** The ask whose exchange with the provider is open for inspection. */
+  const [inspecting, setInspecting] = useState<string | null>(null)
   const { messages, input } = chat
 
   const asking = messages.some((m) => m.role === 'assistant' && m.status === 'working')
@@ -88,7 +129,8 @@ export function AskPanel({ sessionId, chat, setChat, handle, onSql, running, onC
             if (m.role !== 'assistant' || m.status !== 'working') return m
             const i = m.steps.findIndex((s) => s.stepId === e.stepId)
             const steps = m.steps.slice()
-            if (i < 0) steps.push(e)
+            // A step that arrives finished (a note such as "Protected more values") took no time of its own.
+            if (i < 0) steps.push(e.status === 'running' ? e : { ...e, endedAt: e.ts })
             else steps[i] = { ...steps[i], ...e, ts: steps[i].ts, endedAt: e.status === 'running' ? undefined : e.ts }
             return { ...m, steps }
           })
@@ -103,6 +145,10 @@ export function AskPanel({ sessionId, chat, setChat, handle, onSql, running, onC
     const t = setInterval(() => tick((n) => n + 1), 500)
     return () => clearInterval(t)
   }, [asking])
+
+  // A chat's placeholders stay in memory only while the chat is in use: forget them on reset or when the pane goes.
+  const conversationId = chat.conversationId
+  useEffect(() => () => void window.api.ai.forget(conversationId), [conversationId])
 
   // Follow the conversation.
   useEffect(() => {
@@ -251,8 +297,10 @@ export function AskPanel({ sessionId, chat, setChat, handle, onSql, running, onC
     const turns: AiTurn[] = []
     for (const m of messages) {
       if (m.role !== 'assistant' || m.status !== 'done' || !m.result) continue
-      if (m.result.kind === 'query') turns.push({ question: m.question, sql: m.result.sql })
-      else if (m.result.kind === 'clarify') turns.push({ question: m.question, answer: m.result.message })
+      // The sealed turn is the exchange as the model saw it; the main process replays it instead of raw values.
+      const sealed = m.result.kind === 'cancelled' ? undefined : m.result.privacy?.sealed
+      if (m.result.kind === 'query') turns.push({ question: m.question, sql: m.result.sql, ...(sealed ? { sealed } : {}) })
+      else if (m.result.kind === 'clarify') turns.push({ question: m.question, answer: m.result.message, ...(sealed ? { sealed } : {}) })
     }
     return turns.slice(-6)
   }, [messages])
@@ -268,9 +316,10 @@ export function AskPanel({ sessionId, chat, setChat, handle, onSql, running, onC
     const requestId = crypto.randomUUID()
     const assistantId = crypto.randomUUID()
     setChat((c) => ({
+      ...c,
       requestId,
       input: '',
-      messages: [...c.messages, { id: crypto.randomUUID(), role: 'user', text: question, ts: Date.now() }, { id: assistantId, role: 'assistant', question, ts: Date.now(), status: 'working', steps: [] }]
+      messages: [...c.messages, { id: crypto.randomUUID(), role: 'user', text: question, ts: Date.now() }, { id: assistantId, role: 'assistant', question, ts: Date.now(), status: 'working', steps: [], requestId }]
     }))
     const finish = (patch: Partial<Extract<ChatMessage, { role: 'assistant' }>>) =>
       setChat((c) => ({
@@ -279,7 +328,7 @@ export function AskPanel({ sessionId, chat, setChat, handle, onSql, running, onC
         messages: c.messages.map((m) => (m.id === assistantId && m.role === 'assistant' ? { ...m, ...patch, status: 'done', endedAt: Date.now() } : m))
       }))
     try {
-      const res = await window.api.ai.ask(sessionId, question, history, requestId)
+      const res = await window.api.ai.ask(sessionId, question, history, requestId, chat.conversationId)
       finish({ result: res })
       if (res.kind === 'query') {
         const u = res.usage
@@ -297,6 +346,8 @@ export function AskPanel({ sessionId, chat, setChat, handle, onSql, running, onC
 
   const clear = () => {
     if (asking) cancel()
+    // A reset chat forgets its placeholders and what its answers sent.
+    void window.api.ai.forget(chat.conversationId, { transcripts: true })
     setChat(() => emptyChat())
   }
 
@@ -317,7 +368,7 @@ export function AskPanel({ sessionId, chat, setChat, handle, onSql, running, onC
             <span className="ask-step-message">{s.message}</span>
             {s.detail ? <span className="ask-step-detail">{s.detail}</span> : null}
           </span>
-          <span className="ask-step-time">{formatMs((s.endedAt ?? Date.now()) - s.ts)}</span>
+          {s.endedAt === undefined || s.endedAt > s.ts ? <span className="ask-step-time">{formatMs((s.endedAt ?? Date.now()) - s.ts)}</span> : null}
         </div>
       ))}
     </div>
@@ -350,11 +401,22 @@ export function AskPanel({ sessionId, chat, setChat, handle, onSql, running, onC
       )
     }
     const summary = m.steps.length ? `${m.steps.length} step${m.steps.length === 1 ? '' : 's'} · ${formatMs((m.endedAt ?? m.ts) - m.ts)}` : ''
-    const stepsToggle = summary ? (
-      <button className="ask-activity-summary" onClick={() => toggleSteps(m.id)} title="What happened while the answer was built">
-        <Icon name={m.stepsOpen ? 'chevron-down' : 'chevron-right'} size={11} /> {summary}
-      </button>
-    ) : null
+    const inspect = m.requestId ? () => setInspecting(m.requestId!) : undefined
+    const stepsToggle =
+      summary || inspect ? (
+        <div className="ask-activity-row">
+          {summary ? (
+            <button className="ask-activity-summary" onClick={() => toggleSteps(m.id)} title="What happened while the answer was built">
+              <Icon name={m.stepsOpen ? 'chevron-down' : 'chevron-right'} size={11} /> {summary}
+            </button>
+          ) : null}
+          {inspect ? (
+            <button className="ask-activity-summary" onClick={inspect} title="Exactly what was sent to the model and what came back" data-testid="ask-what-was-sent">
+              <Icon name="shield" size={11} /> What was sent
+            </button>
+          ) : null}
+        </div>
+      ) : null
     let body: ReactNode
     if (m.error) body = <div className="chat-text error">{m.error}</div>
     else if (!m.result || m.result.kind === 'cancelled') body = <div className="chat-text muted">Cancelled.</div>
@@ -369,17 +431,23 @@ export function AskPanel({ sessionId, chat, setChat, handle, onSql, running, onC
       const r = m.result
       body = (
         <>
-          <span className={`ask-badge ${r.checks.explained ? 'ok' : 'warn'}`} title="Read-only was enforced by the database and the query plan was checked before running">
-            {r.checks.explained ? 'verified read-only' : 'read-only'}
-            {r.checks.repairs ? ` · fixed ${r.checks.repairs}×` : ''}
-            {r.autoRun ? ' · ran automatically' : ''}
-          </span>
+          <div className="ask-badges">
+            <span className={`ask-badge ${r.checks.explained ? 'ok' : 'warn'}`} title="Read-only was enforced by the database and the query plan was checked before running">
+              {r.checks.explained ? 'verified read-only' : 'read-only'}
+              {r.checks.repairs ? ` · fixed ${r.checks.repairs}×` : ''}
+              {r.autoRun ? ' · ran automatically' : ''}
+            </span>
+            {privacyChip(r.privacy, m.requestId ? () => setInspecting(m.requestId!) : undefined)}
+          </div>
           <div className="chat-text">{r.explanation}</div>
-          <pre className="chat-sql" title="The query placed in the editor">
-            {r.sql}
-          </pre>
-          {r.tablesUsed.length || r.assumptions.length ? (
+          <SqlCode sql={r.sql} dialect={dialect} className="chat-sql" title="The query placed in the editor" />
+          {r.tablesUsed.length || r.assumptions.length || r.warnings?.length ? (
             <div className="chat-chips">
+              {r.warnings?.map((w) => (
+                <span key={w} className="ask-chip warn" title={w} data-testid="ask-warning">
+                  {w}
+                </span>
+              ))}
               {r.tablesUsed.map((t) => (
                 <span key={t} className="ask-chip">
                   <strong>{t}</strong>
@@ -457,6 +525,7 @@ export function AskPanel({ sessionId, chat, setChat, handle, onSql, running, onC
           )
         )}
       </div>
+      {inspecting ? <ExchangeInspector requestId={inspecting} onClose={() => setInspecting(null)} /> : null}
       {notice ? (
         <div className="chat-notice" data-testid="model-notice">
           <span>{notice.text}</span>

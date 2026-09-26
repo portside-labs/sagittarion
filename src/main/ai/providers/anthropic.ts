@@ -11,6 +11,7 @@ import {
   type ProviderConfig,
   type ToolCall
 } from './types'
+import type { OutboundRequest } from '../../privacy/boundary'
 
 const VERSION = '2023-06-01'
 
@@ -53,7 +54,7 @@ export class AnthropicProvider implements LlmProvider {
     return { 'content-type': 'application/json', 'anthropic-version': VERSION, 'x-api-key': this.cfg.apiKey ?? '' }
   }
 
-  async complete(req: ChatRequest, signal?: AbortSignal): Promise<ChatResponse> {
+  async complete(req: OutboundRequest, signal?: AbortSignal): Promise<ChatResponse> {
     if (!this.model) throw new ProviderError('No model is configured. Pick one in Settings.', 'bad_request')
     const body: Record<string, unknown> = {
       model: this.model,

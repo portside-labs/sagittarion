@@ -4,6 +4,7 @@ import type { AiSettings, ProviderId } from '@shared/ai'
 import { describeTarget, resolveSshProfile } from '@shared/connections'
 import { errorMessage } from './lib/util'
 import { defaultLayout, isValidLayout, type LayoutNode } from './lib/layout'
+import { clusterTabs, groupByConnection, nearestTab, settleCollapsed } from './lib/tab-groups'
 import { createSessionStore, snapshotSession, type SessionStore } from './session-store'
 import { ACCEPT_KEY_OPTIONS, type KeywordCase } from './lib/sql-complete'
 
@@ -43,7 +44,6 @@ export interface OpenTab {
   connectionId: string
   name: string
   kind: DatabaseKind
-  color?: string
   target: string
   status: OpenTabStatus
   session: SessionInfo | null
@@ -53,11 +53,18 @@ export interface OpenTab {
   progressId?: string
   /** Tabs to bring back once the connection is made. */
   restore?: WorkspaceConnection
+  /**
+   * A live tab whose link to the database dropped by itself, as idle connections do: it stays as it is, and the next
+   * call that needs the database reconnects. Unset while the link is up.
+   */
+  link?: 'down' | 'reconnecting'
+  /** Why the link is down, or the reconnect's latest step. */
+  linkMessage?: string
 }
 
 export interface Toast {
   id: number
-  kind: 'info' | 'success' | 'error'
+  kind: 'info' | 'success' | 'warn' | 'error'
   message: string
   detail?: string
   /** Set while the exit animation plays. */
@@ -81,9 +88,11 @@ interface State {
   sshProfiles: SshProfile[]
   /** True once the profile list has been read, so a connection's profile can be checked against it. */
   sshProfilesLoaded: boolean
-  /** Connection tabs in order. A live one has a session store of its own; see getSessionStore. */
+  /** Connection tabs in order, each group's tabs side by side. A live one has a session store of its own; see getSessionStore. */
   tabs: OpenTab[]
   activeConnectionId: string | null
+  /** Tab groups folded up to their label, by group name; kept with the workspace. */
+  collapsedTabGroups: string[]
   /** Show the connect screen although connections are open: the "+" tab. */
   showConnect: boolean
   /** A saved connection the connect screen should open on next, e.g. after "Edit connection" on a failed tab. */
@@ -115,6 +124,10 @@ interface State {
   connectTab(connectionId: string): Promise<void>
   /** Disconnects a live tab, or just drops one that never connected. */
   closeTab(connectionId: string): Promise<void>
+  /** Puts the tabs in the given order, as dragged; the order is kept with the workspace. */
+  reorderTabs(connectionIds: string[]): void
+  /** Folds a tab group up to its label, or opens it again. The tab in front leaves a group as it folds, as in a browser. */
+  toggleTabGroup(name: string): void
   /** Called once a live session is closed; the tab goes away. */
   removeSession(sessionId: string): Promise<void>
   removeTab(connectionId: string): Promise<void>
@@ -123,12 +136,21 @@ interface State {
   setConnectSelect(id: string | null): void
   /** Tabs from the previous launch: the one in front reconnects now, the others when opened. */
   restoreWorkspace(state: WorkspaceState): void
-  toast(kind: Toast['kind'], message: string, detail?: string): void
+  /** Shows a toast for a while; returns its id. */
+  toast(kind: Toast['kind'], message: string, detail?: string): number
   dismissToast(id: number): void
 }
 
 let initialized = false
 let toastSeq = 0
+/** The "disconnected" toast showing for a session, taken down once it reconnects. */
+const linkToasts = new Map<string, number>()
+
+/** Text as a sentence of its own, ending in a full stop. */
+function sentence(text: string): string {
+  const t = text.trim()
+  return /[.!?…]$/.test(t) ? t : `${t}.`
+}
 
 const LAYOUT_KEY = 'queryLayout.v2'
 const UI_KEY = 'uiPrefs.v1'
@@ -167,8 +189,8 @@ export function getSessionStore(sessionId: string): SessionStore | undefined {
   return sessionStores.get(sessionId)
 }
 
-function tabFromConfig(cfg: ConnectionConfig, profiles: SshProfile[]): Pick<OpenTab, 'connectionId' | 'name' | 'kind' | 'color' | 'target'> {
-  return { connectionId: cfg.id, name: cfg.name, kind: cfg.kind, color: cfg.color, target: describeTarget(resolveSshProfile(cfg, profiles)) }
+function tabFromConfig(cfg: ConnectionConfig, profiles: SshProfile[]): Pick<OpenTab, 'connectionId' | 'name' | 'kind' | 'target'> {
+  return { connectionId: cfg.id, name: cfg.name, kind: cfg.kind, target: describeTarget(resolveSshProfile(cfg, profiles)) }
 }
 
 export const useStore = create<State>()((set, get) => {
@@ -182,6 +204,7 @@ export const useStore = create<State>()((set, get) => {
     sshProfilesLoaded: false,
     tabs: [],
     activeConnectionId: null,
+    collapsedTabGroups: [],
     showConnect: false,
     connectSelect: null,
     ui: loadUiPrefs(),
@@ -258,11 +281,31 @@ export const useStore = create<State>()((set, get) => {
       // Profiles and connections arrive together: a connection's profile is checked against the list on select.
       await Promise.all([get().loadSshProfiles(), get().loadConnections()])
       await get().loadSettings()
-      window.api.session.onClosed((e) => {
-        const gone = get().tabs.find((t) => t.session?.sessionId === e.sessionId)
-        if (!gone) return
-        get().toast('error', `${gone.name} was disconnected`, e.reason)
-        void get().removeSession(e.sessionId)
+      // A connection whose link drops by itself stays open where it is; the next call that needs the database reconnects.
+      window.api.session.onLink((e) => {
+        const tab = get().tabs.find((t) => t.session?.sessionId === e.sessionId)
+        if (!tab) return
+        const store = sessionStores.get(e.sessionId)
+        const shown = linkToasts.get(e.sessionId)
+        if (shown !== undefined) {
+          linkToasts.delete(e.sessionId)
+          get().dismissToast(shown)
+        }
+        if (e.state === 'dropped') {
+          // A transaction left open went with the link.
+          const rolledBack = store?.getState().inTransaction ?? false
+          store?.getState().setInTransaction(false)
+          patchTab(tab.connectionId, { link: 'down', linkMessage: e.reason })
+          const detail = `${sentence(e.reason)}${rolledBack ? ' Its open transaction was rolled back.' : ''} It reconnects the next time it is needed.`
+          linkToasts.set(e.sessionId, get().toast('warn', `${tab.name} disconnected`, detail))
+        } else if (e.state === 'reconnecting') {
+          patchTab(tab.connectionId, { link: 'reconnecting', linkMessage: e.message })
+        } else if (e.state === 'reconnect-failed') {
+          patchTab(tab.connectionId, { link: 'down', linkMessage: e.reason })
+        } else {
+          store?.getState().setSession(e.info)
+          patchTab(tab.connectionId, { link: undefined, linkMessage: undefined, session: e.info })
+        }
       })
       window.api.session.onProgress((e) => {
         if (!e.requestId) return
@@ -281,7 +324,10 @@ export const useStore = create<State>()((set, get) => {
     async loadConnections() {
       try {
         const [connections, groupStyles] = await Promise.all([window.api.connections.list(), window.api.connections.groupStyles()])
-        set({ connections, groupStyles })
+        // A connection may have changed group, and its tab moves to its new group's tabs.
+        const groupOf = groupByConnection(connections)
+        const { tabs, collapsedTabGroups, activeConnectionId, showConnect } = get()
+        set({ connections, groupStyles, tabs: clusterTabs(tabs, groupOf), collapsedTabGroups: settleCollapsed(collapsedTabGroups, tabs, groupOf, showConnect ? null : activeConnectionId) })
       } catch (e) {
         get().toast('error', 'Could not load saved connections', errorMessage(e))
       }
@@ -307,20 +353,24 @@ export const useStore = create<State>()((set, get) => {
       )
       sessionStores.set(info.sessionId, store)
       watchSessionStore(store)
-      const live: OpenTab = { connectionId: info.connectionId, name: info.name, kind: info.kind, color: info.color, target: info.target, status: 'live', session: info }
-      const tabs = get().tabs
+      const live: OpenTab = { connectionId: info.connectionId, name: info.name, kind: info.kind, target: info.target, status: 'live', session: info }
+      const { tabs, collapsedTabGroups } = get()
+      const groupOf = groupByConnection(get().connections)
       const idx = tabs.findIndex((t) => t.connectionId === info.connectionId)
       set({
-        tabs: idx >= 0 ? tabs.map((t, i) => (i === idx ? live : t)) : [...tabs, live],
-        ...(activate ? { activeConnectionId: info.connectionId, showConnect: false } : {})
+        // A new tab joins the end of its group's tabs, or of the strip.
+        tabs: idx >= 0 ? tabs.map((t, i) => (i === idx ? live : t)) : clusterTabs([...tabs, live], groupOf),
+        ...(activate ? { activeConnectionId: info.connectionId, showConnect: false, collapsedTabGroups: settleCollapsed(collapsedTabGroups, [...tabs, live], groupOf, info.connectionId) } : {})
       })
       void store.getState().refreshSchema()
     },
 
     activateTab(connectionId) {
-      const tab = get().tabs.find((t) => t.connectionId === connectionId)
+      const { tabs, connections, collapsedTabGroups } = get()
+      const tab = tabs.find((t) => t.connectionId === connectionId)
       if (!tab) return
-      set({ activeConnectionId: connectionId, showConnect: false })
+      // Brought to the front from a collapsed group, the tab opens its group.
+      set({ activeConnectionId: connectionId, showConnect: false, collapsedTabGroups: settleCollapsed(collapsedTabGroups, tabs, groupByConnection(connections), connectionId) })
       if (tab.status === 'pending' || tab.status === 'error') void get().connectTab(connectionId)
     },
 
@@ -364,23 +414,60 @@ export const useStore = create<State>()((set, get) => {
       await get().removeTab(connectionId)
     },
 
+    reorderTabs(connectionIds) {
+      const { tabs, connections } = get()
+      const byId = new Map(tabs.map((t) => [t.connectionId, t]))
+      const next = connectionIds.flatMap((id) => byId.get(id) ?? [])
+      if (next.length !== tabs.length || new Set(next).size !== tabs.length) return
+      set({ tabs: clusterTabs(next, groupByConnection(connections)) })
+    },
+
+    toggleTabGroup(name) {
+      const { tabs, connections, collapsedTabGroups, activeConnectionId, showConnect } = get()
+      if (collapsedTabGroups.includes(name)) return set({ collapsedTabGroups: collapsedTabGroups.filter((n) => n !== name) })
+      const groupOf = groupByConnection(connections)
+      const members = tabs.flatMap((t, i) => (groupOf.get(t.connectionId) === name ? [i] : []))
+      if (!members.length) return
+      const collapsed = [...collapsedTabGroups, name]
+      set({ collapsedTabGroups: collapsed })
+      if (showConnect || !activeConnectionId || groupOf.get(activeConnectionId) !== name) return
+      // The tab in front does not fold away with its group: the nearest tab in sight takes over, or with none left, the
+      // connect screen, where a browser would open a new tab.
+      const inSight = nearestTab(tabs, members[members.length - 1] + 1, members[0] - 1, (t) => !collapsed.includes(groupOf.get(t.connectionId) ?? ''))
+      if (inSight) get().activateTab(inSight.connectionId)
+      else get().showConnectScreen()
+    },
+
     async removeSession(sessionId) {
       sessionStores.get(sessionId)?.getState().markClosed()
       sessionStores.delete(sessionId)
+      linkToasts.delete(sessionId)
       const tab = get().tabs.find((t) => t.session?.sessionId === sessionId)
       if (tab) await get().removeTab(tab.connectionId)
     },
 
     async removeTab(connectionId) {
-      const { tabs, activeConnectionId } = get()
+      const { tabs, activeConnectionId, connections, collapsedTabGroups } = get()
       const idx = tabs.findIndex((t) => t.connectionId === connectionId)
       if (idx < 0) return
       const next = tabs.filter((t) => t.connectionId !== connectionId)
+      const groupOf = groupByConnection(connections)
       let active = activeConnectionId
-      if (active === connectionId) active = next[Math.min(idx, next.length - 1)]?.connectionId ?? null
+      // The nearest tab in sight takes the front; with only collapsed groups left, the connect screen does.
+      let onlyCollapsed = false
+      if (active === connectionId) {
+        active = nearestTab(next, idx, idx - 1, (t) => !collapsedTabGroups.includes(groupOf.get(t.connectionId) ?? ''))?.connectionId ?? null
+        onlyCollapsed = !active && next.length > 0
+      }
       // With nothing left open, the connect screen appears; refresh the list first so it opens on the most recent connection.
       if (!next.length) await get().loadConnections()
-      set({ tabs: next, activeConnectionId: active, showConnect: next.length ? get().showConnect : false })
+      const showConnect = next.length ? onlyCollapsed || get().showConnect : false
+      set({
+        tabs: next,
+        activeConnectionId: active,
+        showConnect,
+        collapsedTabGroups: settleCollapsed(get().collapsedTabGroups, next, groupOf, showConnect ? null : active)
+      })
       // A neighbour that never connected does so now that it is in front.
       if (active && active !== activeConnectionId && !get().showConnect) {
         const neighbour = next.find((t) => t.connectionId === active)
@@ -405,15 +492,24 @@ export const useStore = create<State>()((set, get) => {
         tabs.push({ ...tabFromConfig(cfg, sshProfiles), status: 'pending', session: null, restore: saved })
       }
       if (!tabs.length) return
-      const active = tabs.some((t) => t.connectionId === state.activeConnectionId) ? state.activeConnectionId : tabs[0].connectionId
-      set({ tabs, activeConnectionId: active, showConnect: Boolean(state.showConnect) })
+      const groupOf = groupByConnection(connections)
+      const ordered = clusterTabs(tabs, groupOf)
+      const active = ordered.some((t) => t.connectionId === state.activeConnectionId) ? state.activeConnectionId : ordered[0].connectionId
+      const saved = Array.isArray(state.collapsedGroups) ? state.collapsedGroups.filter((n): n is string => typeof n === 'string') : []
+      set({
+        tabs: ordered,
+        activeConnectionId: active,
+        showConnect: Boolean(state.showConnect),
+        collapsedTabGroups: settleCollapsed(saved, ordered, groupOf, state.showConnect ? null : active)
+      })
       if (!state.showConnect && active) void get().connectTab(active)
     },
 
     toast(kind, message, detail) {
       const id = ++toastSeq
       set({ toasts: [...get().toasts, { id, kind, message, detail }] })
-      setTimeout(() => get().dismissToast(id), kind === 'error' ? 12_000 : 4_500)
+      setTimeout(() => get().dismissToast(id), kind === 'error' || kind === 'warn' ? 12_000 : 4_500)
+      return id
     },
 
     dismissToast(id) {
@@ -435,11 +531,12 @@ let lastSaved = ''
 
 /** Everything worth bringing back next time: the tabs, and for live ones their query tabs as they stand. */
 export function snapshotWorkspace(): WorkspaceState {
-  const { tabs, activeConnectionId, showConnect } = useStore.getState()
+  const { tabs, activeConnectionId, showConnect, collapsedTabGroups } = useStore.getState()
   return {
     version: 1,
     activeConnectionId,
     showConnect,
+    collapsedGroups: collapsedTabGroups,
     connections: tabs.map((t) => {
       const store = t.session ? sessionStores.get(t.session.sessionId) : undefined
       return store ? snapshotSession(store.getState()) : (t.restore ?? { connectionId: t.connectionId, activeTabId: null, queryCounter: 0, tabs: [] })
@@ -478,7 +575,7 @@ function startPersistence(): void {
   if (persistenceOn) return
   persistenceOn = true
   useStore.subscribe((next, prev) => {
-    if (next.tabs !== prev.tabs || next.activeConnectionId !== prev.activeConnectionId || next.showConnect !== prev.showConnect) schedulePersist()
+    if (next.tabs !== prev.tabs || next.activeConnectionId !== prev.activeConnectionId || next.showConnect !== prev.showConnect || next.collapsedTabGroups !== prev.collapsedTabGroups) schedulePersist()
   })
   // The window is closing: write whatever the debounce has not written yet, synchronously on the other side.
   window.addEventListener('beforeunload', () => {

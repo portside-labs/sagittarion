@@ -119,6 +119,8 @@ export class Session extends AgentSession {
 
   async connect(): Promise<void> {
     const cfg = await this.buildConnectConfig()
+    // Closed meanwhile, as when a connection closes during a reconnect.
+    if (this.closed) throw new Error('The connection was closed.')
     this.progress('connecting', `Connecting to ${this.ssh.host}:${this.ssh.port}…`)
     await new Promise<void>((resolve, reject) => {
       let settled = false

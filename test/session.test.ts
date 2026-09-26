@@ -14,6 +14,8 @@ import { toCsv, toSqlInserts } from '../src/shared/export'
 import { ConnectionManager } from '../src/main/connections/manager'
 import { migrateStored, noopCodec } from '../src/main/store/connections'
 import type { RowsResult, SshConfig } from '../src/shared/types'
+import type { SessionLinkEvent } from '../src/shared/api'
+import type { ChildProcess } from 'node:child_process'
 
 const root = path.resolve(__dirname, '..')
 const agentSource = fs.readFileSync(path.join(root, 'src/main/agent/sqlite_agent.py'), 'utf8')
@@ -43,6 +45,15 @@ function baseConfig(overrides: Partial<SshConfig> = {}): SshConfig {
 
 function makeSession(ssh: SshConfig, verify: (key: Buffer) => Promise<boolean> = async () => true): Session {
   return new Session(ssh, { agentSource, verifyHostKey: verify })
+}
+
+/** Resolves once `cond` holds, polling. */
+async function until(cond: () => boolean, timeoutMs = 10_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs
+  while (!cond()) {
+    if (Date.now() > deadline) throw new Error('Timed out waiting')
+    await new Promise((r) => setTimeout(r, 20))
+  }
 }
 
 beforeAll(async () => {
@@ -348,9 +359,9 @@ describe('ConnectionManager', () => {
     expect(info.db?.label).toBe(db)
     expect(info.interpreter).toMatch(/python/)
     expect(conn.ssh).toBeNull()
-    const catalog = await manager.driver(conn.id).catalog()
+    const catalog = await (await manager.driver(conn.id)).catalog()
     expect(catalog.totalTables).toBe(6)
-    expect((await manager.fileSession(conn.id).readdir(path.dirname(db))).entries.length).toBeGreaterThan(0)
+    expect((await manager.readFiles(conn.id, (s) => s.readdir(path.dirname(db)))).entries.length).toBeGreaterThan(0)
     await manager.close(conn.id)
     await expect(manager.open({ id: 'l2', name: 'Local', kind: 'sqlite', remote: false, ssh: { host: '', port: 22, username: '', auth: 'key' }, remotePath: '' })).rejects.toThrow(/No database file chosen/)
   })
@@ -369,15 +380,15 @@ describe('ConnectionManager', () => {
   it('opens a SQLite connection end to end and reports it', async () => {
     const db = freshDb('m.db')
     const manager = new ConnectionManager({ agentSource, verifyHostKey: async () => true })
-    const closed: string[] = []
-    manager.on('closed', (e: { reason: string }) => closed.push(e.reason))
+    const events: SessionLinkEvent[] = []
+    manager.on('link', (e: SessionLinkEvent) => events.push(e))
     const conn = await manager.open({ id: 'c1', name: 'Mock', kind: 'sqlite', ssh: baseConfig(), remotePath: db })
     const info = manager.info(conn)
     expect(info.kind).toBe('sqlite')
     expect(info.target).toBe(`test@127.0.0.1:${server.port}`)
     expect(info.db?.label).toBe(db)
     expect(info.db?.serverVersion).toMatch(/^SQLite 3\./)
-    const driver = manager.driver(conn.id)
+    const driver = await manager.driver(conn.id)
     const schema = await driver.schema()
     const catalog = await driver.catalog()
     expect(catalog).toMatchObject({ kind: 'sqlite', totalTables: 6 })
@@ -392,12 +403,121 @@ describe('ConnectionManager', () => {
     expect(await driver.relationsFor([{ name: 'users' }])).toEqual([{ table: 'orders', column: 'user_id', refTable: 'users', refColumn: 'id' }])
     expect(schema.kind).toBe('sqlite')
     expect(schema.tables.map((t) => t.name)).toContain('users')
-    const details = await manager.driver(conn.id).tableDetails({ name: 'orders' })
+    const details = await manager.read(conn.id, (d) => d.tableDetails({ name: 'orders' }))
     expect(details.foreignKeys.length).toBe(1)
     await manager.close(conn.id)
     expect(() => manager.get(conn.id)).toThrow(/no longer open/)
-    // A user-initiated close does not fire the closed event.
-    expect(closed).toEqual([])
+    await expect(manager.read(conn.id, (d) => d.catalog())).rejects.toThrow(/no longer open/)
+    // Closing it is not the link dropping.
+    expect(events).toEqual([])
+  })
+
+  it('keeps a connection whose link drops, and reconnects it on the next call', async () => {
+    const db = freshDb('drop.db')
+    const manager = new ConnectionManager({ agentSource, verifyHostKey: async () => true })
+    const events: SessionLinkEvent[] = []
+    manager.on('link', (e: SessionLinkEvent) => events.push(e))
+    const conn = await manager.open({ id: 'd1', name: 'Mock', kind: 'sqlite', ssh: baseConfig(), remotePath: db })
+    expect((await manager.read(conn.id, (d) => d.catalog())).totalTables).toBe(6)
+    // The server ends the connection, as it does an idle one.
+    server.dropClients()
+    await until(() => events.length > 0)
+    expect(events).toEqual([{ sessionId: conn.id, state: 'dropped', reason: 'Connection closed by the remote host' }])
+    expect(manager.get(conn.id)).toBe(conn)
+    expect(conn.driver).toBeNull()
+    // Nothing is running on a dropped link, so there is nothing to cancel, and cancelling does not reconnect.
+    await manager.cancel(conn.id)
+    expect(events).toHaveLength(1)
+    // The calls that need the database next share one reconnect, and the session stays the same.
+    const [catalog, count] = await Promise.all([
+      manager.read(conn.id, (d) => d.catalog()),
+      manager.read(conn.id, (d) => d.query('SELECT count(*) FROM users'))
+    ])
+    expect(catalog.totalTables).toBe(6)
+    expect((count.results[0] as RowsResult).rows[0][0]).toBe(60)
+    const states = events.map((e) => e.state)
+    expect(states[0]).toBe('dropped')
+    expect(states.slice(1, -1).every((s) => s === 'reconnecting')).toBe(true)
+    expect(states[states.length - 1]).toBe('reconnected')
+    expect(events[events.length - 1]).toMatchObject({ sessionId: conn.id, info: { sessionId: conn.id, db: { label: db } } })
+    // Writes go through the new link as well.
+    const write = await (await manager.driver(conn.id)).query("INSERT INTO settings (key, value) VALUES ('after-drop', '1')")
+    expect(write.results[0].kind).toBe('exec')
+    await manager.close(conn.id)
+  })
+
+  it('runs a read again when the link drops under it, but never a statement that may write', async () => {
+    const db = freshDb('drop-read.db')
+    const manager = new ConnectionManager({ agentSource, verifyHostKey: async () => true })
+    const conn = await manager.open({ id: 'd2', name: 'Mock', kind: 'sqlite', ssh: baseConfig(), remotePath: db })
+    // Long enough that the link is gone before any answer comes back.
+    const slow = 'WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM c WHERE n < 5000000) SELECT count(*) FROM c'
+    let reads = 0
+    const catalog = await manager.read(conn.id, async (d) => {
+      if (++reads === 1) {
+        const pending = d.query(slow, [], 1, { readOnly: true })
+        server.dropClients()
+        await pending
+      }
+      return d.catalog()
+    })
+    expect(reads).toBe(2)
+    expect(catalog.totalTables).toBe(6)
+    // Through `driver`, a statement the drop interrupts fails instead, and the next call reconnects.
+    const driver = await manager.driver(conn.id)
+    const pending = driver.query(slow)
+    server.dropClients()
+    await expect(pending).rejects.toThrow(/helper exited/)
+    const count = await manager.read(conn.id, (d) => d.query('SELECT count(*) FROM users'))
+    expect((count.results[0] as RowsResult).rows[0][0]).toBe(60)
+    await manager.close(conn.id)
+  })
+
+  it('reconnects a local file when its helper process dies', async () => {
+    const db = freshDb('local-drop.db')
+    const manager = new ConnectionManager({ agentSource, verifyHostKey: async () => true })
+    const events: SessionLinkEvent[] = []
+    manager.on('link', (e: SessionLinkEvent) => events.push(e))
+    const conn = await manager.open({ id: 'd3', name: 'Local', kind: 'sqlite', remote: false, ssh: { host: '', port: 22, username: '', auth: 'key' }, remotePath: db })
+    ;(conn.session as unknown as { child: ChildProcess }).child.kill('SIGKILL')
+    await until(() => events.length > 0)
+    expect(events[0]).toMatchObject({ sessionId: conn.id, state: 'dropped', reason: expect.stringMatching(/helper process exited/) })
+    expect((await manager.read(conn.id, (d) => d.catalog())).totalTables).toBe(6)
+    expect(events[events.length - 1]).toMatchObject({ state: 'reconnected', info: { db: { label: db } } })
+    await manager.close(conn.id)
+  })
+
+  it('leaves the link down when a reconnect fails, and tries again on the next call', async () => {
+    const hostKeyPath = path.join(tmp, 'flaky_host_key')
+    let flaky = await startMockServer({ hostKeyPath })
+    const db = freshDb('flaky.db')
+    const manager = new ConnectionManager({ agentSource, verifyHostKey: async () => true })
+    const events: SessionLinkEvent[] = []
+    manager.on('link', (e: SessionLinkEvent) => events.push(e))
+    const ssh = { ...baseConfig(), port: flaky.port }
+    const conn = await manager.open({ id: 'd4', name: 'Flaky', kind: 'sqlite', ssh, remotePath: db })
+    try {
+      // The server goes away altogether.
+      await flaky.close()
+      await until(() => events.some((e) => e.state === 'dropped'))
+      await expect(manager.read(conn.id, (d) => d.catalog())).rejects.toThrow(/Could not reconnect to Flaky: Connection refused/)
+      expect(events[events.length - 1]).toMatchObject({ state: 'reconnect-failed', reason: expect.stringMatching(/Connection refused/) })
+      expect(manager.get(conn.id).dropped).toBe(true)
+      // Back up on the same port: the next call gets through.
+      flaky = await startMockServer({ hostKeyPath, port: ssh.port })
+      expect((await manager.read(conn.id, (d) => d.catalog())).totalTables).toBe(6)
+      expect(events[events.length - 1].state).toBe('reconnected')
+      // Closed while it reconnects: the call fails, and the connection is gone.
+      flaky.dropClients()
+      await until(() => events[events.length - 1].state === 'dropped')
+      const reading = manager.read(conn.id, (d) => d.catalog())
+      await manager.close(conn.id)
+      await expect(reading).rejects.toThrow(/no longer open/)
+      expect(() => manager.get(conn.id)).toThrow(/no longer open/)
+    } finally {
+      await manager.close(conn.id)
+      await flaky.close()
+    }
   })
 
   it('forwards a local port through the SSH connection', async () => {
@@ -436,8 +556,10 @@ describe('saved connection migration', () => {
       remotePath: '/tmp/a.db',
       color: '#fff'
     })
-    expect(migrated).toMatchObject({ id: 'x', kind: 'sqlite', remotePath: '/tmp/a.db', color: '#fff', ssh: { host: 'h', port: 2222, username: 'u', auth: 'password', encryptedPassword: 'abc' } })
-    expect(migrateStored({ id: 'y', kind: 'postgres', ssh: { host: 'h' } })?.kind).toBe('postgres')
+    expect(migrated).toMatchObject({ id: 'x', kind: 'sqlite', remotePath: '/tmp/a.db', ssh: { host: 'h', port: 2222, username: 'u', auth: 'password', encryptedPassword: 'abc' } })
+    // Colours belong to groups now: one saved with a connection goes.
+    expect(migrated).not.toHaveProperty('color')
+    expect(migrateStored({ id: 'y', kind: 'postgres', ssh: { host: 'h' }, color: '#ff5f57' })).toEqual({ id: 'y', kind: 'postgres', ssh: { host: 'h' } })
     expect(migrateStored({ nonsense: true })).toBeNull()
   })
 })

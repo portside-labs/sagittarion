@@ -2,6 +2,7 @@ import { promises as fs } from 'node:fs'
 import path from 'node:path'
 import { randomUUID } from 'node:crypto'
 import { PROVIDERS, type AgentSettings, type AiConnection, type AiConnectionInput, type AiSettings, type AiSettingsUpdate, type ProviderId } from '@shared/ai'
+import { normalizePrivacy, type PrivacySettings } from '@shared/privacy'
 import type { CredentialStore } from './credentials'
 
 /** A connection as saved: the secret is a reference into the credential store. */
@@ -24,6 +25,8 @@ interface StoredAi {
   activeModel: string
   connections: StoredConnection[]
   agent: AgentSettings
+  /** Absent in files written before Local AI Privacy; read as the defaults. */
+  privacy?: PrivacySettings
 }
 
 /** The provider-centric layout written before connections existed. */
@@ -160,7 +163,8 @@ export class SettingsStore {
       connections,
       agent: { ...DEFAULT_AGENT, ...ai.agent },
       encryptionAvailable: this.credentials.available,
-      managedAccount: null
+      managedAccount: null,
+      privacy: normalizePrivacy(ai.privacy)
     }
   }
 
@@ -203,6 +207,7 @@ export class SettingsStore {
       const active = ai.connections.find((c) => c.id === ai.activeConnectionId)
       if (active) active.defaultModel = ai.activeModel
     }
+    if (u.privacy) ai.privacy = normalizePrivacy({ ...normalizePrivacy(ai.privacy), ...u.privacy })
     if (u.agent) {
       if (typeof u.agent.autoRun === 'boolean') ai.agent.autoRun = u.agent.autoRun
       if (typeof u.agent.sendSampleValues === 'boolean') ai.agent.sendSampleValues = u.agent.sendSampleValues

@@ -1,17 +1,29 @@
 // The orchestrator: schema context in, one verified read-only query out.
+//
+// The model is reached only through a ModelGateway. Under Local AI Privacy every request it builds is protected and
+// verified before it leaves; the model's answers keep their placeholders in the transcript (that is what it wrote),
+// and are restored only where they are used here: the SQL that runs, and the words shown in the chat.
 import type { DatabaseKind, QueryResponse, TableRef } from '@shared/types'
-import type { AiProgressStep, AiQueryResult, AiResult, AiTurn, AiUsage } from '@shared/ai'
+import type { AiClarification, AiProgressStep, AiQueryResult, AiResult, AiTurn, AiUsage } from '@shared/ai'
+import { describeCounts, type SealedText, type SealedTurn, type SensitiveEntityType } from '@shared/privacy'
 import { checkReadOnlySql, explainStatement } from './guard'
 import { isoDate, systemRules, TOOLS } from './prompt'
-import { parseJsonObject, ProviderError, throwIfAborted, type ChatMessage, type ChatResponse, type LlmProvider, type ToolCall } from './providers/types'
-import { estimateTokens, tokenize, type SchemaIndex } from './schema-index'
+import { parseJsonObject, ProviderError, throwIfAborted, type ChatMessage, type ChatRequest, type ChatResponse, type ToolCall } from './providers/types'
+import { estimateTokens, shortComment, tokenize, type RenderView, type SchemaIndex } from './schema-index'
 import type { EmbeddingCache } from './embeddings'
+import type { ModelGateway } from '../privacy/gateway'
+import type { OutboundRequest } from '../privacy/boundary'
+import type { SchemaTableData } from '../privacy/session'
+import type { Restored } from '../privacy/restore'
+import { PrivacyBlockedError } from '../privacy/errors'
+import { safeSlice } from '../privacy/markers'
 
 export interface AskDeps {
   kind: DatabaseKind
   serverVersion: string
   index: SchemaIndex
-  provider: LlmProvider
+  /** The way to the model: protects and verifies every request when Local AI Privacy applies to the connection. */
+  provider: ModelGateway
   settings: { sendSampleValues: boolean; autoRun: boolean; schemaBudgetTokens: number; embeddingModel?: string }
   /** Runs SQL under the database's read-only guard. */
   runQuery: (sql: string, maxRows: number) => Promise<QueryResponse>
@@ -74,6 +86,31 @@ export class Progress {
   }
 }
 
+/** What the privacy layer needs to render a table's data safely: samples and comment with their columns. */
+function tableData(index: SchemaIndex, keys: string[]): SchemaTableData[] {
+  const out: SchemaTableData[] = []
+  for (const key of keys) {
+    const t = index.tables.get(key)
+    if (!t) continue
+    out.push({
+      key,
+      table: t.ref.name,
+      comment: t.comment ? shortComment(t.comment) : null,
+      columns: (t.meta?.columns ?? []).map((c) => ({ name: c.name, type: c.type })),
+      samples: index.samples.get(key)
+    })
+  }
+  return out
+}
+
+/** A render view for these tables, or none when nothing is protected. */
+async function viewFor(deps: AskDeps, keys: string[]): Promise<RenderView | undefined> {
+  const privacy = deps.provider.privacy
+  if (!privacy) return undefined
+  privacy.useSchema(deps.index.identifiers())
+  return privacy.schemaView(tableData(deps.index, keys))
+}
+
 async function loadSamples(deps: AskDeps, keys: string[]): Promise<number> {
   const { index } = deps
   const jobs: { key: string; column: string; ref: TableRef }[] = []
@@ -113,10 +150,13 @@ async function queryVector(deps: AskDeps, question: string): Promise<number[] | 
   if (!model || !deps.provider.supportsEmbeddings) return null
   const { index, embeddingCache } = deps
   try {
+    const keys = [...index.tables.keys()]
+    const commented = keys.filter((k) => index.tables.get(k)?.comment)
+    const view = commented.length ? await viewFor(deps, commented) : undefined
     const vectors = new Map<string, number[]>()
     const missing: { key: string; text: string }[] = []
-    for (const key of index.tables.keys()) {
-      const text = index.embeddingText(key)
+    for (const key of keys) {
+      const text = index.embeddingText(key, view)
       const cached = embeddingCache ? await embeddingCache.get(model, text) : undefined
       if (cached) vectors.set(key, cached)
       else missing.push({ key, text })
@@ -125,7 +165,8 @@ async function queryVector(deps: AskDeps, question: string): Promise<number[] | 
       const batch = missing.slice(i, i + 100)
       const embedded = await deps.provider.embed(
         batch.map((b) => b.text),
-        deps.signal
+        deps.signal,
+        { role: 'structured' }
       )
       batch.forEach((b, j) => {
         const v = embedded[j]
@@ -137,10 +178,11 @@ async function queryVector(deps: AskDeps, question: string): Promise<number[] | 
     }
     if (embeddingCache) await embeddingCache.save()
     index.setEmbeddings(vectors)
-    const [q] = await deps.provider.embed([question], deps.signal)
+    const [q] = await deps.provider.embed([question], deps.signal, { role: 'prose' })
     return q && q.length ? q : null
   } catch (err) {
     if (err instanceof ProviderError && err.errorKind === 'cancelled') throw err
+    if (err instanceof PrivacyBlockedError) throw err
     return null
   }
 }
@@ -164,9 +206,17 @@ export async function askDatabase(deps: AskDeps, rawQuestion: string, history: A
   }
 }
 
+function total(counts: Partial<Record<SensitiveEntityType, number>>): number {
+  return Object.values(counts).reduce((n, c) => n + (c ?? 0), 0)
+}
+
 async function run(deps: AskDeps, question: string, history: AiTurn[], usage: AiUsage, progress: Progress): Promise<AiResult> {
   const { index, provider } = deps
+  const privacy = provider.privacy
   const fmt = new Intl.NumberFormat('en-US')
+  // Table and column names are never protected, so the model can still write SQL with them. The list grows as
+  // tables are described, so it is refreshed before each protection.
+  privacy?.useSchema(index.identifiers())
 
   // Schema context: everything when it fits, otherwise retrieve.
   const retrieving = progress.start('retrieve', 'Choosing tables for the question')
@@ -186,7 +236,9 @@ async function run(deps: AskDeps, question: string, history: AiTurn[], usage: Ai
     sampling.done(`${n} column${n === 1 ? '' : 's'} with short value lists`)
   }
   const shown = new Set(selection.keys)
-  const schemaText = index.render(selection, question)
+  // Sample values and comments are protected with their columns as context before the question is, so a value
+  // seen in the data is recognised wherever else it appears.
+  const schemaText = index.render(selection, question, await viewFor(deps, selection.keys))
   const header =
     selection.mode === 'all'
       ? `## Schema (all ${selection.totalTables} tables)\n`
@@ -196,27 +248,57 @@ async function run(deps: AskDeps, question: string, history: AiTurn[], usage: Ai
   let toolsEnabled = true
   const messages: ChatMessage[] = []
   for (const turn of history.slice(-6)) {
-    messages.push({ role: 'user', content: turn.question })
-    messages.push({ role: 'assistant', content: turn.sql ? `SQL used:\n${turn.sql}` : (turn.answer ?? '(no answer)') })
+    // An earlier turn as the model saw it, when the chat kept that; otherwise as shown, and protected on the way out.
+    const sealed = provider.adoptTurn(turn)
+    messages.push({ role: 'user', content: sealed?.question.text ?? turn.question })
+    const sql = turn.sql ? (sealed?.sql?.text ?? turn.sql) : undefined
+    messages.push({ role: 'assistant', content: sql ? `SQL used:\n${sql}` : (sealed?.answer?.text ?? turn.answer ?? '(no answer)') })
   }
-  messages.push({ role: 'user', content: question })
+  messages.push({ role: 'user', content: (await provider.seal(question))?.text ?? question })
 
   const maxSteps = deps.maxToolSteps ?? 6
   const maxRepairs = deps.maxRepairs ?? 2
   let repairs = 0
   let explained = false
+  let protectedSoFar = -1
+
+  /** The request as it may leave: protected and verified, or marked exempt. Reports what was protected. */
+  const prepare = async (req: ChatRequest): Promise<OutboundRequest> => {
+    if (!privacy) return provider.prepare(req)
+    const step = protectedSoFar < 0 ? progress.start('privacy', 'Protecting sensitive values') : null
+    try {
+      privacy.useSchema(index.identifiers())
+      const outbound = await provider.prepare(req)
+      const counts = privacy.report().counts
+      const n = total(counts)
+      if (step) step.done(n ? `${describeCounts(counts)} replaced with placeholders; checked again before sending` : 'nothing sensitive found; checked before sending')
+      else if (n > protectedSoFar) progress.note('privacy', 'Protected more values', describeCounts(counts))
+      protectedSoFar = n
+      return outbound
+    } catch (err) {
+      const detail = err instanceof Error ? err.message : String(err)
+      if (step) step.fail(detail)
+      else progress.note('error', 'Stopped by Local AI Privacy', detail)
+      throw err
+    }
+  }
 
   const complete = async (): Promise<ChatResponse> => {
     throwIfAborted(deps.signal)
-    const req = {
-      system: [{ text: systemRules(deps.kind, deps.serverVersion, today, index.defaultSchema, toolsEnabled) }, { text: header + schemaText, cacheable: true }],
+    const req: ChatRequest = {
+      system: [
+        { text: systemRules(deps.kind, deps.serverVersion, today, index.defaultSchema, toolsEnabled), structured: true },
+        { text: header + schemaText, cacheable: true, structured: true }
+      ],
       messages,
       tools: toolsEnabled ? TOOLS : undefined,
       toolChoice: toolsEnabled ? ('auto' as const) : undefined
     }
+    const outbound = await prepare(req)
+    throwIfAborted(deps.signal)
     const asking = progress.start('request', `Asking ${provider.model || provider.kind}${usage.requests ? ` (request ${usage.requests + 1})` : ''}`)
     try {
-      const res = await provider.complete(req, deps.signal)
+      const res = await provider.send(outbound, deps.signal)
       usage.requests++
       usage.inputTokens += res.usage.inputTokens
       usage.outputTokens += res.usage.outputTokens
@@ -235,72 +317,105 @@ async function run(deps: AskDeps, question: string, history: AiTurn[], usage: Ai
     }
   }
 
-  const finish = (p: Proposal, sql: string): AiQueryResult => {
-    progress.note('done', 'Query ready', p.tablesUsed.length ? `uses ${p.tablesUsed.join(', ')}` : undefined)
+  /** Words from the model, restored for display here. */
+  const shownText = (text: string) => provider.restoreText(text).text
+
+  /** The turn as the model saw it, for the chat to replay; only when something is protected. */
+  const sealTurn = async (extra: { sql?: SealedText; answer?: SealedText }): Promise<SealedTurn | undefined> => {
+    if (!privacy) return undefined
+    const q = await provider.seal(question)
+    return q ? { question: q, ...extra } : undefined
+  }
+
+  /**
+   * A reply that is not a query. `fromModel` is the model's own words, sealed for the history as it wrote them;
+   * `local` is the app's message, which the history replays as shown and protects again.
+   */
+  const clarify = async (fromModel: string, local?: string): Promise<AiClarification> => {
+    const restored = provider.restoreText(fromModel)
+    const message = restored.text || (local ? shownText(local) : '')
+    const sealed = await sealTurn(restored.text ? { answer: { text: fromModel, spans: restored.spans } } : {})
+    return { kind: 'clarify', message, usage, privacy: provider.report(sealed) }
+  }
+
+  const finish = async (p: Proposal, tokenizedSql: string, restored: Restored): Promise<AiQueryResult> => {
+    const tablesUsed = p.tablesUsed.map(shownText)
+    progress.note('done', 'Query ready', tablesUsed.length ? `uses ${tablesUsed.join(', ')}` : undefined)
+    const warnings = restored.withheld
+      ? [`The query refers to ${restored.withheld === 1 ? 'a value' : `${restored.withheld} values`} the model never saw in full (masked or withheld by the privacy policy). Replace ${restored.withheld === 1 ? 'it' : 'them'} before running.`]
+      : []
+    const sealed = await sealTurn({ sql: { text: tokenizedSql, spans: restored.spans } })
     return {
       kind: 'query',
-      sql,
-      explanation: p.explanation,
-      tablesUsed: p.tablesUsed,
-      assumptions: p.assumptions,
+      sql: restored.text,
+      explanation: shownText(p.explanation),
+      tablesUsed,
+      assumptions: p.assumptions.map(shownText),
       checks: { readOnly: true, explained, repairs },
       context: { mode: selection.mode, tables: selection.keys.length, totalTables: selection.totalTables, schemaTokens: estimateTokens(schemaText) },
       usage,
-      autoRun: deps.settings.autoRun && explained
+      autoRun: deps.settings.autoRun && explained && !warnings.length,
+      ...(warnings.length ? { warnings } : {}),
+      privacy: provider.report(sealed)
     }
   }
 
-  const runTool = async (call: ToolCall): Promise<string> => {
+  const runTool = async (call: ToolCall): Promise<{ content: string; structured?: boolean }> => {
     usage.toolCalls++
     const args = call.args ?? {}
     if (call.name === 'search_schema') {
-      const query = String(args.query ?? '')
+      const query = shownText(String(args.query ?? ''))
       const step = progress.start('tool', `Model searched the schema for "${query}"`)
-      const lines = await index.search(query, 10, shown)
+      const lines = await index.search(query, 10, shown, privacy ? (keys) => viewFor(deps, keys) as Promise<RenderView> : undefined)
       for (const l of lines) shown.add(l.slice(0, l.indexOf('(')))
       step.done(lines.length ? `${lines.length} table${lines.length === 1 ? '' : 's'}` : 'nothing new')
-      return lines.length ? lines.join('\n') : 'No further tables match. The excerpt already shows every relevant table.'
+      return { content: lines.length ? lines.join('\n') : 'No further tables match. The excerpt already shows every relevant table.', structured: true }
     }
     if (call.name === 'describe_table') {
-      const name = String(args.table ?? '')
+      const name = shownText(String(args.table ?? ''))
       const step = progress.start('tool', `Model asked to describe ${name}`)
       const t = index.find(name)
       if (!t) {
         step.fail('unknown table')
-        return `Unknown table: ${name}. Use search_schema to find the right name.`
+        return { content: `Unknown table: ${name}. Use search_schema to find the right name.`, structured: true }
       }
-      const text = await index.describe(t.key)
+      await index.ensureColumns([t.key])
       if (deps.settings.sendSampleValues) await loadSamples(deps, [t.key])
+      const text = await index.describe(t.key, await viewFor(deps, [t.key]))
       shown.add(t.key)
       step.done(`${t.meta?.columns.length ?? 0} columns`)
-      return deps.settings.sendSampleValues ? await index.describe(t.key) : text
+      return { content: text, structured: true }
     }
     if (call.name === 'sample_values') {
-      const table = String(args.table ?? '')
-      const column = String(args.column ?? '')
+      const table = shownText(String(args.table ?? ''))
+      const column = shownText(String(args.column ?? ''))
       const step = progress.start('tool', `Model asked for sample values of ${table}.${column}`)
       const t = index.find(table)
       if (t) await index.ensureColumns([t.key])
-      if (!t || !t.meta?.columns.some((c) => c.name === column)) {
+      const meta = t?.meta?.columns.find((c) => c.name === column)
+      if (!t || !meta) {
         step.fail('unknown column')
-        return `Unknown table or column: ${table}.${column}`
+        return { content: `Unknown table or column: ${table}.${column}`, structured: true }
       }
       if (!deps.settings.sendSampleValues) {
         step.done('disabled in settings')
-        return "Sample values are disabled in this app's settings; rely on the column type and the question instead."
+        return { content: "Sample values are disabled in this app's settings; rely on the column type and the question instead.", structured: true }
       }
       try {
         const values = await deps.distinctValues(t.ref, column)
-        const text = values ? (values.length ? values.slice(0, SAMPLE_LIMIT).join(' | ') : 'No values (column is empty or all NULL).') : 'Too many distinct values to list; treat the column as free text.'
+        privacy?.useSchema(index.identifiers())
+        const shownValues = values && privacy ? await privacy.protectValues({ table: t.ref.name, column, declaredType: meta.type }, values.slice(0, SAMPLE_LIMIT)) : values
+        const text = shownValues ? (shownValues.length ? shownValues.slice(0, SAMPLE_LIMIT).join(' | ') : 'No values (column is empty or all NULL).') : 'Too many distinct values to list; treat the column as free text.'
         step.done(values ? `${values.length} value${values.length === 1 ? '' : 's'}` : 'too many values')
-        return text
+        return { content: text, structured: true }
       } catch (e: any) {
+        if (e instanceof PrivacyBlockedError) throw e
         step.fail(e?.message ?? String(e))
-        return `Could not sample: ${e?.message ?? e}`
+        return { content: `Could not sample: ${e?.message ?? e}` }
       }
     }
     progress.note('tool', `Model called unknown tool ${call.name}`)
-    return `Unknown tool ${call.name}.`
+    return { content: `Unknown tool ${call.name}.` }
   }
 
   let lastText = ''
@@ -314,10 +429,10 @@ async function run(deps: AskDeps, question: string, history: AiTurn[], usage: Ai
         calls = [{ id: 'json', name: 'propose_query', args: parsed }]
       } else if (res.text.trim()) {
         progress.note('done', 'Model answered in prose instead of a query')
-        return { kind: 'clarify', message: res.text.trim().slice(0, 800), usage }
+        return clarify(safeSlice(res.text.trim(), 800))
       } else {
         progress.note('error', 'Model returned an empty answer')
-        return { kind: 'clarify', message: 'The model returned an empty answer. Try rephrasing the question.', usage }
+        return clarify('', 'The model returned an empty answer. Try rephrasing the question.')
       }
     }
     const proposal = calls.find((c) => c.name === 'propose_query')
@@ -325,15 +440,25 @@ async function run(deps: AskDeps, question: string, history: AiTurn[], usage: Ai
       const p = readProposal(proposal.args)
       if (p.needsClarification && !p.sql.trim()) {
         progress.note('done', 'Model asked for clarification')
-        return { kind: 'clarify', message: p.needsClarification, usage }
+        return clarify(p.needsClarification)
       }
       const checking = progress.start('check', 'Checking the query is read-only and valid')
+      // The model's SQL is checked in its own terms, then restored for this database and checked again.
       const gate = checkReadOnlySql(p.sql)
       let problem: string | null = gate.ok ? null : gate.reason
-      const cleanSql = gate.ok ? gate.sql : p.sql
+      const tokenizedSql = gate.ok ? gate.sql : p.sql
+      const restored = provider.restoreSql(tokenizedSql, deps.kind)
+      if (!problem && (restored.unknown.length || restored.damaged.length)) {
+        const bad = [...new Set([...restored.unknown, ...restored.damaged])].slice(0, 5)
+        problem = `The query uses placeholders that do not match any protected value: ${bad.join(', ')}. Copy each placeholder exactly as it appears in the conversation, including the <| and |> around it.`
+      }
+      if (!problem) {
+        const gate2 = checkReadOnlySql(restored.text)
+        if (!gate2.ok) problem = gate2.reason
+      }
       if (!problem) {
         try {
-          const res2 = await deps.runQuery(explainStatement(deps.kind, cleanSql), 50)
+          const res2 = await deps.runQuery(explainStatement(deps.kind, restored.text), 50)
           const first = res2.results[0]
           if (first && first.kind === 'error') problem = `The database rejected the query: ${first.message}`
           else explained = true
@@ -343,12 +468,12 @@ async function run(deps: AskDeps, question: string, history: AiTurn[], usage: Ai
       }
       if (!problem) {
         checking.done('EXPLAIN passed')
-        return finish(p, cleanSql)
+        return finish(p, tokenizedSql, restored)
       }
-      checking.fail(problem)
+      checking.fail(shownText(problem))
       if (repairs >= maxRepairs) {
         progress.note('error', 'Gave up after the repair limit')
-        return { kind: 'clarify', message: `I could not produce a query the database accepts. Last attempt failed with: ${problem}`, usage }
+        return clarify('', `I could not produce a query the database accepts. Last attempt failed with: ${problem}`)
       }
       repairs++
       explained = false
@@ -357,8 +482,8 @@ async function run(deps: AskDeps, question: string, history: AiTurn[], usage: Ai
         // Every tool call in the turn needs an answer, or the next request is rejected.
         messages.push({ role: 'assistant', content: res.text, toolCalls: calls })
         for (const call of calls) {
-          const content = call === proposal ? `${problem}\nFix the query and call propose_query again. Use describe_table if unsure about a column.` : await runTool(call)
-          messages.push({ role: 'tool', toolCallId: call.id, name: call.name, content })
+          const answer = call === proposal ? { content: `${problem}\nFix the query and call propose_query again. Use describe_table if unsure about a column.` } : await runTool(call)
+          messages.push({ role: 'tool', toolCallId: call.id, name: call.name, ...answer })
         }
       } else {
         messages.push({ role: 'assistant', content: res.text })
@@ -368,10 +493,10 @@ async function run(deps: AskDeps, question: string, history: AiTurn[], usage: Ai
     }
     // Information tools: answer each and loop.
     messages.push({ role: 'assistant', content: res.text, toolCalls: calls })
-    for (const call of calls) messages.push({ role: 'tool', toolCallId: call.id, name: call.name, content: await runTool(call) })
+    for (const call of calls) messages.push({ role: 'tool', toolCallId: call.id, name: call.name, ...(await runTool(call)) })
   }
   progress.note('error', 'Model kept exploring without proposing a query')
-  return { kind: 'clarify', message: lastText.trim() || 'The model kept exploring the schema without proposing a query. Try naming the tables you mean.', usage }
+  return clarify(safeSlice(lastText.trim(), 800), 'The model kept exploring the schema without proposing a query. Try naming the tables you mean.')
 }
 
 export function questionTerms(question: string): string[] {

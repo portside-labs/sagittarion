@@ -45,6 +45,8 @@ export interface SessionState {
   querySnapshots: Record<string, QueryTabSnapshot>
 
   updateQuerySnapshot(tabId: string, patch: Partial<QueryTabSnapshot>): void
+  /** The session as it stands after a reconnect: the same session, its database details brought up to date. */
+  setSession(info: SessionInfo): void
   /** Reload the catalog and restart the name stream; drops every cached list. */
   refreshSchema(): Promise<void>
   loadNames(epoch: number): Promise<void>
@@ -129,6 +131,10 @@ export function createSessionStore(session: SessionInfo, deps: SessionDeps, rest
     updateQuerySnapshot(tabId, patch) {
       const current = get().querySnapshots
       set({ querySnapshots: { ...current, [tabId]: { ...(current[tabId] ?? { sql: '', limit: 1000 }), ...patch } } })
+    },
+
+    setSession(info) {
+      if (info.sessionId === id) set({ session: info })
     },
 
     async refreshSchema() {

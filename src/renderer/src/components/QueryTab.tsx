@@ -22,10 +22,13 @@ const SNAPSHOT_RESULT_BYTES = 1_500_000
 /** A saved chat, with anything that was still running marked as cut short. */
 function restoreChat(saved: QueryTabSnapshot['chat'] | undefined): ChatState {
   if (!saved) return emptyChat()
-  const messages = (saved.messages as ChatMessage[]).map((m) =>
-    m.role === 'assistant' && m.status === 'working' ? { ...m, status: 'done' as const, error: m.error ?? 'The app was closed before this finished.' } : m
-  )
-  return { messages, input: saved.input ?? '', requestId: null }
+  const messages = (saved.messages as ChatMessage[]).map((m): ChatMessage => {
+    if (m.role !== 'assistant') return m
+    // What an answer sent is held in memory only, so it cannot be inspected after a relaunch.
+    const { requestId: _gone, ...rest } = m
+    return rest.status === 'working' ? { ...rest, status: 'done', error: rest.error ?? 'The app was closed before this finished.' } : rest
+  })
+  return { messages, input: saved.input ?? '', requestId: null, conversationId: crypto.randomUUID() }
 }
 
 /** Column names of a table, fetching them through the store when they are not cached yet. */
@@ -274,7 +277,7 @@ export function QueryTab({ tab, active }: { tab: Extract<Tab, { kind: 'query' }>
   }
 
   return (
-    <div className="query-tab">
+    <div className="query-tab" data-runs={runKey}>
       <div className="toolbar">
         {running ? (
           <button className="btn small danger" onClick={stop} data-testid="stop-button">

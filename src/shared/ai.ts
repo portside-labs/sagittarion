@@ -1,4 +1,5 @@
 // Natural-language to SQL with an AI connection of the user's choosing: shared types, presets and catalogue.
+import type { AiPrivacyReport, PrivacySettings, SealedTurn } from './privacy'
 //
 // Three words that are kept apart on purpose:
 //   connection  how the app reaches models: your own key with a vendor, a local server, or (later) Managed AI
@@ -301,6 +302,8 @@ export interface AiSettings {
   encryptionAvailable: boolean
   /** Null until Managed AI exists and the user signs in; nothing else in the app depends on it. */
   managedAccount: ManagedAccount | null
+  /** Local AI Privacy: what is protected before a request leaves this device. */
+  privacy: PrivacySettings
 }
 
 export function activeConnection(s: AiSettings | null | undefined): AiConnection | null {
@@ -327,6 +330,7 @@ export interface AiSettingsUpdate {
   activeConnectionId?: string
   activeModel?: string
   agent?: Partial<AgentSettings>
+  privacy?: Partial<PrivacySettings>
 }
 
 export interface CatalogModel {
@@ -413,6 +417,8 @@ export interface AiTurn {
   sql?: string
   /** What the model said instead, e.g. a request for clarification. */
   answer?: string
+  /** The same exchange as the model saw it, placeholders in place of protected values; replayed instead of the above. */
+  sealed?: SealedTurn
 }
 
 export interface AiUsage {
@@ -435,12 +441,16 @@ export interface AiQueryResult {
   context: { mode: 'all' | 'retrieved'; tables: number; totalTables: number; schemaTokens: number }
   usage: AiUsage
   autoRun: boolean
+  /** Things to check before running, e.g. a value the model never saw that the query still refers to. */
+  warnings?: string[]
+  privacy?: AiPrivacyReport
 }
 
 export interface AiClarification {
   kind: 'clarify'
   message: string
   usage: AiUsage
+  privacy?: AiPrivacyReport
 }
 
 export interface AiCancelled {
@@ -450,7 +460,7 @@ export interface AiCancelled {
 
 export type AiResult = AiQueryResult | AiClarification | AiCancelled
 
-export type AiStage = 'index' | 'retrieve' | 'sample' | 'request' | 'tool' | 'check' | 'repair' | 'done' | 'error' | 'cancelled'
+export type AiStage = 'index' | 'retrieve' | 'sample' | 'privacy' | 'request' | 'tool' | 'check' | 'repair' | 'done' | 'error' | 'cancelled'
 
 /** One step of an ask, streamed to the renderer while the model works. A step is reported twice: running, then done or error. */
 export interface AiProgressEvent {

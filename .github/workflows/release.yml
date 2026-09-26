@@ -11,6 +11,10 @@ on:
       - 'v*'
   workflow_dispatch:
 
+# The on-device privacy model runs on the CPU; skip onnxruntime-node's CUDA download (Linux x64, several hundred MB).
+env:
+  ONNXRUNTIME_NODE_INSTALL: skip
+
 permissions:
   contents: write
 

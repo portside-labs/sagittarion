@@ -1,4 +1,5 @@
 // Provider-neutral chat and tool-calling types. Adapters translate to each wire protocol.
+import type { OutboundRequest, OutboundTexts } from '../../privacy/boundary'
 
 export interface ToolDef {
   name: string
@@ -16,12 +17,18 @@ export interface ToolCall {
 export type ChatMessage =
   | { role: 'user'; content: string }
   | { role: 'assistant'; content: string; toolCalls?: ToolCall[] }
-  | { role: 'tool'; toolCallId: string; name: string; content: string }
+  /** `structured`: schema-like text whose data was protected with its column as context (see SystemBlock). */
+  | { role: 'tool'; toolCallId: string; name: string; content: string; structured?: boolean }
 
 export interface SystemBlock {
   text: string
   /** Hint that this block is stable across requests and worth caching provider-side. */
   cacheable?: boolean
+  /**
+   * Identifiers and fixed wording rather than prose. Local AI Privacy scans it with detectors that cannot mistake a
+   * table name for a person; its sample values and comments were protected beforehand. Never sent on the wire.
+   */
+  structured?: boolean
 }
 
 export interface ChatRequest {
@@ -59,12 +66,16 @@ export class ProviderError extends Error {
   }
 }
 
+/**
+ * A wire-protocol adapter. It accepts only requests that crossed the privacy boundary (privacy/boundary.ts): protected
+ * and verified, or explicitly exempt. It never sees the vault.
+ */
 export interface LlmProvider {
   readonly kind: string
   readonly model: string
   readonly supportsEmbeddings: boolean
-  complete(req: ChatRequest, signal?: AbortSignal): Promise<ChatResponse>
-  embed(texts: string[], signal?: AbortSignal): Promise<number[][]>
+  complete(req: OutboundRequest, signal?: AbortSignal): Promise<ChatResponse>
+  embed(texts: OutboundTexts, signal?: AbortSignal): Promise<number[][]>
   listModels(): Promise<string[]>
 }
 

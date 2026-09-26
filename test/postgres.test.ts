@@ -8,12 +8,22 @@ import { ConnectionManager } from '../src/main/connections/manager'
 import { splitStatements, isRowReturning } from '../src/main/db/sql-split'
 import { decodeFloat, decodeNumeric, decodeBytea, encodeParam } from '../src/main/db/pg-values'
 import type { RowsResult } from '../src/shared/types'
+import type { SessionLinkEvent } from '../src/shared/api'
 
 const root = path.resolve(__dirname, '..')
 const agentSource = fs.readFileSync(path.join(root, 'src/main/agent/sqlite_agent.py'), 'utf8')
 const enabled = Boolean(process.env.PG_URL) || dockerAvailable()
 
 let server: Awaited<ReturnType<typeof providePostgres>>
+
+/** Resolves once `cond` holds, polling. */
+async function until(cond: () => boolean, timeoutMs = 10_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs
+  while (!cond()) {
+    if (Date.now() > deadline) throw new Error('Timed out waiting')
+    await new Promise((r) => setTimeout(r, 20))
+  }
+}
 
 function driver(overrides: Partial<ConstructorParameters<typeof PostgresDriver>[0]> = {}): PostgresDriver {
   return new PostgresDriver({
@@ -412,6 +422,40 @@ describe.skipIf(!enabled)('PostgreSQL driver', () => {
     }
   }, 180_000)
 
+  it('reconnects when the server ends an idle session', async () => {
+    const manager = new ConnectionManager({ agentSource, verifyHostKey: async () => true })
+    const events: SessionLinkEvent[] = []
+    manager.on('link', (e: SessionLinkEvent) => events.push(e))
+    const conn = await manager.open({
+      id: 'pg-idle',
+      name: 'Idle',
+      kind: 'postgres',
+      ssh: { host: '', port: 22, username: '', auth: 'key' },
+      pg: { host: server.host, port: server.port, database: server.database, user: server.user, password: server.password, sslMode: 'prefer', tunnel: false }
+    })
+    const admin = driver()
+    await admin.connect()
+    try {
+      // Found while idle: the server says so the moment it ends the session.
+      await admin.query("SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE application_name = 'Sagittarion' AND pid <> pg_backend_pid()")
+      await until(() => events.length > 0)
+      expect(events[0]).toMatchObject({ sessionId: conn.id, state: 'dropped', reason: expect.stringMatching(/terminat/i) })
+      expect(await manager.read(conn.id, (d) => d.count({ schema: 'public', name: 'settings' }))).toBe(3)
+      expect(events[events.length - 1]).toMatchObject({ state: 'reconnected' })
+      // A statement the drop interrupts reports it, and is not run again.
+      const d = await manager.driver(conn.id)
+      const pending = d.query('SELECT pg_sleep(5)')
+      await new Promise((r) => setTimeout(r, 300))
+      await admin.query("SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE application_name = 'Sagittarion' AND pid <> pg_backend_pid() AND query LIKE '%pg_sleep%'")
+      const res = await pending
+      expect(res.results[0]).toMatchObject({ kind: 'error', message: expect.stringMatching(/terminat/i) })
+      expect(await manager.read(conn.id, (d) => d.count({ schema: 'public', name: 'settings' }))).toBe(3)
+    } finally {
+      await admin.close()
+      await manager.close(conn.id)
+    }
+  })
+
   it('gives friendly errors for bad credentials and databases', async () => {
     await expect(driver({ password: 'wrong' }).connect()).rejects.toThrow(/Password authentication failed for user "test"/)
     await expect(driver({ database: 'nope' }).connect()).rejects.toThrow(/Database "nope" does not exist/)
@@ -434,10 +478,19 @@ describe.skipIf(!enabled)('PostgreSQL driver', () => {
       expect(info.tunnel).toBe(`${ssh.username}@${ssh.host}:${ssh.port}`)
       expect(info.target).toBe(`test@${server.host}${server.port !== 5432 ? `:${server.port}` : ''}/app`)
       expect(info.db?.details.find((x) => x.label === 'tunnel')?.value).toContain('via')
-      const rows = await manager.driver(conn.id).rows({ table: 'settings', offset: 0, limit: 10, withCount: true })
+      const rows = await manager.read(conn.id, (d) => d.rows({ table: 'settings', offset: 0, limit: 10, withCount: true }))
       expect(rows.total).toBe(3)
       // A second connection through the same tunnel (cancel uses one).
-      await manager.driver(conn.id).cancel()
+      await manager.cancel(conn.id)
+      // The SSH server ends the tunnel, as with an idle connection: the next call makes a new one.
+      const events: SessionLinkEvent[] = []
+      manager.on('link', (e: SessionLinkEvent) => events.push(e))
+      ssh.dropClients()
+      await until(() => events.length > 0)
+      expect(events[0]).toMatchObject({ sessionId: conn.id, state: 'dropped' })
+      const again = await manager.read(conn.id, (d) => d.rows({ table: 'settings', offset: 0, limit: 10, withCount: true }))
+      expect(again.total).toBe(3)
+      expect(events[events.length - 1]).toMatchObject({ state: 'reconnected', info: { sessionId: conn.id } })
       await manager.close(conn.id)
 
       await expect(

@@ -1,4 +1,4 @@
-import { useLayoutEffect, useState } from 'react'
+import { useEffect, useLayoutEffect, useRef, useState } from 'react'
 import {
   BYOK_PROVIDERS,
   CONNECTION_TYPES,
@@ -12,17 +12,25 @@ import {
   type ConnectionType,
   type ProviderId
 } from '@shared/ai'
+import { DEFAULT_PRIVACY, PRIVACY_POLICIES, classifyEndpoint, privacyApplies, type PrivacyPolicyId, type PrivacySettings, type SemanticModelStatus } from '@shared/privacy'
+import { formatBytes } from '@shared/export'
 import { useStore, type SettingsTab } from '@/store'
 import { ACCEPT_KEY_OPTIONS } from '@/lib/sql-complete'
 import { Modal } from './Modal'
 import { Icon } from './Icons'
 import { errorMessage } from '@/lib/util'
 
+/** The sidebar, in alphabetical order so a new section lands in its place. */
 const SETTINGS_TABS = [
+  { id: 'ai' as const, label: 'AI', icon: 'chat' as const },
   { id: 'appearance' as const, label: 'Appearance', icon: 'layout' as const },
-  { id: 'editor' as const, label: 'Editor', icon: 'code' as const },
-  { id: 'ai' as const, label: 'AI', icon: 'chat' as const }
-]
+  { id: 'editor' as const, label: 'Editor', icon: 'code' as const }
+].sort((a, b) => a.label.localeCompare(b.label))
+
+/** Managed AI stays out of Settings until it is available. */
+const OFFERED_TYPES = CONNECTION_TYPES.filter((t) => t.type !== 'managed')
+/** "No account needed" only tells the kinds apart beside Managed AI, which needs one. */
+const SHOW_ACCOUNT = OFFERED_TYPES.some((t) => t.type === 'managed')
 
 /** The connection as it is being edited, before it is saved. */
 interface Draft {
@@ -37,6 +45,66 @@ const DEFAULT_AGENT: AgentSettings = { schemaBudgetTokens: 8000, autoRun: true, 
 
 function draftFrom(c: AiConnection, model?: string): Draft {
   return { type: c.type, provider: c.provider, baseUrl: c.baseUrl, model: model || c.defaultModel, embeddingModel: c.embeddingModel }
+}
+
+const MODEL_BADGE: Record<SemanticModelStatus['state'], string | null> = {
+  installed: 'Installed',
+  'not-installed': 'Not installed',
+  unsupported: 'Not available here',
+  failed: 'Not installed',
+  downloading: null
+}
+
+/** The on-device model's download, progress and removal, under its switch. */
+function ModelControls({ status, onInstall, onCancel, onRemove }: { status: SemanticModelStatus; onInstall: () => void; onCancel: () => void; onRemove: () => void }) {
+  const m = status.model
+  const bytes = (n: number) => formatBytes(n).replace(' ', '\u00a0')
+  const size = bytes(m.size)
+  const about = `${m.name} ${m.version} by ${m.publisher}, ${m.license}, ${size}`
+  if (status.state === 'unsupported') {
+    return (
+      <span className="hint warn" data-testid="privacy-model-status">
+        {status.message}
+      </span>
+    )
+  }
+  if (status.state === 'downloading') {
+    const pct = Math.min(100, Math.round(((status.received ?? 0) / m.size) * 100))
+    return (
+      <div className="model-row" data-testid="privacy-model-status">
+        <div className="model-progress" role="progressbar" aria-label="Downloading the on-device model" aria-valuenow={pct} aria-valuemin={0} aria-valuemax={100}>
+          <div style={{ width: `${pct}%` }} />
+        </div>
+        <span className="hint">
+          Downloading {bytes(status.received ?? 0)} of {size}
+        </span>
+        <button type="button" className="btn small ghost" onClick={onCancel} data-testid="privacy-model-cancel">
+          Cancel
+        </button>
+      </div>
+    )
+  }
+  if (status.state === 'installed') {
+    return (
+      <div className="model-row" data-testid="privacy-model-status">
+        <span className="hint">{about}. It loads when a question needs it and unloads after ten quiet minutes.</span>
+        <button type="button" className="btn small ghost" onClick={onRemove} data-testid="privacy-model-remove">
+          <Icon name="trash" size={12} /> Remove
+        </button>
+      </div>
+    )
+  }
+  return (
+    <div className="model-row" data-testid="privacy-model-status">
+      {status.state === 'failed' ? <span className="hint warn">{status.message}</span> : null}
+      <span className="hint">
+        {about}. Downloaded once from {m.source}, and every file is checked against its pinned SHA-256 before the model runs.
+      </span>
+      <button type="button" className="btn small" onClick={onInstall} data-testid="privacy-model-install">
+        <Icon name="download" size={12} /> {status.state === 'failed' ? 'Try again' : `Download (${size})`}
+      </button>
+    </div>
+  )
 }
 
 export function SettingsDialog() {
@@ -54,6 +122,8 @@ export function SettingsDialog() {
   const [advanced, setAdvanced] = useState(false)
   const [models, setModels] = useState<string[] | null>(null)
   const [agent, setAgent] = useState<AgentSettings>(DEFAULT_AGENT)
+  const [privacySettings, setPrivacySettings] = useState<PrivacySettings>(DEFAULT_PRIVACY)
+  const [modelStatus, setModelStatus] = useState<SemanticModelStatus | null>(null)
   const [tab, setTab] = useState<SettingsTab>('appearance')
   const [busy, setBusy] = useState<null | 'save' | 'test' | 'remove' | 'models'>(null)
 
@@ -72,20 +142,41 @@ export function SettingsDialog() {
     else if (intent?.provider) setTab('ai')
   }, [open, intent])
 
-  // Load the saved values each time the dialog opens, before the first paint so no stale draft shows.
+  // Load the saved values each time the dialog opens, before the first paint so no stale draft shows. Only once per
+  // opening: an action that saves one setting straight away (removing a key, installing the model) refreshes the
+  // saved settings without discarding what is being edited.
+  const loaded = useRef(false)
   useLayoutEffect(() => {
-    if (!open || !settings) return
+    if (!open) {
+      loaded.current = false
+      return
+    }
+    if (!settings || loaded.current) return
+    loaded.current = true
     const current = activeConnection(settings)
     setDraft(current ? draftFrom(current, settings.activeModel) : draftForProvider('openai'))
     setKey('')
     setModels(null)
     setAdvanced(false)
     setAgent(settings.agent)
+    setPrivacySettings(settings.privacy ?? DEFAULT_PRIVACY)
     // Opened from the model picker: start on that provider with the model filled in.
     if (intent?.provider) setDraft(draftForProvider(intent.provider, intent.model))
     else if (intent?.model) setDraft((d) => ({ ...d, model: intent.model! }))
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open, settings, intent])
+
+  // The on-device model's status while the dialog is open, with download progress as it arrives.
+  useEffect(() => {
+    if (!open) return
+    let live = true
+    void window.api.privacyModel.status().then((s) => live && setModelStatus(s))
+    const off = window.api.privacyModel.onStatus((s) => setModelStatus(s))
+    return () => {
+      live = false
+      off()
+    }
+  }, [open])
 
   if (!open) return null
 
@@ -134,12 +225,15 @@ export function SettingsDialog() {
     draft.embeddingModel.trim() !== active.embeddingModel ||
     agent.autoRun !== settings.agent.autoRun ||
     agent.sendSampleValues !== settings.agent.sendSampleValues ||
-    agent.schemaBudgetTokens !== settings.agent.schemaBudgetTokens
+    agent.schemaBudgetTokens !== settings.agent.schemaBudgetTokens ||
+    (Object.keys(DEFAULT_PRIVACY) as (keyof PrivacySettings)[]).some((k) => privacySettings[k] !== (settings.privacy ?? DEFAULT_PRIVACY)[k])
 
   const save = async () => {
     setBusy('save')
     try {
-      await window.api.settings.update({ connection: input(), agent })
+      await window.api.settings.update({ connection: input(), agent, privacy: privacySettings })
+      // The form shows what was saved, as the main process normalized it.
+      loaded.current = false
       await loadSettings()
       toast('success', 'Settings saved')
       setKey('')
@@ -179,6 +273,7 @@ export function SettingsDialog() {
     setBusy('remove')
     try {
       await window.api.settings.update({ connection: { id: saved?.id, type: draft.type, provider: draft.provider, apiKey: null } })
+      loaded.current = false
       await loadSettings()
       toast('success', `${preset.label} key removed`)
     } catch (e) {
@@ -188,17 +283,59 @@ export function SettingsDialog() {
     }
   }
 
+  const installModel = async () => {
+    try {
+      const s = await window.api.privacyModel.install()
+      setModelStatus(s)
+      if (s.state === 'installed') {
+        // Downloading it is asking for it: switched on and saved now, not left for a Save that closing would skip.
+        // Only this setting is saved; anything else being edited stays as it is.
+        await window.api.settings.update({ privacy: { semanticDetection: true } })
+        setPrivacySettings((p) => ({ ...p, semanticDetection: true }))
+        await loadSettings()
+        toast('success', 'On-device model installed and switched on')
+      } else if (s.state === 'failed') toast('error', 'The model was not installed', s.message)
+    } catch (e) {
+      toast('error', 'The model was not installed', errorMessage(e))
+    }
+  }
+
+  const removeModel = async () => {
+    try {
+      setModelStatus(await window.api.privacyModel.remove())
+      loaded.current = false
+      await loadSettings()
+      toast('success', 'On-device model removed')
+    } catch (e) {
+      toast('error', 'Could not remove the model', errorMessage(e))
+    }
+  }
+
   const openLink = (url: string) => (e: React.MouseEvent) => {
     e.preventDefault()
     void window.api.app.openExternal(url)
   }
 
+  const endpoint = classifyEndpoint(draft.baseUrl.trim() || preset.baseUrl)
+  const protection = privacyApplies(privacySettings, endpoint.trust)
   const privacy =
     draft.type === 'local'
-      ? `Questions and schema details go only to the server at ${draft.baseUrl.trim() || 'the base URL'}. Nothing reaches Portside Labs.`
+      ? `Questions and schema details go only to the server at ${draft.baseUrl.trim() || 'the base URL'}${protection.protect ? ', after sensitive values are replaced on this computer' : ''}. Nothing reaches Portside Labs.`
       : draft.type === 'byok'
-        ? `Questions and the relevant schema go straight to ${preset.label} with your key. Nothing reaches Portside Labs.`
+        ? `Questions and the relevant schema go straight to ${preset.label} with your key${protection.protect ? ', after sensitive values are replaced on this computer' : ''}. Nothing reaches Portside Labs.`
         : 'Questions go through Portside Labs to the model provider. Database credentials never do.'
+  const policyInfo = PRIVACY_POLICIES[privacySettings.policyId] ?? PRIVACY_POLICIES['general-pii']
+  const readers = privacySettings.semanticDetection ? ' by the rules and the on-device model' : ' by the rules'
+  const protectionStatus = !privacySettings.enabled
+    ? 'Local AI Privacy is off: questions, sample values and database errors are sent to the model as they are.'
+    : endpoint.trust === 'this-device'
+      ? privacySettings.protectLocalModels
+        ? `${endpoint.host} is this computer, and requests to it are protected too,${readers}.`
+        : `${endpoint.host} is this computer, so requests to it are sent as they are. Turn on the option above to protect them as well.`
+      : `${endpoint.host} is outside this computer: every request to it is protected${readers} and checked before it is sent.`
+  const setPrivacy = (patch: Partial<PrivacySettings>) => setPrivacySettings((p) => ({ ...p, ...patch }))
+  // Offered once the model is installed; always possible to switch off.
+  const semanticSwitchable = modelStatus?.state === 'installed' || privacySettings.semanticDetection
 
   return (
     <Modal title="Settings" onClose={close} width={760} header={false} className="settings-modal">
@@ -289,32 +426,27 @@ export function SettingsDialog() {
             <Icon name="chat" /> AI connection
           </h2>
           <p className="hint">
-            Questions typed into the Ask box are turned into SQL by a model of your choice. Bring your own key, run a model locally, or use Managed AI
-            when it arrives. The database client is yours; the cloud is optional.
+            Questions typed into the Ask box are turned into SQL by a model of your choice. Bring your own key or run a model locally. The database
+            client is yours; the cloud is optional.
           </p>
 
           <div className="ai-type-tiles" data-testid="ai-types">
-            {CONNECTION_TYPES.map((t) => {
-              const available = t.type !== 'managed'
-              return (
-                <button
-                  key={t.type}
-                  type="button"
-                  className={`ai-type-tile ${draft.type === t.type ? 'active' : ''}`}
-                  onClick={() => chooseType(t.type)}
-                  disabled={!available}
-                  aria-pressed={draft.type === t.type}
-                  data-testid={`ai-type-${t.type}`}
-                >
-                  <span className="ai-type-head">
-                    <span className="ai-type-label">{t.label}</span>
-                    {!available ? <span className="badge coming-soon">Coming soon</span> : null}
-                  </span>
-                  <span className="ai-type-blurb">{t.blurb}</span>
-                  <span className="ai-type-account">{t.account}</span>
-                </button>
-              )
-            })}
+            {OFFERED_TYPES.map((t) => (
+              <button
+                key={t.type}
+                type="button"
+                className={`ai-type-tile ${draft.type === t.type ? 'active' : ''}`}
+                onClick={() => chooseType(t.type)}
+                aria-pressed={draft.type === t.type}
+                data-testid={`ai-type-${t.type}`}
+              >
+                <span className="ai-type-head">
+                  <span className="ai-type-label">{t.label}</span>
+                </span>
+                <span className="ai-type-blurb">{t.blurb}</span>
+                {SHOW_ACCOUNT ? <span className="ai-type-account">{t.account}</span> : null}
+              </button>
+            ))}
           </div>
 
           {draft.type === 'byok' ? (
@@ -454,6 +586,85 @@ export function SettingsDialog() {
           </p>
 
           <h2 className="section-gap">
+            <Icon name="shield" /> Privacy &amp; data protection
+          </h2>
+          <div className="field">
+            <label className="checkbox">
+              <input type="checkbox" checked={privacySettings.enabled} onChange={(e) => setPrivacy({ enabled: e.target.checked })} data-testid="privacy-enabled" />
+              Protect sensitive data before it leaves this device
+            </label>
+            <span className="hint">
+              Names, contact details, ids, card numbers and secrets in questions, sample values and database errors are replaced with
+              placeholders on this computer before a request is sent. The model answers with the placeholders and the real values are put
+              back here, so the chat and the SQL look as usual. The mapping never leaves this computer, and no account is needed.
+            </span>
+          </div>
+          {privacySettings.enabled ? (
+            <>
+              <div className="field">
+                <label>Detection</label>
+                <div className="privacy-detectors" data-testid="privacy-detectors">
+                  <div className="privacy-detector">
+                    <span className="privacy-detector-name">Pattern recognizers</span>
+                    <span className="badge">Always on</span>
+                    <span className="hint">Emails, phone numbers, card and account numbers, government ids, keys and tokens, checked with checksums where they exist.</span>
+                  </div>
+                  <div className="privacy-detector">
+                    <label className="checkbox">
+                      <input type="checkbox" checked={privacySettings.schemaDetection} onChange={(e) => setPrivacy({ schemaDetection: e.target.checked })} data-testid="privacy-schema" />
+                      Database schema detection
+                    </label>
+                    <span className="hint">Columns such as email, date_of_birth or card_number are recognised by name, and so are labelled values in JSON, logs and SQL.</span>
+                  </div>
+                  <div className="privacy-detector" data-testid="privacy-model">
+                    <label className={`checkbox ${semanticSwitchable ? '' : 'disabled'}`}>
+                      <input
+                        type="checkbox"
+                        checked={privacySettings.semanticDetection}
+                        disabled={!semanticSwitchable}
+                        onChange={(e) => setPrivacy({ semanticDetection: e.target.checked })}
+                        data-testid="privacy-semantic"
+                      />
+                      On-device model
+                    </label>
+                    {modelStatus && MODEL_BADGE[modelStatus.state] ? (
+                      <span className={`badge ${modelStatus.state === 'installed' ? '' : 'coming-soon'}`}>{MODEL_BADGE[modelStatus.state]}</span>
+                    ) : null}
+                    <span className="hint">
+                      Finds names, places and organizations that patterns miss, such as a surname without a title or a hospital mentioned in passing. It runs on
+                      this computer in a process of its own; nothing it reads leaves.
+                    </span>
+                    {modelStatus ? (
+                      <ModelControls status={modelStatus} onInstall={() => void installModel()} onCancel={() => void window.api.privacyModel.cancel()} onRemove={() => void removeModel()} />
+                    ) : null}
+                  </div>
+                </div>
+              </div>
+              <div className="field">
+                <label>Privacy policy</label>
+                <select className="select" value={privacySettings.policyId} onChange={(e) => setPrivacy({ policyId: e.target.value as PrivacyPolicyId })} data-testid="privacy-policy">
+                  {Object.values(PRIVACY_POLICIES).map((p) => (
+                    <option key={p.id} value={p.id}>
+                      {p.label} (v{p.version})
+                    </option>
+                  ))}
+                </select>
+                <span className="hint">{policyInfo.description}</span>
+              </div>
+              <div className="field">
+                <label className="checkbox">
+                  <input type="checkbox" checked={privacySettings.protectLocalModels} onChange={(e) => setPrivacy({ protectLocalModels: e.target.checked })} data-testid="privacy-local" />
+                  Also protect models on this computer
+                </label>
+                <span className="hint">Ollama, LM Studio and other servers at localhost see the data as it is unless this is on.</span>
+              </div>
+            </>
+          ) : null}
+          <p className="hint privacy" data-testid="privacy-status">
+            {protectionStatus}
+          </p>
+
+          <h2 className="section-gap">
             <Icon name="database" /> Database context
           </h2>
           <div className="field">
@@ -477,7 +688,8 @@ export function SettingsDialog() {
             </label>
             <span className="hint">
               When on, up to 20 distinct values of short text columns in the tables being queried are included, so words like "paid" can be matched to
-              how a status is actually stored. Table and column names and the question itself are always sent.
+              how a status is actually stored. Table and column names and the question itself are always sent; with Local AI Privacy on, sensitive values
+              among them are replaced with placeholders first.
             </span>
           </div>
 

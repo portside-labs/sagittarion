@@ -1,9 +1,10 @@
-import { app, BrowserWindow, dialog, ipcMain, Menu, safeStorage, screen, shell, type MenuItemConstructorOptions } from 'electron'
+import { app, BrowserWindow, dialog, ipcMain, Menu, net, safeStorage, screen, shell, utilityProcess, type MenuItemConstructorOptions } from 'electron'
 import { promises as fs } from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import crypto from 'node:crypto'
 import agentSource from './agent/sqlite_agent.py?raw'
+import modelHostPath from './privacy/semantic/host?modulePath'
 import { ConnectionManager } from './connections/manager'
 import { humanKeyType, KnownHostsStore } from './ssh/hostkeys'
 import { ConnectionStore, noopCodec, type SecretCodec } from './store/connections'
@@ -15,14 +16,31 @@ import { qi, qualify } from './db/pg-values'
 import { cellToPlainText } from '@shared/export'
 import type { AiConnectionInput, AiProgressEvent, AiProgressStep, AiSettingsUpdate, AiTurn } from '@shared/ai'
 import { PROVIDERS } from '@shared/ai'
+import { classifyEndpoint, privacyApplies, type PrivacySettings } from '@shared/privacy'
 import { createProvider, providerConfigFor } from './ai/providers/factory'
-import { ProviderError } from './ai/providers/types'
+import { ProviderError, type LlmProvider, type ProviderConfig } from './ai/providers/types'
+import { WireRecorder } from './ai/wire'
+import { sendUnprotected } from './privacy/boundary'
+import { ConversationVaults } from './privacy/conversations'
+import { engineForSettings } from './privacy/engine'
+import { PrivacyBlockedError } from './privacy/errors'
+import { ModelGateway } from './privacy/gateway'
+import { PolicyError, policyById } from './privacy/policy'
+import { PrivacySession } from './privacy/session'
+import type { HostHandle } from './privacy/semantic/client'
+import type { HostReply } from './privacy/semantic/host'
+import { SemanticModel } from './privacy/semantic/manager'
+import { GLINER_PII_BASE } from './privacy/semantic/manifest'
+import { unsupportedReason } from './privacy/semantic/platform'
+import { ModelStore } from './privacy/semantic/store'
+import type { SemanticSensitiveDataDetector } from './privacy/types'
+import { TranscriptStore, transcriptForViewer } from './privacy/transcripts'
 import { SchemaIndex, type SchemaSource } from './ai/schema-index'
 import { askDatabase } from './ai/nl2sql'
 import { EmbeddingCache } from './ai/embeddings'
 import type { DatabaseDriver } from './db/driver'
 import { toCsv, toJson, toSqlInserts } from '@shared/export'
-import type { OpenOptions } from '@shared/api'
+import type { OpenOptions, SessionLinkEvent } from '@shared/api'
 import type { AppInfo, ConnectionConfig, ExportRequest, ListObjectsRequest, ObjectRef, PendingChange, RowsRequest, SessionInfo, SshConfig, SshProfile, TableRef, WorkspaceState } from '@shared/types'
 
 const isMac = process.platform === 'darwin'
@@ -40,31 +58,52 @@ const schemaIndexes = new Map<string, Promise<SchemaIndex>>()
 const recentTables = new Map<string, string[]>()
 /** Running asks, so the renderer can cancel them. */
 const aiRequests = new Map<string, AbortController>()
+/** Placeholder vaults of the chats in use: main-process memory only, never written anywhere. */
+const conversations = new ConversationVaults()
+/** What each recent ask sent and received, for the "What was sent" view. Memory only. */
+const transcripts = new TranscriptStore()
+/** The on-device model for semantic detection; its files live under userData/models. */
+let semanticModel: SemanticModel
 
-function schemaSourceFor(driver: DatabaseDriver): SchemaSource {
+/** The model's own process: an Electron utility process running host.ts (Node and onnxruntime-node). */
+function spawnModelHost(): HostHandle {
+  const child = utilityProcess.fork(modelHostPath, [], { serviceName: 'Sagittarion privacy model', stdio: 'ignore' })
+  return {
+    post: (request) => child.postMessage(request),
+    onMessage: (handler) => child.on('message', (reply: HostReply) => handler(reply)),
+    onExit: (handler) => child.on('exit', () => handler()),
+    kill: () => {
+      child.kill()
+    }
+  }
+}
+
+/** What the AI's schema index reads, through whichever link the session has at the time. */
+function schemaSourceFor(sessionId: string): SchemaSource {
+  const read = <T>(fn: (driver: DatabaseDriver) => Promise<T>) => manager.read(sessionId, fn)
   return {
     async listTables() {
       const out: Awaited<ReturnType<DatabaseDriver['listObjects']>>['items'] = []
       let cursor: string | null = null
       do {
-        const page = await driver.listObjects({ kinds: ['table', 'view'], cursor, limit: 5000 })
+        const page = await read((d) => d.listObjects({ kinds: ['table', 'view'], cursor, limit: 5000 }))
         out.push(...page.items)
         cursor = page.cursor
       } while (cursor)
       return out
     },
-    tablesMeta: (refs) => driver.tablesMeta(refs),
-    relationsFor: (refs) => driver.relationsFor(refs),
-    searchColumns: async (query, limit) => (await driver.searchObjects(query, limit)).columns
+    tablesMeta: (refs) => read((d) => d.tablesMeta(refs)),
+    relationsFor: (refs) => read((d) => d.relationsFor(refs)),
+    searchColumns: async (query, limit) => (await read((d) => d.searchObjects(query, limit))).columns
   }
 }
 
-function schemaIndexFor(sessionId: string, driver: DatabaseDriver, kind: 'sqlite' | 'postgres'): Promise<SchemaIndex> {
+function schemaIndexFor(sessionId: string, kind: 'sqlite' | 'postgres'): Promise<SchemaIndex> {
   let pending = schemaIndexes.get(sessionId)
   if (!pending) {
     pending = (async () => {
-      const catalog = await driver.catalog()
-      return SchemaIndex.create(schemaSourceFor(driver), kind, catalog.defaultSchema)
+      const catalog = await manager.read(sessionId, (d) => d.catalog())
+      return SchemaIndex.create(schemaSourceFor(sessionId), kind, catalog.defaultSchema)
     })()
     pending.catch(() => schemaIndexes.delete(sessionId))
     schemaIndexes.set(sessionId, pending)
@@ -73,16 +112,41 @@ function schemaIndexFor(sessionId: string, driver: DatabaseDriver, kind: 'sqlite
 }
 
 /** The provider behind the active connection, or behind one as typed into Settings, with its key. */
-async function providerFor(input?: AiConnectionInput) {
+async function providerFor(input?: AiConnectionInput, extra: Partial<ProviderConfig> = {}) {
   const { connection, apiKey } = await settingsStore.resolve(input)
   const preset = PROVIDERS[connection.provider]
   if (!preset.available) throw new Error(`${preset.label} is not available yet.`)
   if (preset.needsKey && !apiKey) throw new Error(`Add an API key for ${preset.label} in Settings to ask questions in plain English.`)
   const settings = await settingsStore.get()
-  const provider = createProvider(
-    providerConfigFor({ provider: connection.provider, baseUrl: connection.baseUrl, model: connection.defaultModel, embeddingModel: connection.embeddingModel }, apiKey)
-  )
-  return { settings, connection, provider }
+  const config = providerConfigFor({ provider: connection.provider, baseUrl: connection.baseUrl, model: connection.defaultModel, embeddingModel: connection.embeddingModel }, apiKey, extra)
+  const provider = createProvider(config)
+  return { settings, connection, provider, baseUrl: config.baseUrl }
+}
+
+/**
+ * The way to the model for one ask. Protected whenever Local AI Privacy is on and the endpoint is not this computer
+ * (or protecting local models is on too); otherwise the gateway carries the reason it may send data as it is.
+ * Anything that stops protection from working stops the ask.
+ */
+async function gatewayFor(provider: LlmProvider, baseUrl: string, privacy: PrivacySettings, sessionId: string, conversationId: string, signal: AbortSignal): Promise<ModelGateway> {
+  const { trust, host } = classifyEndpoint(baseUrl)
+  const applies = privacyApplies(privacy, trust)
+  if (!applies.protect) return ModelGateway.unprotected(provider, applies.exemption, host)
+  let policy
+  try {
+    policy = policyById(privacy.policyId)
+  } catch (err) {
+    throw new PrivacyBlockedError('policy-invalid', [], err instanceof PolicyError ? err.problems[0] : undefined)
+  }
+  // Switched on but unable to run (not installed, or this computer cannot run it): the engine refuses, and says why.
+  let semantic: SemanticSensitiveDataDetector | null = null
+  let why: string | undefined
+  if (privacy.semanticDetection) {
+    semantic = await semanticModel.detector()
+    if (!semantic) why = (await semanticModel.status()).message
+  }
+  const engine = engineForSettings(privacy, semantic, why)
+  return ModelGateway.protected(provider, new PrivacySession({ engine, policy, vault: conversations.vault(sessionId, conversationId), host, signal }))
 }
 
 async function distinctValuesFor(driver: DatabaseDriver, kind: 'sqlite' | 'postgres', ref: TableRef, column: string): Promise<string[] | null> {
@@ -296,32 +360,32 @@ function registerIpc(): void {
   ipcMain.handle('session:close', (_e, sessionId: string) => {
     schemaIndexes.delete(sessionId)
     recentTables.delete(sessionId)
+    conversations.forgetSession(sessionId)
+    transcripts.forgetSession(sessionId)
     return manager.close(sessionId)
   })
 
-  ipcMain.handle('db:open', async (_e, sessionId: string, remotePath: string, readOnly: boolean) => {
-    const conn = manager.get(sessionId)
-    if (conn.config.kind !== 'sqlite' || !conn.driver) throw new Error('Only SQLite connections open files.')
-    return (conn.driver as any).open(remotePath, readOnly)
-  })
+  // A connection whose link dropped while idle reconnects on the first of these that needs it. Reads run once more if
+  // the link turns out to have died under them; statements that may write never run twice.
+  ipcMain.handle('db:open', (_e, sessionId: string, remotePath: string, readOnly: boolean) => manager.openFile(sessionId, remotePath, readOnly))
   ipcMain.handle('db:catalog', (_e, sessionId: string) => {
     schemaIndexes.delete(sessionId)
-    return manager.driver(sessionId).catalog()
+    return manager.read(sessionId, (d) => d.catalog())
   })
-  ipcMain.handle('db:listObjects', (_e, sessionId: string, req: ListObjectsRequest) => manager.driver(sessionId).listObjects(req))
-  ipcMain.handle('db:searchObjects', (_e, sessionId: string, query: string, limit: number) => manager.driver(sessionId).searchObjects(query, limit))
-  ipcMain.handle('db:definition', (_e, sessionId: string, ref: ObjectRef) => manager.driver(sessionId).definition(ref))
-  ipcMain.handle('db:tableDetails', (_e, sessionId: string, ref: TableRef) => manager.driver(sessionId).tableDetails(ref))
-  ipcMain.handle('db:rows', (_e, sessionId: string, req: RowsRequest) => manager.driver(sessionId).rows(req))
-  ipcMain.handle('db:count', (_e, sessionId: string, ref: TableRef, where?: string) => manager.driver(sessionId).count(ref, where))
-  ipcMain.handle('db:query', (_e, sessionId: string, sql: string, params: unknown[], maxRows: number) =>
-    manager.driver(sessionId).query(sql, params, maxRows)
+  ipcMain.handle('db:listObjects', (_e, sessionId: string, req: ListObjectsRequest) => manager.read(sessionId, (d) => d.listObjects(req)))
+  ipcMain.handle('db:searchObjects', (_e, sessionId: string, query: string, limit: number) => manager.read(sessionId, (d) => d.searchObjects(query, limit)))
+  ipcMain.handle('db:definition', (_e, sessionId: string, ref: ObjectRef) => manager.read(sessionId, (d) => d.definition(ref)))
+  ipcMain.handle('db:tableDetails', (_e, sessionId: string, ref: TableRef) => manager.read(sessionId, (d) => d.tableDetails(ref)))
+  ipcMain.handle('db:rows', (_e, sessionId: string, req: RowsRequest) => manager.read(sessionId, (d) => d.rows(req)))
+  ipcMain.handle('db:count', (_e, sessionId: string, ref: TableRef, where?: string) => manager.read(sessionId, (d) => d.count(ref, where)))
+  ipcMain.handle('db:query', async (_e, sessionId: string, sql: string, params: unknown[], maxRows: number) =>
+    (await manager.driver(sessionId)).query(sql, params, maxRows)
   )
-  ipcMain.handle('db:cancel', (_e, sessionId: string) => manager.driver(sessionId).cancel())
-  ipcMain.handle('db:apply', (_e, sessionId: string, changes: PendingChange[]) => manager.driver(sessionId).apply(changes))
+  ipcMain.handle('db:cancel', (_e, sessionId: string) => manager.cancel(sessionId))
+  ipcMain.handle('db:apply', async (_e, sessionId: string, changes: PendingChange[]) => (await manager.driver(sessionId)).apply(changes))
 
-  ipcMain.handle('sftp:readdir', (_e, sessionId: string, p: string) => manager.fileSession(sessionId).readdir(p))
-  ipcMain.handle('sftp:home', (_e, sessionId: string) => manager.fileSession(sessionId).home())
+  ipcMain.handle('sftp:readdir', (_e, sessionId: string, p: string) => manager.readFiles(sessionId, (s) => s.readdir(p)))
+  ipcMain.handle('sftp:home', (_e, sessionId: string) => manager.readFiles(sessionId, (s) => s.home()))
   ipcMain.handle('dialog:pickSqliteFile', async (_e, current?: string) => {
     const r = await dialog.showOpenDialog(mainWindow as BrowserWindow, {
       title: 'Choose an SQLite database',
@@ -355,7 +419,19 @@ function registerIpc(): void {
     e.returnValue = true
   })
   ipcMain.handle('settings:get', () => settingsStore.get())
-  ipcMain.handle('settings:update', (_e, u: AiSettingsUpdate) => settingsStore.update(u))
+  ipcMain.handle('settings:update', async (_e, u: AiSettingsUpdate) => {
+    // Semantic detection is only offered once the model is installed; a request to switch it on without one is ignored.
+    if (u.privacy?.semanticDetection && !(await semanticModel.detector())) u = { ...u, privacy: { ...u.privacy, semanticDetection: false } }
+    return settingsStore.update(u)
+  })
+  ipcMain.handle('privacy:model-status', () => semanticModel.status())
+  ipcMain.handle('privacy:model-install', () => semanticModel.install())
+  ipcMain.handle('privacy:model-cancel', () => semanticModel.cancel())
+  ipcMain.handle('privacy:model-remove', async () => {
+    const status = await semanticModel.remove()
+    await settingsStore.update({ privacy: { semanticDetection: false } })
+    return status
+  })
   ipcMain.handle('settings:testProvider', async (_e, overrides: AiConnectionInput | null) => {
     try {
       const { provider, connection } = await providerFor(overrides ?? undefined)
@@ -369,7 +445,7 @@ function registerIpc(): void {
       } catch (err) {
         // Some servers have no model listing; a tiny completion still proves the connection.
         if (!(err instanceof ProviderError) || err.errorKind === 'auth' || err.errorKind === 'network') throw err
-        const res = await provider.complete({ system: [{ text: 'Reply with the single word OK.' }], messages: [{ role: 'user', content: 'ping' }] })
+        const res = await provider.complete(sendUnprotected({ system: [{ text: 'Reply with the single word OK.' }], messages: [{ role: 'user', content: 'ping' }] }, 'fixed-text'))
         return { ok: true, message: `Connected to ${res.model || connection.defaultModel}.` }
       }
     } catch (err: any) {
@@ -381,27 +457,37 @@ function registerIpc(): void {
     return provider.listModels()
   })
 
-  ipcMain.handle('ai:ask', async (_e, sessionId: string, question: string, history: AiTurn[], requestId: string) => {
+  ipcMain.handle('ai:ask', async (_e, sessionId: string, question: string, history: AiTurn[], requestId: string, conversationId?: string) => {
     const conn = manager.get(sessionId)
-    const driver = manager.driver(sessionId)
     const kind = conn.config.kind
     const controller = new AbortController()
     const id = requestId || crypto.randomUUID()
+    const chatId = conversationId || id
     aiRequests.set(id, controller)
     let seq = 0
     const onProgress = (step: AiProgressStep) => {
       const event: AiProgressEvent = { ...step, requestId: id, seq: ++seq, ts: Date.now() }
       send('ai:progress', event)
     }
+    // Every byte the adapters exchange with the provider during this ask, for the user to inspect afterwards.
+    const wire = new WireRecorder()
+    const started = Date.now()
+    let host = ''
+    let gateway: ModelGateway | undefined
+    let blocked: string | undefined
     try {
-      const { provider, settings, connection } = await providerFor()
+      const { provider, settings, connection, baseUrl } = await providerFor(undefined, { fetchImpl: wire.fetch })
+      host = classifyEndpoint(baseUrl).host
+      gateway = await gatewayFor(provider, baseUrl, settings.privacy, sessionId, chatId, controller.signal)
+      // A link that dropped while idle is made again before the ask starts on the database.
+      await manager.ready(sessionId)
       let index: SchemaIndex
       const cached = schemaIndexes.get(sessionId)
       if (cached) index = await cached
       else {
         onProgress({ stepId: 'index', stage: 'index', status: 'running', message: 'Reading the schema' })
         try {
-          index = await schemaIndexFor(sessionId, driver, kind)
+          index = await schemaIndexFor(sessionId, kind)
           onProgress({ stepId: 'index', stage: 'index', status: 'done', message: 'Reading the schema', detail: `${index.tables.size.toLocaleString('en-US')} tables indexed` })
         } catch (err) {
           onProgress({ stepId: 'index', stage: 'index', status: 'error', message: 'Reading the schema', detail: err instanceof Error ? err.message : String(err) })
@@ -413,10 +499,11 @@ function registerIpc(): void {
           kind,
           serverVersion: conn.driver?.info()?.serverVersion ?? kind,
           index,
-          provider,
+          provider: gateway,
           settings: { ...settings.agent, embeddingModel: connection.embeddingModel },
-          runQuery: (sql, maxRows) => driver.query(sql, [], maxRows, { readOnly: true }),
-          distinctValues: (ref, column) => distinctValuesFor(driver, kind, ref, column),
+          // Read-only, so safe to run again should the link drop under them.
+          runQuery: (sql, maxRows) => manager.read(sessionId, (d) => d.query(sql, [], maxRows, { readOnly: true })),
+          distinctValues: (ref, column) => manager.read(sessionId, (d) => distinctValuesFor(d, kind, ref, column)),
           embeddingCache,
           recentTables: recentTables.get(sessionId),
           onProgress,
@@ -430,12 +517,38 @@ function registerIpc(): void {
         recentTables.set(sessionId, recent)
       }
       return result
+    } catch (err) {
+      if (err instanceof PrivacyBlockedError) blocked = err.message
+      throw err
     } finally {
       aiRequests.delete(id)
+      if (host) {
+        transcripts.put(sessionId, chatId, {
+          requestId: id,
+          host,
+          at: started,
+          protected: gateway ? Boolean(gateway.privacy) : Boolean(blocked),
+          exemption: gateway?.exemption ?? undefined,
+          exchanges: wire.exchanges,
+          legend: gateway?.transcriptLegend(wire.exchanges.map((x) => x.request)) ?? [],
+          report: gateway?.report(),
+          ...(blocked ? { blocked } : {})
+        })
+      }
     }
+  })
+  ipcMain.handle('ai:transcript', (_e, requestId: string, opts?: { values?: boolean }) => {
+    const held = typeof requestId === 'string' ? transcripts.get(requestId) : undefined
+    if (!held) return null
+    return transcriptForViewer(held.transcript, conversations.peek(held.sessionId, held.conversationId), opts?.values === true)
   })
   ipcMain.handle('ai:cancel', (_e, requestId: string) => {
     aiRequests.get(requestId)?.abort()
+  })
+  ipcMain.handle('ai:forget', (_e, conversationId: string, opts?: { transcripts?: boolean }) => {
+    if (typeof conversationId !== 'string' || !conversationId) return
+    conversations.forget(conversationId)
+    if (opts?.transcripts) transcripts.forgetConversation(conversationId)
   })
 
   ipcMain.handle('export:save', async (_e, req: ExportRequest) => {
@@ -483,9 +596,16 @@ if (!app.requestSingleInstanceLock()) {
     sshProfileStore = new SshProfileStore(path.join(userData, 'ssh-profiles.json'), codec)
     workspaceStore = new WorkspaceStore(path.join(userData, 'workspace.json'))
     embeddingCache = new EmbeddingCache(path.join(userData, 'ai-cache', 'embeddings.json'))
+    semanticModel = new SemanticModel({
+      // Electron's fetch follows the system's proxy settings, which a company network may require.
+      store: new ModelStore({ root: path.join(userData, 'models'), manifest: GLINER_PII_BASE, fetch: (input, init) => net.fetch(input as string, init) }),
+      spawn: spawnModelHost,
+      unsupported: unsupportedReason(),
+      onStatus: (status) => send('privacy:model-status', status)
+    })
     knownHosts = new KnownHostsStore(path.join(userData, 'known_hosts.json'), path.join(os.homedir(), '.ssh', 'known_hosts'))
     manager = new ConnectionManager({ agentSource, verifyHostKey, resolveSshProfile: (id) => sshProfileStore.get(id) })
-    manager.on('closed', (e: { sessionId: string; reason: string }) => send('session:closed', e))
+    manager.on('link', (e: SessionLinkEvent) => send('session:link', e))
     registerIpc()
     buildMenu()
     mainWindow = createWindow()
@@ -501,5 +621,6 @@ if (!app.requestSingleInstanceLock()) {
 
   app.on('before-quit', () => {
     void manager?.closeAll()
+    semanticModel?.dispose()
   })
 }

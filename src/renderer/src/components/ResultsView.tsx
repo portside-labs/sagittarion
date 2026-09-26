@@ -1,12 +1,14 @@
 import { useEffect, useMemo, useState } from 'react'
 import type { CellValue, PendingChange, RowKey, RowsResult, StatementResult, TableRef } from '@shared/types'
 import { tableKey } from '@shared/connections'
-import { DataGrid, type CellPos, type GridColumn } from './DataGrid'
+import { DataGrid, type GridColumn, type GridMenuContext, type GridSelection } from './DataGrid'
 import { CellInspector } from './CellInspector'
 import { Icon } from './Icons'
 import { editableSource } from '@/lib/sql-source'
 import { valuesEqual } from '@/lib/format'
-import { errorMessage, formatDuration, formatNumber } from '@/lib/util'
+import { activeCell } from '@/lib/grid-selection'
+import { errorMessage, formatDuration, formatNumber, isMac } from '@/lib/util'
+import type { MenuItem } from './ContextMenu'
 import { useSession } from '@/session-store'
 import { useStore } from '@/store'
 
@@ -48,7 +50,7 @@ export function ResultsView({
   onDirty?: (dirty: boolean) => void
 }) {
   const [idx, setIdx] = useState(0)
-  const [selection, setSelection] = useState<CellPos | null>(null)
+  const [selection, setSelection] = useState<GridSelection>([])
   const [inspector, setInspector] = useState(false)
   /** Staged cell edits per result index. */
   const [edits, setEdits] = useState<Map<number, Edits>>(new Map())
@@ -57,6 +59,7 @@ export function ResultsView({
   const loadTable = useSession((s) => s.loadTable)
   const confirm = useStore((s) => s.confirm)
   const toast = useStore((s) => s.toast)
+  const setStatus = useSession((s) => s.setStatus)
 
   useEffect(() => {
     if (!results) return
@@ -72,7 +75,7 @@ export function ResultsView({
       }
       setIdx(Math.max(0, last))
     }
-    setSelection(null)
+    setSelection([])
     setEdits(new Map())
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [runKey, results === null])
@@ -108,6 +111,17 @@ export function ResultsView({
     })
     return { table: { schema: details.schema, name: details.name }, columns, keyFor }
   }, [current, source, tables])
+
+  // Rebuilt only with the result, so the grid redraws just the rows that change.
+  const gridColumns = useMemo<GridColumn[]>(
+    () => plan?.columns ?? (current?.kind === 'rows' ? current.columns.map((c) => ({ name: c.name, declType: c.declType, inferred: c.inferred })) : []),
+    [plan, current]
+  )
+  const activePos = activeCell(selection)
+  const menuItems = ({ setNull }: GridMenuContext): MenuItem[] => [
+    { label: 'Inspect value', onClick: () => setInspector(true) },
+    ...(plan ? [{ label: 'Set NULL', shortcut: isMac ? '⌘⌫' : 'Ctrl+Del', disabled: !setNull, onClick: setNull }] : [])
+  ]
 
   const pending = edits.get(idx)
   const pendingCount = pending?.size ?? 0
@@ -191,45 +205,10 @@ export function ResultsView({
     )
   }
   const totalMs = results.reduce((s, r) => s + (r.durationMs ?? 0), 0)
-  const gridColumns: GridColumn[] = plan?.columns ?? (current.kind === 'rows' ? current.columns.map((c) => ({ name: c.name, declType: c.declType, inferred: c.inferred })) : [])
-  const selectedColumn = current.kind === 'rows' && selection ? gridColumns[selection.col] : null
+  const selectedColumn = current.kind === 'rows' && activePos ? gridColumns[activePos.col] : null
 
   return (
     <div className="results" data-testid="results">
-      <div className="result-chips">
-        {results.map((r, i) => (
-          <button key={i} className={`chip ${i === idx ? 'active' : ''} ${r.kind === 'error' ? 'error' : ''}`} onClick={() => setIdx(i)} title={r.sql}>
-            <span className="n">{i + 1}</span>
-            {chipLabel(r)}
-            {edits.get(i)?.size ? <span className="chip-dot" title="Has staged edits" /> : null}
-          </button>
-        ))}
-        <span className="spacer" style={{ flex: 1 }} />
-        {pendingCount > 0 ? (
-          <>
-            <button className="btn small success" onClick={() => void apply()} disabled={applying} data-testid="results-apply">
-              {applying ? <span className="spinner" /> : <Icon name="check" />} Apply {pendingCount}
-            </button>
-            <button className="btn small" onClick={discard} disabled={applying} data-testid="results-discard">
-              Discard
-            </button>
-          </>
-        ) : (
-          <span className="muted" style={{ color: 'var(--text-muted)', whiteSpace: 'nowrap' }}>
-            {results.length} statement{results.length === 1 ? '' : 's'} · {formatDuration(totalMs)}
-          </span>
-        )}
-        {current.kind === 'rows' ? (
-          <>
-            <button className="btn ghost icon small" title="Export this result" onClick={() => onExport(current)}>
-              <Icon name="download" />
-            </button>
-            <button className={`btn ghost icon small ${inspector ? 'active' : ''}`} title="Toggle cell inspector" onClick={() => setInspector((v) => !v)}>
-              <Icon name="panel" />
-            </button>
-          </>
-        ) : null}
-      </div>
       {current.kind === 'rows' ? (
         <div className="grid-area">
           <DataGrid
@@ -238,20 +217,22 @@ export function ResultsView({
             editable={Boolean(plan)}
             pendingUpdates={pending}
             selection={selection}
-            onSelect={setSelection}
+            onSelectionChange={setSelection}
             onEdit={plan ? onEdit : undefined}
+            menuItems={menuItems}
             onActivate={() => setInspector(true)}
+            onCopied={setStatus}
             emptyMessage="Query returned no rows"
             testId="result-grid"
           />
           {inspector ? (
             <CellInspector
               column={selectedColumn}
-              value={selection ? (pending?.get(selection.row)?.[selectedColumn?.name ?? ''] ?? current.rows[selection.row]?.[selection.col]) : undefined}
+              value={activePos ? (pending?.get(activePos.row)?.[selectedColumn?.name ?? ''] ?? current.rows[activePos.row]?.[activePos.col]) : undefined}
               editable={Boolean(plan) && Boolean(selectedColumn) && !selectedColumn?.readOnly}
-              onStage={plan && selection && selectedColumn ? (v) => onEdit(selection.row, selectedColumn.name, v) : undefined}
+              onStage={plan && activePos && selectedColumn ? (v) => onEdit(activePos.row, selectedColumn.name, v) : undefined}
               onClose={() => setInspector(false)}
-              rowLabel={selection ? `#${selection.row + 1}` : undefined}
+              rowLabel={activePos ? `#${activePos.row + 1}` : undefined}
             />
           ) : null}
         </div>
@@ -275,6 +256,50 @@ export function ResultsView({
       {current.kind === 'rows' && current.truncated ? (
         <div className="banner info">Showing the first {formatNumber(current.rowCount)} rows. Raise the row limit in the toolbar to fetch more.</div>
       ) : null}
+      {/* The bar with the row count, time and actions stays at the bottom of the pane. */}
+      <div className="result-chips">
+        {/* One badge per statement, to switch between their results; a single statement's result needs none. */}
+        {results.length > 1 ? results.map((r, i) => (
+          <button
+            key={i}
+            className={`chip ${i === idx ? 'active' : ''} ${r.kind === 'error' ? 'error' : ''}`}
+            onClick={() => {
+              if (i !== idx) setSelection([])
+              setIdx(i)
+            }}
+            title={r.sql}
+          >
+            <span className="n">{i + 1}</span>
+            {chipLabel(r)}
+            {edits.get(i)?.size ? <span className="chip-dot" title="Has staged edits" /> : null}
+          </button>
+        )) : null}
+        <span className="spacer" style={{ flex: 1 }} />
+        {pendingCount > 0 ? (
+          <>
+            <button className="btn small success" onClick={() => void apply()} disabled={applying} data-testid="results-apply">
+              {applying ? <span className="spinner" /> : <Icon name="check" />} Apply {pendingCount}
+            </button>
+            <button className="btn small" onClick={discard} disabled={applying} data-testid="results-discard">
+              Discard
+            </button>
+          </>
+        ) : (
+          <span className="muted" style={{ color: 'var(--text-muted)', whiteSpace: 'nowrap' }} data-testid="results-summary">
+            {results.length === 1 ? chipLabel(current) : `${results.length} statements`} · {formatDuration(totalMs)}
+          </span>
+        )}
+        {current.kind === 'rows' ? (
+          <>
+            <button className="btn ghost icon small" title="Export this result" onClick={() => onExport(current)}>
+              <Icon name="download" />
+            </button>
+            <button className={`btn ghost icon small ${inspector ? 'active' : ''}`} title="Toggle cell inspector" onClick={() => setInspector((v) => !v)}>
+              <Icon name="panel" />
+            </button>
+          </>
+        ) : null}
+      </div>
     </div>
   )
 }

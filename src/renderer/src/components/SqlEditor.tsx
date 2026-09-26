@@ -36,8 +36,8 @@ interface Props {
 
 const appTheme = EditorView.theme(
   {
-    '&': { backgroundColor: 'var(--bg-editor)', fontSize: '13px', height: '100%' },
-    '.cm-scroller': { fontFamily: 'var(--mono)', lineHeight: '1.55' },
+    '&': { backgroundColor: 'var(--bg-editor)', fontSize: 'var(--code-size)', height: '100%' },
+    '.cm-scroller': { fontFamily: 'var(--mono)', lineHeight: 'var(--code-line)' },
     '.cm-gutters': { backgroundColor: 'var(--bg-editor)', borderRight: '1px solid var(--border)', color: 'var(--text-faint)' },
     '.cm-activeLineGutter': { backgroundColor: 'rgba(255,255,255,0.04)' },
     '.cm-activeLine': { backgroundColor: 'rgba(255,255,255,0.03)' },

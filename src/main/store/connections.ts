@@ -17,9 +17,13 @@ export const noopCodec: SecretCodec = {
   decrypt: () => null
 }
 
-/** Accepts the pre-multi-database file layout (SSH fields at the top level) as well as the current one. */
-export function migrateStored(raw: any): StoredConnection | null {
-  if (!raw || typeof raw !== 'object' || typeof raw.id !== 'string') return null
+/**
+ * Accepts the pre-multi-database file layout (SSH fields at the top level) as well as the current one. A colour saved
+ * with a connection is dropped: colours belong to groups now.
+ */
+export function migrateStored(input: any): StoredConnection | null {
+  if (!input || typeof input !== 'object' || typeof input.id !== 'string') return null
+  const { color: _color, ...raw } = input
   if (raw.ssh && typeof raw.ssh === 'object') return raw as StoredConnection
   if (typeof raw.host === 'string') {
     const { host, port, username, auth, savePassword, privateKeyPath, savePassphrase, encryptedPassword, encryptedPassphrase, remotePath, ...rest } = raw

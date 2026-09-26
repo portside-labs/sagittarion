@@ -26,8 +26,13 @@
   --new-row: rgba(62, 207, 142, 0.12);
   --deleted-row: rgba(255, 95, 87, 0.14);
   --selection: rgba(255, 255, 255, 0.22);
-  --mono: ui-monospace, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
-  --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, Roboto, Helvetica, Arial, sans-serif;
+  --range-fill: color-mix(in srgb, var(--accent) 16%, transparent);
+  /* Consolas and Liberation Mono keep Windows and Linux off Courier when none of the first three is installed. */
+  --mono: "SF Mono", "JetBrains Mono", Menlo, Consolas, "Liberation Mono", monospace;
+  /* Code and SQL: the editor and every block that shows a statement or a request. */
+  --code-size: 12px;
+  --code-line: 1.6;
+  --sans: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", sans-serif;
   --radius: 6px;
   --radius-sm: 4px;
   --titlebar-h: 40px;
@@ -134,6 +139,13 @@ body.mac .titlebar {
 }
 .dot.warn {
   background: var(--warn);
+}
+.dot.err {
+  background: var(--danger);
+  box-shadow: 0 0 0 3px var(--danger-soft);
+}
+.dot.busy {
+  animation: pulse-dot 1s ease-in-out infinite;
 }
 
 /* ---------------------------------------------------------------- buttons */
@@ -362,8 +374,8 @@ select.select {
 .conn-item {
   display: flex;
   align-items: center;
-  gap: 10px;
-  padding: 8px 10px;
+  gap: 9px;
+  padding: 6px 8px;
   border-radius: var(--radius);
   cursor: pointer;
   position: relative;
@@ -374,44 +386,46 @@ select.select {
 .conn-item.active {
   background: var(--accent-soft);
 }
-.conn-item .conn-dot {
-  width: 10px;
-  height: 10px;
-  border-radius: 50%;
-  flex: 0 0 auto;
-  background: var(--text-faint);
-}
-.conn-item .conn-text {
+.conn-item .conn-name {
   flex: 1;
   min-width: 0;
-}
-.conn-item .conn-name {
   font-weight: 600;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-.conn-item .conn-sub {
-  color: var(--text-muted);
-  font-size: 11.5px;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  font-family: var(--mono);
-}
 /* ---- connection groups ---- */
 .conn-group + .conn-group {
   margin-top: 8px;
 }
-/* A coloured group: a soft tint and a hairline in its colour, with the name in the colour too. */
+/*
+ * A coloured group, in the connection list or among the tabs. Each shade is the group's colour at a set lightness
+ * with much of its chroma kept, so fills stay rich instead of greying out and no colour looks heavier than another.
+ */
+.conn-group.tinted,
+.conn-tab-group.tinted {
+  --group-fill: oklch(from var(--group-color) 0.225 calc(c * 0.32) h);
+  --group-fill-hover: oklch(from var(--group-color) 0.265 calc(c * 0.38) h);
+  --group-fill-active: oklch(from var(--group-color) 0.305 calc(c * 0.44) h);
+  --group-line: oklch(from var(--group-color) 0.48 calc(c * 0.68) h);
+  --group-ink: oklch(from var(--group-color) max(l, 0.8) c h);
+}
+/* In the list: the fill and a hairline in the colour, the name in it too, and rows that keep to it when hovered or picked. */
 .conn-group.tinted {
   padding: 2px;
   border-radius: 10px;
-  background: color-mix(in srgb, var(--group-color) 9%, transparent);
-  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--group-color) 38%, transparent);
+  background: var(--group-fill);
+  box-shadow: inset 0 0 0 1px var(--group-line);
 }
 .conn-group.tinted .conn-group-name {
-  color: var(--group-color);
+  color: var(--group-ink);
+}
+.conn-group.tinted .conn-group-header:hover,
+.conn-group.tinted .conn-item:hover {
+  background: var(--group-fill-hover);
+}
+.conn-group.tinted .conn-item.active {
+  background: var(--group-fill-active);
 }
 .context-menu-custom {
   padding: 4px 10px 6px;
@@ -841,18 +855,11 @@ select.select {
   background: var(--bg-hover);
   color: var(--text);
 }
+/* The tab in front is marked by its lighter background and brighter text; a line along its top edge would crowd the
+   group lines of the connection tabs just above it. */
 .tab.active {
   background: var(--bg);
   color: var(--text);
-}
-.tab.active::after {
-  content: '';
-  position: absolute;
-  left: 0;
-  right: 0;
-  top: 0;
-  height: 2px;
-  background: var(--accent);
 }
 .tab .tab-title {
   overflow: hidden;
@@ -1044,7 +1051,8 @@ select.select {
   margin: 0;
   white-space: pre-wrap;
   font-family: var(--mono);
-  font-size: 12px;
+  font-size: var(--code-size);
+  line-height: var(--code-line);
 }
 .loading-bar {
   height: 2px;
@@ -1082,6 +1090,8 @@ select.select {
   overflow: auto;
   outline: none;
   position: relative;
+  /* Cells scrolled into view stay clear of the header and the row numbers, which stick. */
+  scroll-padding: var(--row-h) 0 0 52px;
 }
 table.grid {
   border-collapse: separate;
@@ -1236,6 +1246,15 @@ table.grid {
 .grid td.cell-selected {
   outline: 2px solid var(--accent);
   outline-offset: -2px;
+}
+/* A selection of more than one cell: a wash over the cells, laid over whatever colour a pending edit gives them. */
+.grid td.cell-in-range {
+  box-shadow: inset 0 0 0 100vmax var(--range-fill);
+}
+.grid tbody tr.row-in-range td.rownum,
+.grid thead th.col-in-range {
+  color: var(--text);
+  background: #262a33;
 }
 .grid td .cell-text {
   display: block;
@@ -1456,15 +1475,22 @@ table.struct {
   flex-direction: column;
   min-height: 0;
 }
+/* The bar under a result: statement badges, row count and time, actions. At the bottom however short the result. */
 .result-chips {
   display: flex;
   align-items: center;
   gap: 6px;
+  margin-top: auto;
   padding: 6px 10px;
-  border-bottom: 1px solid var(--border);
+  border-top: 1px solid var(--border);
   background: var(--bg-panel);
   overflow-x: auto;
   flex: 0 0 auto;
+}
+/* The row-limit notice sits between the rows and the bar. */
+.results > .banner {
+  border-bottom: none;
+  border-top: 1px solid var(--border);
 }
 .chip {
   display: inline-flex;
@@ -1499,6 +1525,9 @@ table.struct {
   color: var(--text);
   line-height: 1.7;
   user-select: text;
+  /* A long error scrolls, so the bar under it stays in view. */
+  min-height: 0;
+  overflow: auto;
 }
 .result-message .muted {
   color: var(--text-muted);
@@ -1510,7 +1539,8 @@ table.struct {
   background: var(--bg-input);
   border: 1px solid var(--border);
   font-family: var(--mono);
-  font-size: 12px;
+  font-size: var(--code-size);
+  line-height: var(--code-line);
   white-space: pre-wrap;
   max-height: 200px;
   overflow: auto;
@@ -1563,6 +1593,14 @@ table.struct {
 .statusbar .status-ro {
   color: var(--accent);
 }
+/* Kept whole: the details to its left give way first. */
+.statusbar .status-link {
+  flex: 0 0 auto;
+  color: var(--warn);
+}
+.statusbar .status-link.busy {
+  color: var(--text-muted);
+}
 
 /* ---------------------------------------------------------------- modal */
 .modal-backdrop {
@@ -1578,6 +1616,9 @@ table.struct {
   width: 640px;
   max-width: calc(100vw - 40px);
   max-height: calc(100vh - 80px);
+  /* A tall dialog reaches up over the window's drag areas (the top bars), where macOS would take a click to move the
+     window and the dialog's own controls, its close button first, would never get it. */
+  -webkit-app-region: no-drag;
   background: var(--bg-elev);
   border: 1px solid var(--border-strong);
   border-radius: 10px;
@@ -1803,6 +1844,10 @@ table.struct {
   --toast-accent: var(--ok);
   --toast-glow: rgba(62, 207, 142, 0.2);
 }
+.toast.warn {
+  --toast-accent: var(--warn);
+  --toast-glow: rgba(230, 162, 60, 0.2);
+}
 .toast.error {
   --toast-accent: var(--danger);
   --toast-glow: rgba(255, 95, 87, 0.22);
@@ -1919,10 +1964,11 @@ table.struct {
 }
 
 /* ---------------------------------------------------------------- settings + ask */
-/* The settings dialog keeps one height whichever tab is showing; each tab scrolls inside it. */
+/* The settings dialog keeps one height whichever tab is showing, as much of the window as it can up to 880px
+   (.modal keeps it inside the window); each tab scrolls inside it. */
 .modal.settings-modal {
   position: relative;
-  height: 620px;
+  height: 880px;
 }
 .settings-body {
   display: flex;
@@ -2237,14 +2283,13 @@ table.struct {
   border-color: #59b8e8;
 }
 .conn-item .conn-kind {
-  width: 30px;
-  height: 30px;
-  border-radius: 8px;
+  width: 24px;
+  height: 24px;
+  border-radius: 6px;
   display: inline-flex;
   align-items: center;
   justify-content: center;
   flex: 0 0 auto;
-  margin-left: auto;
   background: var(--bg-active);
 }
 .conn-item .conn-kind.postgres {
@@ -2338,6 +2383,12 @@ table.struct {
   white-space: pre-wrap;
   word-break: break-word;
 }
+.chat-msg.user .chat-text {
+  font-size: 13.5px;
+}
+.chat-msg.assistant .chat-text {
+  font-size: 13px;
+}
 .chat-hint {
   color: var(--text-muted);
   font-size: 11.5px;
@@ -2347,13 +2398,15 @@ table.struct {
   padding: 6px 8px;
   border-radius: 6px;
   background: var(--bg-editor);
+  /* Plain text in One Dark's colour, as in the editor; keywords, strings and numbers carry their own. */
+  color: #abb2bf;
   font-family: var(--mono);
-  font-size: 11.5px;
+  font-size: var(--code-size);
+  line-height: var(--code-line);
   white-space: pre-wrap;
   word-break: break-word;
   max-height: 140px;
   overflow: auto;
-  color: var(--text-muted);
 }
 .chat-chips {
   display: flex;
@@ -3022,8 +3075,8 @@ html.mac .conn-tabs {
   display: inline-flex;
   align-items: center;
   gap: 7px;
-  height: 30px;
-  margin-bottom: 4px;
+  height: 26px;
+  margin-bottom: 6px;
   padding: 0 6px 0 10px;
   border-radius: 8px;
   color: var(--text-muted);
@@ -3081,9 +3134,9 @@ html.mac .conn-tabs {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  width: 28px;
-  height: 28px;
-  margin-bottom: 5px;
+  width: 26px;
+  height: 26px;
+  margin-bottom: 6px;
   border: none;
   border-radius: 8px;
   background: transparent;
@@ -3174,8 +3227,248 @@ html.mac .app-shell.has-tabs .sidebar-header {
 html.mac .app-shell.has-tabs .conn-list-header {
   padding-left: 14px;
 }
-.conn-item .conn-dot.connected {
-  box-shadow: 0 0 0 2px var(--bg-panel), 0 0 0 3.5px #3ecf8e;
+/* A connection in use has its logo ringed: green while connected, red once dropped, amber while it reconnects. An
+   outline rather than a ring of shadow, so the gap shows the row behind it, tinted or not. */
+.conn-item.link-up .conn-kind,
+.conn-item.link-down .conn-kind,
+.conn-item.link-reconnecting .conn-kind {
+  outline: 1.5px solid var(--ok);
+  outline-offset: 1.5px;
+}
+.conn-item.link-down .conn-kind {
+  outline-color: var(--danger);
+}
+.conn-item.link-reconnecting .conn-kind {
+  outline-color: var(--warn);
+  animation: pulse-dot 1s ease-in-out infinite;
+}
+
+/* ---- tab groups: a connection group's tabs side by side behind its label, as in a browser ---- */
+.conn-tab-group {
+  --group-fill: var(--bg-elev);
+  --group-fill-hover: var(--bg-hover);
+  --group-fill-active: var(--bg-active);
+  --group-line: var(--border-strong);
+  --group-ink: var(--text-muted);
+  --group-mark: var(--text-faint);
+  position: relative;
+  display: flex;
+  align-items: flex-end;
+  gap: 4px;
+  height: 100%;
+  flex: 0 0 auto;
+  transition: gap 180ms ease;
+}
+.conn-tab-group.tinted {
+  --group-mark: var(--group-color);
+}
+.conn-tabs > .conn-tab-group {
+  margin: 0 3px;
+}
+/*
+ * The label is the size of a tab, with the same corners and type size, so a group's name and its tabs sit level;
+ * the group's colour and a bolder weight tell it apart. Without a colour it is only outlined, so it never looks like
+ * the tab in front.
+ */
+.conn-tab-group-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  flex: 0 0 auto;
+  max-width: 160px;
+  height: 26px;
+  margin-bottom: 6px;
+  padding: 0 11px;
+  border-radius: 8px;
+  background: var(--group-fill);
+  box-shadow: inset 0 0 0 1px var(--group-line);
+  color: var(--group-ink);
+  font-size: 12.5px;
+  font-weight: 600;
+  white-space: nowrap;
+  cursor: pointer;
+  user-select: none;
+  -webkit-app-region: no-drag;
+}
+.conn-tab-group:not(.tinted) .conn-tab-group-label {
+  background: transparent;
+}
+.conn-tab-group-label:hover {
+  background: var(--group-fill-hover);
+  box-shadow: inset 0 0 0 1px var(--group-mark);
+}
+.conn-tab-group-label:focus-visible {
+  outline: 2px solid var(--group-mark);
+  outline-offset: 2px;
+}
+.conn-tab-group-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+/* How many tabs a collapsed group holds. */
+.conn-tab-group-count {
+  font-variant-numeric: tabular-nums;
+  opacity: 0.7;
+}
+/* The line under the group's tabs, from its label to its last tab: a hairline, like the app's other rules. */
+.conn-tab-group::after {
+  content: '';
+  position: absolute;
+  left: 3px;
+  right: 0;
+  bottom: 0;
+  height: 1px;
+  background: var(--group-mark);
+  pointer-events: none;
+  transition: opacity 180ms ease;
+}
+/*
+ * Collapsing: the box around the tabs closes to nothing while the tabs, held to its far end, slide in under the
+ * label; once shut they are out of sight. Opening runs the other way.
+ */
+.conn-tab-group-tabs {
+  display: grid;
+  grid-template-columns: 1fr;
+  min-width: 0;
+  height: 100%;
+  transition: grid-template-columns 180ms ease;
+}
+.conn-tab-group-list {
+  display: flex;
+  align-items: flex-end;
+  justify-content: flex-end;
+  gap: 4px;
+  min-width: 0;
+  height: 100%;
+  overflow-x: clip;
+  transition: visibility 0s;
+}
+.conn-tab-group-list > .conn-tab {
+  flex-shrink: 0;
+}
+.conn-tab-group.collapsed {
+  gap: 0;
+}
+.conn-tab-group.collapsed::after {
+  opacity: 0;
+}
+.conn-tab-group.collapsed .conn-tab-group-tabs {
+  grid-template-columns: 0fr;
+}
+.conn-tab-group.collapsed .conn-tab-group-list {
+  visibility: hidden;
+  transition: visibility 0s linear 180ms;
+}
+.conn-rail .conn-tab-group {
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+  flex: 0 0 auto;
+  width: 64px;
+  height: auto;
+  padding: 5px 0 4px;
+  border-radius: 12px;
+  background: var(--group-fill);
+  box-shadow: inset 0 0 0 1px var(--group-line);
+}
+.conn-rail .conn-tab-group.collapsed {
+  gap: 0;
+}
+.conn-rail .conn-tab-group::after {
+  display: none;
+}
+/* In the rail the tabs fold upwards, and the active tab's marker still shows beside them. */
+.conn-rail .conn-tab-group-tabs,
+.conn-rail .conn-tab-group.collapsed .conn-tab-group-tabs {
+  grid-template-columns: 1fr;
+  grid-template-rows: 1fr;
+  width: 100%;
+  height: auto;
+  transition: grid-template-rows 180ms ease;
+}
+.conn-rail .conn-tab-group.collapsed .conn-tab-group-tabs {
+  grid-template-rows: 0fr;
+}
+.conn-rail .conn-tab-group-list {
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+  min-height: 0;
+  height: auto;
+  overflow-x: visible;
+  overflow-y: clip;
+}
+/* On the group's fill, its tabs hover and stand out in its colour rather than in grey. */
+.conn-rail .conn-tab-group.tinted .conn-tab:hover {
+  background: var(--group-fill-hover);
+}
+.conn-rail .conn-tab-group.tinted .conn-tab.active {
+  background: var(--group-fill-active);
+  box-shadow: inset 0 0 0 1px var(--group-line);
+}
+.conn-rail .conn-tab-group-label {
+  flex-direction: column;
+  gap: 3px;
+  max-width: 62px;
+  height: auto;
+  margin: 0;
+  padding: 1px 2px;
+  border-radius: 5px;
+  line-height: 14px;
+  background: none;
+  box-shadow: none;
+  font-size: 10px;
+}
+.conn-rail .conn-tab-group-label:hover {
+  background: var(--group-fill-hover);
+  box-shadow: none;
+}
+.conn-rail .conn-tab-group-name {
+  max-width: 100%;
+}
+.conn-rail .conn-tab-group-count {
+  min-width: 18px;
+  padding: 0 5px;
+  border-radius: 7px;
+  background: var(--group-fill-active);
+  font-size: 9.5px;
+  text-align: center;
+  opacity: 1;
+}
+
+/* ---- dragging tabs into a new order ---- */
+.sorting > [data-sort-item]:not(.dragging) {
+  transition: transform 150ms ease;
+}
+[data-sort-item].dragging {
+  z-index: 3;
+}
+.conn-tab.dragging {
+  background: var(--bg-elev);
+  color: var(--text);
+  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.5), inset 0 0 0 1px var(--border-strong);
+}
+.conn-tabs .conn-tab-group.dragging {
+  background: var(--bg);
+}
+.conn-rail .conn-tab-group.dragging {
+  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.5), inset 0 0 0 1px var(--group-line);
+}
+html.drag-sorting,
+html.drag-sorting * {
+  cursor: grabbing !important;
+}
+@media (prefers-reduced-motion: reduce) {
+  .sorting > [data-sort-item] {
+    transition: none !important;
+  }
+  .conn-tab-group,
+  .conn-tab-group::after,
+  .conn-tab-group-tabs,
+  .conn-rail .conn-tab-group-tabs {
+    transition: none;
+  }
 }
 
 /* ---- a connection tab that is not connected yet ---- */
@@ -3230,6 +3523,26 @@ html.mac .app-shell.has-tabs .conn-list-header {
 .conn-tab.status-connecting .conn-tab-logo {
   animation: pulse-dot 1s ease-in-out infinite;
 }
+/* Open, with its connection down until the next call reconnects it: a red ring, amber and pulsing while it reconnects. */
+.conn-tab.link-down .conn-tab-dot,
+.conn-tab.link-reconnecting .conn-tab-dot {
+  background: transparent;
+  box-shadow: inset 0 0 0 1.5px var(--link-state);
+}
+.conn-tab.link-down {
+  --link-state: var(--danger);
+}
+.conn-tab.link-reconnecting {
+  --link-state: var(--warn);
+}
+.conn-rail .conn-tab.link-down .conn-tab-logo,
+.conn-rail .conn-tab.link-reconnecting .conn-tab-logo {
+  box-shadow: inset 0 0 0 1.5px var(--link-state);
+}
+.conn-tab.link-reconnecting .conn-tab-dot,
+.conn-tab.link-reconnecting .conn-tab-logo {
+  animation: pulse-dot 1s ease-in-out infinite;
+}
 @keyframes pulse-dot {
   0%,
   100% {
@@ -3243,7 +3556,9 @@ html.mac .app-shell.has-tabs .conn-list-header {
 /* ---- AI connection types in Settings ---- */
 .ai-type-tiles {
   display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+  /* One equal column per kind offered, sharing the row. */
+  grid-auto-flow: column;
+  grid-auto-columns: minmax(0, 1fr);
   gap: 8px;
   margin: 4px 0 14px;
 }
@@ -3359,4 +3674,282 @@ html.mac .app-shell.has-tabs .conn-list-header {
   display: flex;
   flex-wrap: wrap;
   gap: 4px 18px;
+}
+
+/* ---- Local AI Privacy ---- */
+.privacy-detectors {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg-panel);
+}
+.privacy-detector {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 2px 8px;
+}
+.privacy-detector .hint {
+  flex: 1 1 100%;
+  margin: 0 !important;
+}
+.privacy-detector-name {
+  font-size: 12.5px;
+  color: var(--text);
+}
+.privacy-detector .badge:not(.coming-soon) {
+  white-space: nowrap;
+  padding: 1px 5px;
+  border-radius: 4px;
+  background: var(--bg-elev);
+  color: var(--text-muted);
+  font-size: 9.5px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+.checkbox.disabled {
+  color: var(--text-faint);
+}
+.hint.warn {
+  color: var(--warn);
+}
+/* The on-device model's download and removal, under its switch. */
+.model-row {
+  flex: 1 1 100%;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 10px;
+  margin-top: 4px;
+}
+.model-row .hint {
+  flex: 1 1 260px;
+}
+.model-row .btn {
+  flex: 0 0 auto;
+}
+.model-progress {
+  flex: 1 1 100%;
+  height: 4px;
+  border-radius: 2px;
+  background: var(--bg-elev);
+  overflow: hidden;
+}
+.model-progress > div {
+  height: 100%;
+  background: var(--accent);
+  transition: width 0.2s ease-out;
+}
+.ask-badges {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+}
+.ask-chip.privacy {
+  height: 20px;
+  font-size: 11px;
+  color: var(--text-muted);
+}
+
+/* ---- What was sent: the exchange inspector ---- */
+button.ask-chip.privacy {
+  cursor: pointer;
+  font: inherit;
+  font-size: 11px;
+}
+button.ask-chip.privacy:hover:not(:disabled) {
+  color: var(--text);
+  border-color: var(--text-faint);
+}
+button.ask-chip.privacy:disabled {
+  cursor: default;
+}
+.ask-activity-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 2px 10px;
+}
+.modal.exchange-modal {
+  height: calc(100vh - 80px);
+}
+.exchange-body {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 14px 18px 16px;
+  min-height: 0;
+  flex: 1;
+  overflow: auto;
+}
+.exchange-summary p {
+  margin: 4px 0 0;
+  font-size: 12px;
+  line-height: 1.5;
+}
+.exchange-headline {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+}
+.exchange-muted {
+  color: var(--text-muted);
+}
+.exchange-ok {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  color: var(--ok);
+  white-space: nowrap;
+}
+.exchange-warn {
+  color: var(--warn);
+  white-space: nowrap;
+}
+.exchange-legend {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg-panel);
+}
+.exchange-legend-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+.exchange-title {
+  font-weight: 600;
+  font-size: 12px;
+}
+.exchange-legend table {
+  border-collapse: collapse;
+  font-size: 12px;
+}
+.exchange-legend td {
+  padding: 3px 12px 3px 0;
+  vertical-align: middle;
+}
+.exchange-legend .btn {
+  align-self: flex-start;
+}
+.exchange-value {
+  font-family: var(--mono);
+  font-size: 11.5px;
+}
+.wire-ph {
+  padding: 0 3px;
+  border-radius: 3px;
+  background: var(--accent-soft);
+  color: var(--text);
+  font-family: var(--mono);
+  font-size: 11px;
+  white-space: nowrap;
+}
+.exchange-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+.exchange-toolbar .spacer {
+  flex: 1;
+}
+.exchange-find {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 12px;
+}
+.exchange-find input.text {
+  flex: 1;
+  height: 28px;
+}
+.exchange-content {
+  flex: 1;
+  min-height: 240px;
+  overflow: auto;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg-editor);
+}
+.exchange-endpoint {
+  margin-bottom: 10px;
+  color: var(--text-faint);
+  font-family: var(--mono);
+  font-size: 11px;
+  word-break: break-all;
+}
+.wire-section + .wire-section {
+  margin-top: 12px;
+}
+.wire-section-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 0;
+  border: none;
+  background: transparent;
+  color: var(--text-muted);
+  font: inherit;
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+}
+.wire-section-label:not(:disabled) {
+  cursor: pointer;
+}
+.wire-section-label:disabled {
+  color: var(--text-muted);
+}
+.wire-text,
+.wire-raw {
+  margin: 4px 0 0;
+  font-family: var(--mono);
+  font-size: var(--code-size);
+  line-height: var(--code-line);
+  white-space: pre-wrap;
+  word-break: break-word;
+  color: var(--text);
+}
+.wire-text.json {
+  color: var(--text-muted);
+}
+.wire-raw {
+  margin: 0;
+  word-break: break-all;
+}
+.exchange-content mark {
+  background: var(--warn-soft);
+  color: var(--warn);
+  border-radius: 2px;
+}
+.exchange-empty {
+  padding: 24px 0;
+  color: var(--text-muted);
+  text-align: center;
+}
+.wire-folded {
+  margin-top: 4px;
+  color: var(--text-faint);
+  font-family: var(--mono);
+  font-size: 11px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  cursor: pointer;
+}
+.wire-folded:hover {
+  color: var(--text-muted);
 }

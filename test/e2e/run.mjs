@@ -83,6 +83,7 @@ async function main() {
     await page.getByTestId('open-settings').click()
     await page.getByTestId('settings-dialog').waitFor()
     assert((await page.getByTestId('settings-appearance').count()) === 1, 'settings open on the Appearance tab')
+    assert((await page.locator('.settings-nav-item').allTextContents()).map((s) => s.trim()).join(', ') === 'AI, Appearance, Editor', 'settings sections are listed alphabetically')
     await page.getByTestId('settings-tab-ai').click()
     await page.getByTestId('send-sample-values').check()
     await page.getByTestId('settings-save').click()
@@ -108,6 +109,9 @@ async function main() {
     // A second connection opens from the "+" tab while the first stays connected.
     await page.getByTestId('conn-tab-add').click()
     await page.getByTestId('new-connection').waitFor()
+    // Each saved connection is one line, logo and name; the one in use has its logo ringed.
+    assert((await page.locator('.conn-item.link-up .conn-name').allTextContents()).join() === 'E2E local file', 'the list rings the connection in use')
+    assert((await page.locator('.conn-item', { hasText: 'E2E local file' }).locator('.conn-kind img[alt=SQLite]').count()) === 1, 'the list shows the database logo')
 
     // ------------------------------------------------------------ remote SQLite over SSH, saving the host as a profile
     await page.getByTestId('new-connection').click()
@@ -250,6 +254,95 @@ async function main() {
     })
     assert((await page.locator('.banner.error').count()) === 0, 'error banner cleared')
 
+    // ------------------------------------------------------------ selecting cells and copying them
+    const cellAt = (r, c) => grid.locator(`td[data-r="${r}"][data-c="${c}"]`)
+    const centre = async (loc) => {
+      const b = await loc.boundingBox()
+      return [b.x + b.width / 2, b.y + b.height / 2]
+    }
+    // What an action puts on the clipboard; the renderer writes it asynchronously, so wait for it to land.
+    const copiedBy = async (action) => {
+      await app.evaluate(({ clipboard }) => clipboard.writeText(''))
+      await action()
+      for (let i = 0; i < 100; i++) {
+        const text = await app.evaluate(({ clipboard }) => clipboard.readText())
+        if (text) return text
+        await page.waitForTimeout(50)
+      }
+      return ''
+    }
+    const inRange = () => grid.locator('td.cell-in-range').count()
+    // A drag from one cell to another selects the rectangle between them, and copies as tab-separated lines.
+    await page.mouse.move(...(await centre(cellAt(0, 0))))
+    await page.mouse.down()
+    await page.mouse.move(...(await centre(cellAt(2, 1))), { steps: 6 })
+    await page.mouse.up()
+    assert((await inRange()) === 6, `a drag selects the 3 × 2 rectangle (got ${await inRange()})`)
+    await grid.screenshot({ path: path.join(artifacts, '03c-range-selection.png') })
+    let copied = await copiedBy(() => page.keyboard.press(`${mod}+c`))
+    const rectangle = []
+    for (const r of [0, 1, 2]) rectangle.push(`${await cellAt(r, 0).textContent()}\t${await cellAt(r, 1).textContent()}`)
+    assert(copied === rectangle.join('\n'), `the selection is copied as tab-separated lines (got ${JSON.stringify(copied)})`)
+    assert((await front('status-link').count()) === 0 && (await page.locator('.session-slot:not([hidden]) .statusbar').textContent()).includes('Copied 6 values'), 'the status bar says what was copied')
+    // Shift+click stretches it; Shift+arrows move its far corner.
+    await cellAt(3, 2).click({ modifiers: ['Shift'] })
+    assert((await inRange()) === 12, 'Shift+click stretches it to 4 × 3')
+    await page.keyboard.press('Shift+ArrowDown')
+    await page.keyboard.press('Shift+ArrowRight')
+    assert((await inRange()) === 20, 'Shift+arrows grow it to 5 × 4')
+    // A row number selects its whole row, and the modifier adds another.
+    const columnCount = (await grid.locator('thead th').count()) - 1
+    await grid.locator('tbody tr').nth(4).locator('td.rownum').click()
+    assert((await inRange()) === columnCount, 'a row number selects its whole row')
+    await grid.locator('tbody tr').nth(6).locator('td.rownum').click({ modifiers: [mod] })
+    assert((await inRange()) === columnCount * 2, 'the modifier adds a second row')
+    // A right-click inside the selection keeps it; Copy with column names puts the header line first.
+    await cellAt(6, 1).click({ button: 'right' })
+    copied = await copiedBy(() => page.locator('.context-menu-item', { hasText: 'Copy with column names' }).click())
+    const names = await grid.locator('thead th .th-name').allTextContents()
+    assert(copied.startsWith(names.join('\t') + '\n'), `column names come first (got ${JSON.stringify(copied.slice(0, 80))})`)
+    for (const r of [4, 6]) assert(copied.includes(`\t${await cellAt(r, 1).textContent()}\t`), `row ${r + 1} is in the copy`)
+    assert(!copied.includes(`\t${await cellAt(5, 1).textContent()}\t`), 'the row between them is not')
+    // Copy as SQL list: part of a column, one quoted value per line, ready for WHERE … IN ( … ).
+    await cellAt(0, 1).click()
+    await cellAt(2, 1).click({ modifiers: ['Shift'] })
+    const listed = []
+    for (const r of [0, 1, 2]) listed.push(`'${(await cellAt(r, 1).textContent()).replace(/'/g, "''")}'`)
+    copied = await copiedBy(() => page.keyboard.press(`${mod}+Alt+c`))
+    assert(copied === listed.join(',\n'), `the shortcut copies a SQL list (got ${JSON.stringify(copied)})`)
+    assert((await page.locator('.session-slot:not([hidden]) .statusbar').textContent()).includes('Copied 3 values as a SQL list'), 'the status bar says how it was copied')
+    await cellAt(1, 1).click({ button: 'right' })
+    copied = await copiedBy(() => page.locator('.context-menu-item', { hasText: 'Copy as SQL list' }).click())
+    assert(copied === listed.join(',\n'), 'so does the context menu')
+    // The keyboard is back with the grid: select everything, then nothing.
+    await page.keyboard.press(`${mod}+a`)
+    assert((await inRange()) === 60 * columnCount, 'select all covers every loaded row')
+    await page.keyboard.press('Escape')
+    assert((await grid.locator('td.cell-in-range, td.cell-selected').count()) === 0, 'Escape clears the selection')
+    console.log('grid cells select like a spreadsheet and copy as tab-separated text')
+
+    // ------------------------------------------------------------ the link drops while idle
+    // The SSH server ends the connection, as an idle one gets ended: the tab stays where it is, with a toast.
+    server.dropClients()
+    await page.locator('.toast.warn', { hasText: 'E2E mock host disconnected' }).waitFor({ timeout: 20000 })
+    await page.waitForFunction(() => document.querySelector('[data-testid=conn-tab]')?.getAttribute('data-link') === 'down')
+    assert((await page.locator('.connect-screen').count()) === 0, 'a dropped connection does not go back to the connection list')
+    assert(await grid.locator('tbody tr').first().isVisible(), 'the table tab stays as it was')
+    assert((await front('status-link').textContent()).includes('Disconnected'), 'the status bar says the connection is down')
+    await page.waitForTimeout(300) // the toast's entrance
+    await shot('03b-link-dropped')
+    // The next thing that needs the database reconnects, on the same tab.
+    await afterReload(() => grid.locator('thead th', { hasText: 'age' }).click())
+    await page.waitForFunction(() => document.querySelector('[data-testid=conn-tab]')?.getAttribute('data-link') === 'up')
+    assert((await grid.locator('tbody tr').count()) === 60, 'rows load again after reconnecting')
+    assert((await page.locator('.banner.error').count()) === 0, 'the reload after the drop succeeds')
+    assert((await front('status-link').count()) === 0, 'the status bar no longer says disconnected')
+    await page.waitForFunction(() => !document.querySelector('.toast.warn'))
+    // Sorted descending by the reconnecting click; two more bring back the ascending sort the next steps start from.
+    await afterReload(() => grid.locator('thead th', { hasText: 'age' }).click())
+    await afterReload(() => grid.locator('thead th', { hasText: 'age' }).click())
+    console.log('dropped link: stayed on the tab, toasted, reconnected on the next action')
+
     // ------------------------------------------------------------ editing
     await afterReload(() => grid.locator('thead th', { hasText: 'age' }).click()) // desc
     await afterReload(() => grid.locator('thead th', { hasText: 'age' }).click()) // off -> default order
@@ -308,7 +401,10 @@ async function main() {
     await page.getByTestId('ask-button').click()
     await page.getByTestId('settings-dialog').waitFor()
     assert((await page.getByTestId('ai-provider').inputValue()) === 'openai', 'settings default to OpenAI with your own key')
-    assert((await page.getByTestId('ai-type-managed').isDisabled()) === true, 'Managed AI is announced but not available yet')
+    assert((await page.getByTestId('ai-type-managed').count()) === 0, 'Managed AI is hidden until it is available')
+    assert((await page.getByTestId('ai-types').locator('.ai-type-account').count()) === 0, 'without Managed AI the tiles leave out whether an account is needed')
+    const tiles = await page.getByTestId('ai-types').evaluate((row) => ({ row: row.clientWidth, widths: [...row.children].map((t) => t.getBoundingClientRect().width) }))
+    assert(tiles.widths.length === 2 && Math.abs(tiles.widths[0] - tiles.widths[1]) < 1 && tiles.widths[0] > tiles.row / 2 - 8, 'the two kinds of connection share the row equally')
     await page.getByTestId('ai-type-local').click()
     assert((await page.getByTestId('ai-local-type').inputValue()) === 'ollama', 'local servers default to Ollama')
     assert((await page.getByTestId('ai-base-url').inputValue()) === 'http://localhost:11434/v1', 'switching to a local server applies its preset')
@@ -398,10 +494,39 @@ async function main() {
     const resultRows = await resultGrid.locator('tbody tr').count()
     assert(resultRows === 5, `query result has 5 rows (got ${resultRows})`)
     assert((await resultGrid.locator('td[data-r="0"][data-c="1"]').textContent()) === 'Edited via GUI', 'query sees the applied edit')
+    // Query results select and copy the same way: all of it, with column names.
+    await resultGrid.locator('td[data-r="0"][data-c="0"]').click()
+    await page.keyboard.press(`${mod}+a`)
+    assert((await resultGrid.locator('td.cell-in-range').count()) === 20, 'select all covers the 5 × 4 result')
+    const resultCopy = (await copiedBy(() => page.keyboard.press(`${mod}+Shift+c`))).split('\n')
+    assert(resultCopy[0] === 'id\tname\temail\tbalance', `column names head the copied result (got ${JSON.stringify(resultCopy[0])})`)
+    assert(resultCopy.length === 6 && resultCopy[1].startsWith('1\tEdited via GUI\t'), `a line per row follows (got ${JSON.stringify(resultCopy)})`)
+    // Results do not sort, so a click on a column header selects the column.
+    await resultGrid.locator('thead th', { hasText: 'name' }).click()
+    assert((await resultGrid.locator('td.cell-in-range').count()) === 5, 'a header click selects the column of a result')
+    await page.keyboard.press('Escape')
     // Query results show a type glyph per column, inferred from the values for SQLite.
     await resultGrid.locator('thead .th-type').first().waitFor()
     assert((await resultGrid.locator('thead .th-type').first().getAttribute('title')).includes('from the values'), 'result glyphs say the type was inferred')
     await shot('06-query')
+    // The link drops with a query tab open: the status dot turns red, and running the query again reconnects on its
+    // own and shows the results.
+    const statusDot = page.locator('.session-slot:not([hidden]) [data-testid=status-dot]')
+    const queryRuns = () => page.locator('.tab-pane:not([hidden]) .query-tab').getAttribute('data-runs').then(Number)
+    assert((await statusDot.getAttribute('data-state')) === 'connected' && (await statusDot.evaluate((el) => el.classList.contains('ok'))), 'the status dot is green while connected')
+    const runsBefore = await queryRuns()
+    server.dropClients()
+    await page.locator('.toast.warn', { hasText: 'E2E mock host disconnected' }).waitFor({ timeout: 20000 })
+    assert((await statusDot.getAttribute('data-state')) === 'disconnected' && (await statusDot.evaluate((el) => el.classList.contains('err'))), 'the status dot turns red once the connection drops')
+    await cm.click()
+    await page.keyboard.press(`${mod}+Enter`)
+    await page.waitForFunction((n) => Number(document.querySelector('.tab-pane:not([hidden]) .query-tab')?.getAttribute('data-runs')) > n, runsBefore, { timeout: 30000 })
+    const rerunError = page.locator('.session-slot:not([hidden]) .result-error')
+    assert((await rerunError.count()) === 0, `the query runs after reconnecting (got ${await rerunError.first().textContent().catch(() => '')})`)
+    assert((await statusDot.getAttribute('data-state')) === 'connected', 'the status dot is green again')
+    await page.locator('.result-chips .chip').first().click()
+    assert((await resultGrid.locator('td[data-r="0"][data-c="1"]').textContent()) === 'Edited via GUI', 'the rerun shows the rows')
+    console.log('a query run after the connection dropped reconnects and runs')
     // A double-click edits a result cell of a single-table select; Apply writes it back through the same path as the Data tab.
     await resultGrid.locator('td[data-r="0"][data-c="1"]').dblclick()
     const cellEditor = resultGrid.locator('textarea')
@@ -418,7 +543,10 @@ async function main() {
     await page.keyboard.press(`${mod}+a`)
     await page.keyboard.type('SELECT 1 AS first;\n\nSELECT 2 AS second')
     await page.keyboard.press(`${mod}+Enter`)
-    await page.waitForFunction(() => document.querySelectorAll('.result-chips .chip').length === 1 && document.querySelector('[data-testid=result-grid] td[data-r="0"][data-c="0"]')?.textContent === '2')
+    await page.waitForFunction(() => document.querySelector('[data-testid=result-grid] td[data-r="0"][data-c="0"]')?.textContent === '2')
+    // One statement needs no badge to pick its result; the summary says what it returned.
+    assert((await front('results-summary').textContent()).startsWith('1 row ·'), 'a single statement shows its row count in the summary')
+    assert((await page.locator('.session-slot:not([hidden]) .result-chips .chip').count()) === 0, 'and no badges')
     await page.keyboard.press(`${mod}+Shift+Enter`)
     await page.waitForFunction(() => document.querySelectorAll('.result-chips .chip').length === 2)
     console.log('result cells edit in place; the cursor block runs on its own')
@@ -578,7 +706,37 @@ async function main() {
     await connItem('E2E local file').click()
     await page.getByTestId('connect-button').click()
     await front('tree-table-users').waitFor({ timeout: 30000 })
-    await page.getByTestId('conn-tab').first().click()
+    // The grouped connection's tab sits behind its group's label, and the tabs drag into an order a restart keeps.
+    const connTab = (name) => page.locator('[data-testid=conn-tab]').filter({ has: page.locator('.conn-tab-name', { hasText: new RegExp(`^${name}$`) }) })
+    const acmeTabs = page.locator('[data-testid=conn-tab-group][data-group="Acme Corp"]')
+    assert((await acmeTabs.getByTestId('conn-tab-group-label').textContent()) === 'Acme Corp', 'the tab strip labels the group')
+    assert((await acmeTabs.locator('.conn-tab-name').allTextContents()).join() === 'E2E via profile', 'the grouped connection sits in its group')
+    assert(await acmeTabs.evaluate((el) => el.classList.contains('tinted')), 'the group keeps its colour in the tab strip')
+    // A click on the label collapses the group, as in a browser; the tab in front moves out of a group as it closes.
+    const acmeLabel = acmeTabs.getByTestId('conn-tab-group-label')
+    await acmeLabel.click()
+    await connTab('E2E via profile').waitFor({ state: 'hidden' })
+    assert((await acmeLabel.getAttribute('aria-expanded')) === 'false', 'the label says the group is collapsed')
+    assert((await connTab('E2E local file').getAttribute('aria-selected')) === 'true', 'collapsing another group leaves the tab in front alone')
+    await acmeLabel.click()
+    await connTab('E2E via profile').click()
+    // Colours come from groups: the tab takes the colour of its group, while the window's accent stays white.
+    assert(((await connTab('E2E via profile').getAttribute('style')) ?? '').includes('#3ecf8e'), 'the tab takes its group colour')
+    assert((await page.evaluate(() => document.documentElement.style.getPropertyValue('--accent'))) === '#ffffff', "the window's accent stays white in a coloured group")
+    await acmeLabel.click()
+    await connTab('E2E via profile').waitFor({ state: 'hidden' })
+    assert((await connTab('E2E local file').getAttribute('aria-selected')) === 'true', 'the tab in front leaves its group as the group collapses')
+    await acmeLabel.click()
+    await connTab('E2E via profile').waitFor()
+    const dragFrom = await connTab('E2E local file').boundingBox()
+    const dragTo = await acmeTabs.getByTestId('conn-tab-group-label').boundingBox()
+    await page.mouse.move(dragFrom.x + dragFrom.width / 2, dragFrom.y + dragFrom.height / 2)
+    await page.mouse.down()
+    await page.mouse.move(dragTo.x + 4, dragFrom.y + dragFrom.height / 2, { steps: 12 })
+    await page.mouse.up()
+    await page.waitForFunction(() => document.querySelector('[data-testid=conn-tab] .conn-tab-name')?.textContent === 'E2E local file')
+    await shot('07c3-grouped-tabs')
+    await connTab('E2E via profile').click()
     await page.waitForTimeout(800)
     await app.close()
     app = await electron.launch(launchOptions)
@@ -587,16 +745,33 @@ async function main() {
     await page.waitForLoadState('domcontentloaded')
     await page.getByTestId('conn-tab').nth(1).waitFor({ timeout: 15000 })
     assert((await page.getByTestId('conn-tab').count()) === 2, 'both connection tabs come back')
-    assert((await page.getByTestId('conn-tab').first().getAttribute('aria-selected')) === 'true', 'the connection that was in front is in front again')
+    assert((await page.locator('[data-testid=conn-tab] .conn-tab-name').allTextContents()).join() === 'E2E local file,E2E via profile', 'the tabs come back in the order they were dragged into')
+    assert((await connTab('E2E via profile').getAttribute('aria-selected')) === 'true', 'the connection that was in front is in front again')
     await front('tree-table-users').waitFor({ timeout: 30000 })
     assert((await page.locator('.session-slot:not([hidden]) .tabbar .tab').count()) === 1, 'its query tab is back')
     await page.locator('.session-slot:not([hidden]) .cm-content', { hasText: 'SELECT id, name FROM users' }).waitFor()
     assert((await page.locator('.session-slot:not([hidden]) [data-testid=result-grid] tbody tr').count()) === 3, 'the last results are back')
     await shot('07d-restored-workspace')
-    assert((await page.getByTestId('conn-tab').nth(1).getAttribute('data-status')) === 'pending', 'the other connection waits until it is opened')
-    await page.getByTestId('conn-tab').nth(1).click()
+    assert((await connTab('E2E local file').getAttribute('data-status')) === 'pending', 'the other connection waits until it is opened')
+    await connTab('E2E local file').click()
     await front('tree-table-users').waitFor({ timeout: 30000 })
     console.log('workspace restored after a restart')
+    // A collapsed group stays collapsed through a restart.
+    await page.locator('[data-testid=conn-tab-group][data-group="Acme Corp"]').getByTestId('conn-tab-group-label').click()
+    await connTab('E2E via profile').waitFor({ state: 'hidden' })
+    await page.waitForTimeout(800)
+    await app.close()
+    app = await electron.launch(launchOptions)
+    page = await app.firstWindow()
+    watchConsole()
+    await page.waitForLoadState('domcontentloaded')
+    const acmeAgain = page.locator('[data-testid=conn-tab-group][data-group="Acme Corp"]').getByTestId('conn-tab-group-label')
+    await acmeAgain.waitFor({ timeout: 15000 })
+    assert((await acmeAgain.getAttribute('aria-expanded')) === 'false', 'the group comes back collapsed')
+    assert((await connTab('E2E local file').getAttribute('aria-selected')) === 'true', 'the tab that was in front is in front again')
+    await acmeAgain.click()
+    await connTab('E2E via profile').waitFor()
+    console.log('tab groups collapse, and stay collapsed across a restart')
     for (const remaining of [1, 0]) {
       await page.getByTestId('conn-tab').first().hover()
       await page.getByTestId('conn-tab').first().getByTestId('conn-tab-close').click()
@@ -685,6 +860,23 @@ async function main() {
       assert((await pgResult.locator('tbody tr').count()) === 3, 'postgres query result has 3 rows')
       assert((await pgResult.locator('td[data-r="0"][data-c="3"]').textContent()) === 'false', 'boolean renders as false')
       await shot('10-postgres-query')
+      // The server ends the session, as an idle-session timeout or a restart does: the tab stays, the dot turns red, and
+      // running the query again reconnects and shows its rows.
+      const pgDot = page.locator('.session-slot:not([hidden]) [data-testid=status-dot]')
+      const pgRunsBefore = Number(await page.locator('.tab-pane:not([hidden]) .query-tab').getAttribute('data-runs'))
+      const killer = new pg.Client({ connectionString: pgUrl })
+      await killer.connect()
+      await killer.query("SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE application_name = 'Sagittarion' AND pid <> pg_backend_pid()")
+      await killer.end()
+      await page.locator('.toast.warn', { hasText: 'E2E Postgres disconnected' }).waitFor({ timeout: 20000 })
+      assert((await pgDot.getAttribute('data-state')) === 'disconnected', 'the status dot turns red when the server ends the session')
+      await pgCm.click()
+      await page.keyboard.press(`${mod}+Enter`)
+      await page.waitForFunction((n) => Number(document.querySelector('.tab-pane:not([hidden]) .query-tab')?.getAttribute('data-runs')) > n, pgRunsBefore, { timeout: 30000 })
+      const pgError = page.locator('.session-slot:not([hidden]) .result-error')
+      assert((await pgError.count()) === 0, `the query runs after the server ended the session (got ${await pgError.first().textContent().catch(() => '')})`)
+      assert((await pgResult.locator('tbody tr').count()) === 3, 'with its rows')
+      assert((await pgDot.getAttribute('data-state')) === 'connected', 'and the dot is green again')
       await page.getByTestId('disconnect-button').click()
       await page.getByTestId('connect-button').waitFor()
       assert((await page.locator('.conn-item').count()) === 5, 'postgres connection was saved')

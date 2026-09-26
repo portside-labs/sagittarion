@@ -1,6 +1,7 @@
 import { contextBridge, ipcRenderer, type IpcRendererEvent } from 'electron'
-import type { Api, ConnectProgressEvent, SessionClosedEvent } from '@shared/api'
+import type { Api, ConnectProgressEvent, SessionLinkEvent } from '@shared/api'
 import type { AiProgressEvent } from '@shared/ai'
+import type { SemanticModelStatus } from '@shared/privacy'
 
 function subscribe<T>(channel: string, cb: (payload: T) => void): () => void {
   const handler = (_event: IpcRendererEvent, payload: T) => cb(payload)
@@ -30,7 +31,7 @@ const api: Api = {
   session: {
     open: (cfg, opts) => ipcRenderer.invoke('session:open', cfg, opts ?? {}),
     close: (sessionId) => ipcRenderer.invoke('session:close', sessionId),
-    onClosed: (cb) => subscribe<SessionClosedEvent>('session:closed', cb),
+    onLink: (cb) => subscribe<SessionLinkEvent>('session:link', cb),
     onProgress: (cb) => subscribe<ConnectProgressEvent>('connect:progress', cb)
   },
   db: {
@@ -67,9 +68,18 @@ const api: Api = {
     listModels: (input) => ipcRenderer.invoke('settings:listModels', input ?? null)
   },
   ai: {
-    ask: (sessionId, question, history, requestId) => ipcRenderer.invoke('ai:ask', sessionId, question, history ?? [], requestId ?? ''),
+    ask: (sessionId, question, history, requestId, conversationId) => ipcRenderer.invoke('ai:ask', sessionId, question, history ?? [], requestId ?? '', conversationId ?? ''),
     cancel: (requestId) => ipcRenderer.invoke('ai:cancel', requestId),
+    forget: (conversationId, opts) => ipcRenderer.invoke('ai:forget', conversationId, opts ?? {}),
+    transcript: (requestId, opts) => ipcRenderer.invoke('ai:transcript', requestId, opts ?? {}),
     onProgress: (cb) => subscribe<AiProgressEvent>('ai:progress', cb)
+  },
+  privacyModel: {
+    status: () => ipcRenderer.invoke('privacy:model-status'),
+    install: () => ipcRenderer.invoke('privacy:model-install'),
+    cancel: () => ipcRenderer.invoke('privacy:model-cancel'),
+    remove: () => ipcRenderer.invoke('privacy:model-remove'),
+    onStatus: (cb) => subscribe<SemanticModelStatus>('privacy:model-status', cb)
   }
 }
 

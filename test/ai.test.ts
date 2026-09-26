@@ -10,6 +10,7 @@ import { AnthropicProvider } from '../src/main/ai/providers/anthropic'
 import { ProviderError, parseJsonObject, type ChatRequest, type ChatResponse, type LlmProvider } from '../src/main/ai/providers/types'
 import { providerConfigFor } from '../src/main/ai/providers/factory'
 import { systemRules } from '../src/main/ai/prompt'
+import { ModelGateway } from '../src/main/privacy/gateway'
 
 // ---------------------------------------------------------------- fixtures
 
@@ -267,7 +268,8 @@ function deps(provider: LlmProvider, overrides: Partial<AskDeps> = {}): AskDeps 
     kind: 'sqlite',
     serverVersion: '3.45.1',
     index,
-    provider,
+    // These tests are about the orchestrator; test/privacy covers the protected gateway.
+    provider: ModelGateway.unprotected(provider, 'privacy-off', 'test.invalid'),
     settings: { sendSampleValues: false, autoRun: true, schemaBudgetTokens: 8000 },
     runQuery: async (sql): Promise<QueryResponse> => {
       ran.push(sql)

@@ -197,6 +197,12 @@ export class PostgresDriver extends EventEmitter implements DatabaseDriver {
     }
     if (!this.client) throw friendlyPgError(lastErr, o)
     const client = this.client
+    if (this.closed) {
+      // Closed while connecting, as when a connection closes during a reconnect: let go of the client just made.
+      this.client = null
+      await client.end().catch(() => undefined)
+      throw new Error('The connection was closed while it was being made.')
+    }
     client.on('error', (err: Error) => this.handleClosed(`Connection error: ${err.message}`))
     client.on('end', () => this.handleClosed('The server closed the connection'))
     const connection: any = (client as any).connection

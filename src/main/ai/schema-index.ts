@@ -142,12 +142,37 @@ export interface SchemaIndexOptions {
 const DEFAULT_PRELOAD = 400
 const SAMPLE_COLUMNS_PER_LINE = 20
 
+/**
+ * Rewrites the data in a line, sample values and the table comment, before a model sees it: Local AI Privacy
+ * supplies one that shows placeholders. Anything the view was not prepared for comes back empty, never raw.
+ */
+export interface RenderView {
+  samples(key: string, column: string, values: string[]): string[]
+  comment(key: string, comment: string): string
+}
+
+/** A table comment as a schema line shows it: one line, at most 120 characters. */
+export function shortComment(comment: string): string {
+  return comment.replace(/\s+/g, ' ').slice(0, 120)
+}
+
 export class SchemaIndex {
   readonly kind: DatabaseKind
   readonly defaultSchema?: string
   readonly tables = new Map<string, IndexedTable>()
   /** Sample values by table key then column, filled in by the caller when allowed. */
   readonly samples = new Map<string, Record<string, string[]>>()
+
+  /** Every table and column name known so far, bare and schema-qualified. */
+  identifiers(): string[] {
+    const out: string[] = []
+    for (const t of this.tables.values()) {
+      out.push(t.ref.name)
+      if (t.ref.schema) out.push(`${t.ref.schema}.${t.ref.name}`)
+      for (const c of t.meta?.columns ?? []) out.push(c.name)
+    }
+    return out
+  }
   totalTokens = 0
   private bm25: Bm25
   private embeddings: Map<string, number[]> | null = null
@@ -303,14 +328,15 @@ export class SchemaIndex {
   }
 
   /** Text used to embed a table: what it is called and what it holds. */
-  embeddingText(key: string): string {
+  embeddingText(key: string, view?: RenderView): string {
     const t = this.tables.get(key)
     if (!t) return key
     const cols = (t.meta?.columns ?? [])
       .slice(0, 40)
       .map((c) => c.name)
       .join(', ')
-    return `${t.key}${cols ? `: ${cols}` : ''}${t.comment ? `. ${t.comment}` : ''}`
+    const comment = t.comment ? (view ? view.comment(key, shortComment(t.comment)) : t.comment) : ''
+    return `${t.key}${cols ? `: ${cols}` : ''}${comment ? `. ${comment}` : ''}`
   }
 
   /** Rank tables for a question. Names and comments always count; loaded columns add to the score. */
@@ -407,7 +433,7 @@ export class SchemaIndex {
   }
 
   /** One compact line for a table, e.g. orders(id int pk, user_id int fk->users.id, status text {paid|pending}) ~400 rows */
-  lineFor(key: string, opts: { full?: boolean; samples?: boolean; matchTerms?: string[] } = {}): string {
+  lineFor(key: string, opts: { full?: boolean; samples?: boolean; matchTerms?: string[]; view?: RenderView } = {}): string {
     const t = this.tables.get(key)
     if (!t) return ''
     let line: string
@@ -431,7 +457,8 @@ export class SchemaIndex {
         if (c.pk > 0) s += ' pk'
         const fk = t.fkByColumn.get(c.name)
         if (fk) s += ` fk->${fk}`
-        const vals = samples?.[c.name]
+        const raw = samples?.[c.name]
+        const vals = raw && raw.length && opts.view ? opts.view.samples(key, c.name, raw) : raw
         if (vals && vals.length) s += ` {${vals.slice(0, SAMPLE_COLUMNS_PER_LINE).join('|')}}`
         return s
       })
@@ -440,17 +467,20 @@ export class SchemaIndex {
     }
     if (t.type === 'view') line += ' [view]'
     if (typeof t.rowEstimate === 'number' && t.rowEstimate >= 0) line += ` ~${formatCount(t.rowEstimate)} rows`
-    if (t.comment) line += ` -- ${t.comment.replace(/\s+/g, ' ').slice(0, 120)}`
+    if (t.comment) {
+      const comment = opts.view ? opts.view.comment(key, shortComment(t.comment)) : shortComment(t.comment)
+      if (comment) line += ` -- ${comment}`
+    }
     return line
   }
 
   /** Everything about one table, for the describe_table tool. Loads what is missing. */
-  async describe(key: string): Promise<string> {
+  async describe(key: string, view?: RenderView): Promise<string> {
     const t = this.tables.get(key)
     if (!t) return `Unknown table: ${key}`
     await this.ensureColumns([key])
     await this.ensureRelations([key])
-    const lines = [this.lineFor(key, { full: true, samples: true })]
+    const lines = [this.lineFor(key, { full: true, samples: true, view })]
     const referencedBy: string[] = []
     for (const other of this.tables.values()) {
       for (const [col, target] of other.fkByColumn) if (target.startsWith(`${key}.`)) referencedBy.push(`${other.key}.${col}`)
@@ -464,7 +494,7 @@ export class SchemaIndex {
    * Compact lines of the best-matching tables for the search_schema tool.
    * Falls back to a column-name search in the database when names alone find little.
    */
-  async search(query: string, limit: number, exclude: Set<string> = new Set()): Promise<string[]> {
+  async search(query: string, limit: number, exclude: Set<string> = new Set(), prepareView?: (keys: string[]) => Promise<RenderView>): Promise<string[]> {
     const terms = tokenize(query)
     const keys = this.rank(query)
       .filter((r) => !exclude.has(r.key))
@@ -487,14 +517,15 @@ export class SchemaIndex {
       }
     }
     await this.ensureColumns(keys)
-    return keys.map((k) => this.lineFor(k, { full: false, samples: true, matchTerms: terms }))
+    const view = prepareView ? await prepareView(keys) : undefined
+    return keys.map((k) => this.lineFor(k, { full: false, samples: true, matchTerms: terms, view }))
   }
 
   /** The schema block for the prompt, in stable order for cacheability. */
-  render(selection: Selection, question: string): string {
+  render(selection: Selection, question: string, view?: RenderView): string {
     const terms = tokenize(question)
     const keys = selection.mode === 'all' ? selection.keys : [...selection.keys].sort()
-    return keys.map((k) => this.lineFor(k, { full: false, samples: true, matchTerms: terms })).join('\n')
+    return keys.map((k) => this.lineFor(k, { full: false, samples: true, matchTerms: terms, view })).join('\n')
   }
 }
 

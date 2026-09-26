@@ -45,6 +45,11 @@ export abstract class AgentSession extends EventEmitter {
   async startAgent(): Promise<PythonAgent> {
     if (this.agent && !this.agent.hasExited) return this.agent
     const agent = await this.spawnAgent()
+    if (this.closed) {
+      // Closed while the helper was starting, as when a connection closes during a reconnect: the helper goes too.
+      agent.close()
+      throw new AgentError('The connection was closed.')
+    }
     agent.on('exit', (info) => {
       if (this.agent === agent) {
         this.agent = null

@@ -162,6 +162,16 @@ export async function startMockServer(options = {}) {
     password,
     hostKey,
     server,
+    /** Ends every client connection while the server stays up, as a server does with idle connections. */
+    dropClients: () => {
+      for (const c of clients) {
+        try {
+          c.end()
+        } catch {
+          /* already gone */
+        }
+      }
+    },
     close: () =>
       new Promise((resolve) => {
         for (const c of clients) {

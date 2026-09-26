@@ -1,6 +1,7 @@
 import { useEffect } from 'react'
 import { applyAccent } from './lib/theme'
 import { isModKey } from './lib/util'
+import { groupByConnection, tabsInSight } from './lib/tab-groups'
 import { getSessionStore, useStore } from './store'
 import { SessionContext } from './session-store'
 import { ConnectScreen } from './screens/ConnectScreen'
@@ -22,10 +23,10 @@ export default function App() {
   const active = tabs.find((t) => t.connectionId === activeConnectionId) ?? null
   const connectVisible = showConnect || !active
 
-  // The accent follows the connection in front; white on the connect screen and for connections without a colour.
+  // The accent is white everywhere; a group's colour marks its tabs, not the whole window.
   useEffect(() => {
-    applyAccent(connectVisible ? undefined : active?.color)
-  }, [connectVisible, active?.color])
+    applyAccent(undefined)
+  }, [])
 
   // The top rows leave room for the traffic lights on macOS.
   useEffect(() => {
@@ -37,18 +38,21 @@ export default function App() {
     void init()
   }, [init])
 
-  // ⌘⇧] and ⌘⇧[ step through the connection tabs.
+  // ⌘⇧] and ⌘⇧[ step through the connection tabs, passing over those tucked away in a collapsed group.
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (!isModKey(e) || !e.shiftKey) return
       const forward = e.key === ']' || e.key === '}'
       const back = e.key === '[' || e.key === '{'
       if (!forward && !back) return
-      const { tabs: open, activeConnectionId: current } = useStore.getState()
-      if (open.length < 2) return
+      const { tabs, connections, collapsedTabGroups, activeConnectionId: current } = useStore.getState()
+      const open = tabsInSight(tabs, groupByConnection(connections), collapsedTabGroups)
+      const idx = open.findIndex((t) => t.connectionId === current)
+      if (!open.length || (open.length < 2 && idx >= 0)) return
       e.preventDefault()
-      const idx = Math.max(0, open.findIndex((t) => t.connectionId === current))
-      activateTab(open[(idx + (forward ? 1 : -1) + open.length) % open.length].connectionId)
+      // From a tab out of sight, the first or last one in sight comes next.
+      const nextIdx = idx < 0 ? (forward ? 0 : open.length - 1) : (idx + (forward ? 1 : -1) + open.length) % open.length
+      activateTab(open[nextIdx].connectionId)
     }
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)

@@ -23,6 +23,7 @@ import type {
   WorkspaceState
 } from './types'
 import type { AiConnectionInput, AiProgressEvent, AiResult, AiSettings, AiSettingsUpdate, AiTurn } from './ai'
+import type { AiTranscript, SemanticModelStatus } from './privacy'
 
 export interface OpenOptions {
   /** Open the configured database after connecting (default true). SQLite only; Postgres always opens. */
@@ -31,10 +32,17 @@ export interface OpenOptions {
   requestId?: string
 }
 
-export interface SessionClosedEvent {
-  sessionId: string
-  reason: string
-}
+/**
+ * How an open session's link to its database fares. The link can drop by itself, as an idle connection closed by the
+ * server or the network does; the session stays open, and the next call that needs the database reconnects it.
+ */
+export type SessionLinkEvent =
+  | { sessionId: string; state: 'dropped'; reason: string }
+  /** A call needs the database and the link is being made again; `message` is the latest step. */
+  | { sessionId: string; state: 'reconnecting'; message: string }
+  | { sessionId: string; state: 'reconnected'; info: SessionInfo }
+  /** The link stays down, for the next call to try again. */
+  | { sessionId: string; state: 'reconnect-failed'; reason: string }
 
 export interface ConnectProgressEvent extends ConnectProgress {
   requestId?: string
@@ -69,7 +77,7 @@ export interface Api {
   session: {
     open(cfg: ConnectionConfig, opts?: OpenOptions): Promise<SessionInfo>
     close(sessionId: string): Promise<void>
-    onClosed(cb: (e: SessionClosedEvent) => void): Unsubscribe
+    onLink(cb: (e: SessionLinkEvent) => void): Unsubscribe
     onProgress(cb: (e: ConnectProgressEvent) => void): Unsubscribe
   }
   db: {
@@ -115,11 +123,33 @@ export interface Api {
     listModels(input?: AiConnectionInput): Promise<string[]>
   }
   ai: {
-    /** Turn a plain-English question into a verified read-only query for the open database. */
-    ask(sessionId: string, question: string, history?: AiTurn[], requestId?: string): Promise<AiResult>
+    /**
+     * Turn a plain-English question into a verified read-only query for the open database. `conversationId` scopes
+     * Local AI Privacy's placeholders to one chat, so the same person keeps the same placeholder in follow-ups.
+     */
+    ask(sessionId: string, question: string, history?: AiTurn[], requestId?: string, conversationId?: string): Promise<AiResult>
     /** Stop a running ask; the pending call resolves with kind "cancelled". */
     cancel(requestId: string): Promise<void>
+    /** Drop a chat's placeholders from memory; with `transcripts`, what its answers sent too (the chat was reset). */
+    forget(conversationId: string, opts?: { transcripts?: boolean }): Promise<void>
+    /**
+     * Exactly what an ask sent to the model provider and got back, for the "What was sent" view; null once it is no
+     * longer held. With `values`, placeholders the policy restores are paired with their values, while the chat
+     * still holds them.
+     */
+    transcript(requestId: string, opts?: { values?: boolean }): Promise<AiTranscript | null>
     /** Step-by-step progress of running asks, keyed by requestId. */
     onProgress(cb: (e: AiProgressEvent) => void): Unsubscribe
+  }
+  /** The on-device model behind semantic detection: whether it can run here, its download, its removal. */
+  privacyModel: {
+    status(): Promise<SemanticModelStatus>
+    /** Downloads and checks the model; resolves with the status it ends in (installed, cancelled or failed). */
+    install(): Promise<SemanticModelStatus>
+    cancel(): Promise<void>
+    /** Deletes the model's files and switches semantic detection off. */
+    remove(): Promise<SemanticModelStatus>
+    /** Status changes, including download progress. */
+    onStatus(cb: (s: SemanticModelStatus) => void): Unsubscribe
   }
 }

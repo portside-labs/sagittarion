@@ -261,8 +261,8 @@ export function ConnectScreen() {
   const renameInFlight = useRef(false)
   const groups = useMemo(() => groupConnections(connections), [connections])
   const names = useMemo(() => groupNames(connections), [connections])
-  /** Saved connections with a session open right now. */
-  const openIds = useMemo(() => new Set(openTabs.map((t) => t.connectionId)), [openTabs])
+  /** How the saved connections with a live tab are doing: connected, dropped, or reconnecting. */
+  const linkStates = useMemo(() => new Map(openTabs.flatMap((t) => (t.status === 'live' ? [[t.connectionId, t.link ?? 'up'] as const] : []))), [openTabs])
 
   // Open the most recent connection once both it and the profile list are known.
   useEffect(() => {
@@ -720,28 +720,31 @@ export function ConnectScreen() {
                     )}
                     {collapsed
                       ? null
-                      : g.connections.map((c) => (
-                <div
-                  key={c.id}
-                  className={`conn-item ${c.id === selectedId ? 'active' : ''}`}
-                  onClick={() => select(c)}
-                  onDoubleClick={() => void connect()}
-                  onContextMenu={(e) => {
-                    e.preventDefault()
-                    setConnMenu({ x: e.clientX, y: e.clientY, conn: c })
-                  }}
-                >
-                  <span className={`conn-dot ${openIds.has(c.id) ? 'connected' : ''}`} style={c.color ? { background: c.color } : undefined} title={openIds.has(c.id) ? 'Connected' : undefined} />
-                  <div className="conn-text">
-                    <div className="conn-name">{c.name}</div>
-                    <div className="conn-sub">{describeTarget(resolveSshProfile(c, sshProfiles))}</div>
-                    <div className="conn-sub">{c.kind === 'postgres' ? (c.pg?.tunnel ? `via ssh ${describeSsh(resolveSshProfile(c, sshProfiles).ssh)}` : KIND_LABELS.postgres) : c.remotePath}</div>
-                  </div>
-                  <span className={`conn-kind ${c.kind}`}>
-                    <DbLogo kind={c.kind} size={20} />
-                  </span>
-                </div>
-                        ))}
+                      : g.connections.map((c) => {
+                          const resolved = resolveSshProfile(c, sshProfiles)
+                          const where = c.kind === 'postgres' ? (c.pg?.tunnel ? `via ssh ${describeSsh(resolved.ssh)}` : null) : c.remotePath
+                          const link = linkStates.get(c.id)
+                          const state = link === 'up' ? 'Connected' : link === 'down' ? 'Disconnected' : link === 'reconnecting' ? 'Reconnecting' : null
+                          // One line: the database's logo and the name. Where it points is left to the tooltip.
+                          return (
+                            <div
+                              key={c.id}
+                              className={`conn-item ${c.id === selectedId ? 'active' : ''} ${link ? `link-${link}` : ''}`}
+                              title={[describeTarget(resolved), where, state].filter(Boolean).join('\n')}
+                              onClick={() => select(c)}
+                              onDoubleClick={() => void connect()}
+                              onContextMenu={(e) => {
+                                e.preventDefault()
+                                setConnMenu({ x: e.clientX, y: e.clientY, conn: c })
+                              }}
+                            >
+                              <span className={`conn-kind ${c.kind}`}>
+                                <DbLogo kind={c.kind} size={15} />
+                              </span>
+                              <span className="conn-name">{c.name}</span>
+                            </div>
+                          )
+                        })}
                   </div>
                 )
               })
@@ -976,15 +979,6 @@ export function ConnectScreen() {
                       <span className="hint">
                         {form.kind === 'sqlite' ? 'The file is opened in read-only mode.' : 'Sets the session to read-only transactions by default.'}
                       </span>
-                    </div>
-                    <div className="field">
-                      <label>Colour</label>
-                      <div className="swatches">
-                        <button type="button" className={`swatch none ${!form.color ? 'active' : ''}`} onClick={() => update({ color: undefined })} title="None" />
-                        {COLORS.map((c) => (
-                          <button key={c} type="button" className={`swatch ${form.color === c ? 'active' : ''}`} style={{ background: c }} onClick={() => update({ color: c })} />
-                        ))}
-                      </div>
                     </div>
                   </div>
                 </div>

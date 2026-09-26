@@ -1,5 +1,4 @@
-// The accent colour follows the open connection so the whole window says
-// which database it is. With no colour chosen the accent is white.
+// The accent colour: white. Group colours mark the tabs of a group, not the window.
 
 export const DEFAULT_ACCENT = '#ffffff'
 

@@ -43,9 +43,7 @@ export interface ConnectionConfig {
   id: string
   name: string
   kind: DatabaseKind
-  /** Optional accent colour shown in the sidebar and title bar. */
-  color?: string
-  /** Optional group the connection is listed under: an app, an environment, whatever suits the user. */
+  /** Optional group the connection is listed under: an app, an environment, whatever suits the user. Groups have colours; connections do not. */
   group?: string
   readOnly?: boolean
   lastUsedAt?: number
@@ -416,7 +414,6 @@ export interface SessionInfo {
   connectionId: string
   name: string
   kind: DatabaseKind
-  color?: string
   /** Where we are connected: user@host for SQLite, user@host/database for Postgres. */
   target: string
   /** Set once a database has been opened on this session. */
@@ -505,4 +502,6 @@ export interface WorkspaceState {
   activeConnectionId: string | null
   showConnect: boolean
   connections: WorkspaceConnection[]
+  /** Tab groups folded up to their label, by group name. */
+  collapsedGroups?: string[]
 }

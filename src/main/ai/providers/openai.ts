@@ -13,6 +13,7 @@ import {
   type ProviderConfig,
   type ToolCall
 } from './types'
+import type { OutboundRequest, OutboundTexts } from '../../privacy/boundary'
 
 function mapMessages(req: ChatRequest): unknown[] {
   const out: unknown[] = []
@@ -65,7 +66,7 @@ export class OpenAiCompatibleProvider implements LlmProvider {
     return h
   }
 
-  async complete(req: ChatRequest, signal?: AbortSignal): Promise<ChatResponse> {
+  async complete(req: OutboundRequest, signal?: AbortSignal): Promise<ChatResponse> {
     if (!this.model) throw new ProviderError('No model is configured. Pick one in Settings.', 'bad_request')
     const body: Record<string, unknown> = { model: this.model, messages: mapMessages(req) }
     if (req.tools?.length) {
@@ -96,7 +97,7 @@ export class OpenAiCompatibleProvider implements LlmProvider {
     }
   }
 
-  async embed(texts: string[], signal?: AbortSignal): Promise<number[][]> {
+  async embed(texts: OutboundTexts, signal?: AbortSignal): Promise<number[][]> {
     if (!this.cfg.embeddingModel) throw new ProviderError('No embedding model is configured.', 'bad_request')
     const res = await fetchWithTimeout(
       this.fetchImpl,
