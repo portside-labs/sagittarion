@@ -2,7 +2,7 @@
   "name": "sagittarion",
   "productName": "Sagittarion",
   "version": "0.8.0",
-  "description": "Desktop GUI for browsing and editing SQLite databases on remote hosts over SSH",
+  "description": "Desktop client for SQLite and PostgreSQL, local or over SSH",
   "main": "./out/main/index.js",
   "author": {
     "name": "Portside Labs LLC",
