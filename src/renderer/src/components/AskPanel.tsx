@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties, type ReactNode } from 'react'
 import { createPortal } from 'react-dom'
 import type { AiProgressEvent, AiResult, AiTurn, CatalogModel } from '@shared/ai'
-import { BYOK_PROVIDERS, LOCAL_PROVIDERS, MODEL_CATALOG, PROVIDERS, activeConnection, connectionReady, modelTitle, vendorOf } from '@shared/ai'
+import { BYOK_PROVIDERS, LOCAL_PROVIDERS, MODEL_CATALOG, PROVIDERS, activeConnection, connectionReady, modelTitle, prettyModelName, vendorOf } from '@shared/ai'
 import { describeCounts, type AiPrivacyReport } from '@shared/privacy'
 import { useStore } from '@/store'
 import { useSession } from '@/session-store'
@@ -46,8 +46,9 @@ export function emptyChat(): ChatState {
   return { messages: [], input: '', requestId: null, conversationId: crypto.randomUUID() }
 }
 
-/** "3 values protected", with the kinds in the tooltip; opens what was sent. Nothing when the answer was not protected. */
-function privacyChip(p: AiPrivacyReport | undefined, onOpen?: () => void): ReactNode {
+/** "🔒 6 protected", with the kinds in the tooltip; opens what was sent and the values behind it. Nothing when the answer
+ * was not protected. */
+function privacyLink(p: AiPrivacyReport | undefined, onOpen?: () => void): ReactNode {
   if (!p?.protected) return null
   const n = Object.values(p.counts).reduce((sum, c) => sum + (c ?? 0), 0)
   const title = [
@@ -60,8 +61,9 @@ function privacyChip(p: AiPrivacyReport | undefined, onOpen?: () => void): React
     .filter(Boolean)
     .join(' ')
   return (
-    <button type="button" className="ask-chip privacy" title={title} onClick={onOpen} disabled={!onOpen} data-testid="ask-privacy">
-      <Icon name="shield" size={11} /> {n ? `${n} protected` : 'checked'}
+    <button type="button" className="ask-protected" title={title} onClick={onOpen} disabled={!onOpen} data-testid="ask-privacy">
+      <Icon name="lock" size={12} />
+      {n ? `${n} protected` : 'nothing to protect'}
     </button>
   )
 }
@@ -402,21 +404,17 @@ export function AskPanel({ sessionId, chat, setChat, handle, onSql, running, onC
     }
     const summary = m.steps.length ? `${m.steps.length} step${m.steps.length === 1 ? '' : 's'} · ${formatMs((m.endedAt ?? m.ts) - m.ts)}` : ''
     const inspect = m.requestId ? () => setInspecting(m.requestId!) : undefined
-    const stepsToggle =
-      summary || inspect ? (
-        <div className="ask-activity-row">
-          {summary ? (
-            <button className="ask-activity-summary" onClick={() => toggleSteps(m.id)} title="What happened while the answer was built">
-              <Icon name={m.stepsOpen ? 'chevron-down' : 'chevron-right'} size={11} /> {summary}
-            </button>
-          ) : null}
-          {inspect ? (
-            <button className="ask-activity-summary" onClick={inspect} title="Exactly what was sent to the model and what came back" data-testid="ask-what-was-sent">
-              <Icon name="shield" size={11} /> What was sent
-            </button>
-          ) : null}
-        </div>
-      ) : null
+    const stepsToggle = summary ? (
+      <button className={`ask-steps-toggle ${m.stepsOpen ? 'open' : ''}`} onClick={() => toggleSteps(m.id)} title="What happened while the answer was built">
+        {summary} <Icon name="chevron-down" size={11} />
+      </button>
+    ) : null
+    // Beside the steps: every request and response, as they went over the network.
+    const whatWasSent = inspect ? (
+      <button className="ask-action" onClick={inspect} title="Exactly what was sent to the model and what came back" data-testid="ask-what-was-sent">
+        <Icon name="shield" size={11} /> What was sent to the model
+      </button>
+    ) : null
     let body: ReactNode
     if (m.error) body = <div className="chat-text error">{m.error}</div>
     else if (!m.result || m.result.kind === 'cancelled') body = <div className="chat-text muted">Cancelled.</div>
@@ -429,56 +427,77 @@ export function AskPanel({ sessionId, chat, setChat, handle, onSql, running, onC
       )
     } else {
       const r = m.result
+      const readOnly = r.checks.explained
+        ? 'Verified read-only: the database refused writes, and the query plan was checked before running'
+        : 'Read-only: the database refused writes, but the query plan could not be checked'
+      const context = r.context.mode === 'all' ? `all ${r.context.totalTables} tables` : `${r.context.tables} of ${r.context.totalTables} tables`
+      const privacy = privacyLink(r.privacy, inspect)
       body = (
         <>
-          <div className="ask-badges">
-            <span className={`ask-badge ${r.checks.explained ? 'ok' : 'warn'}`} title="Read-only was enforced by the database and the query plan was checked before running">
-              {r.checks.explained ? 'verified read-only' : 'read-only'}
-              {r.checks.repairs ? ` · fixed ${r.checks.repairs}×` : ''}
-              {r.autoRun ? ' · ran automatically' : ''}
-            </span>
-            {privacyChip(r.privacy, m.requestId ? () => setInspecting(m.requestId!) : undefined)}
-          </div>
           <div className="chat-text">{r.explanation}</div>
           <SqlCode sql={r.sql} dialect={dialect} className="chat-sql" title="The query placed in the editor" />
-          {r.tablesUsed.length || r.assumptions.length || r.warnings?.length ? (
-            <div className="chat-chips">
-              {r.warnings?.map((w) => (
-                <span key={w} className="ask-chip warn" title={w} data-testid="ask-warning">
-                  {w}
-                </span>
-              ))}
-              {r.tablesUsed.map((t) => (
-                <span key={t} className="ask-chip">
-                  <strong>{t}</strong>
-                </span>
-              ))}
-              {r.assumptions.map((a) => (
-                <span key={a} className="ask-chip warn" title={a}>
-                  {a}
-                </span>
-              ))}
+          {r.warnings?.map((w) => (
+            <div key={w} className="ask-note warn" data-testid="ask-warning">
+              {w}
             </div>
-          ) : null}
-          <div className="chat-meta" title={`Schema context: ${r.context.mode === 'all' ? 'all tables' : `${r.context.tables} of ${r.context.totalTables} tables`} (~${formatTokens(r.context.schemaTokens)} tokens)`}>
-            {r.context.mode === 'all' ? `${r.context.totalTables} tables` : `${r.context.tables}/${r.context.totalTables} tables`} · {formatTokens(r.usage.inputTokens + r.usage.outputTokens)} tokens · {r.usage.model}
-          </div>
-          <div className="chat-actions">
-            <button className="btn small success" onClick={() => onSql(r.sql, true)} disabled={running} data-testid="ask-run">
-              <Icon name="play" /> {r.autoRun ? 'Run again' : 'Run it'}
-            </button>
-            <button className="btn small ghost" onClick={() => onSql(r.sql, false)} title="Put this query in the editor without running it">
-              <Icon name="code" /> To editor
-            </button>
+          ))}
+          {r.assumptions.map((a) => (
+            <div key={a} className="ask-note">
+              {a}
+            </div>
+          ))}
+          {/* What happened to the query, as glyphs with their details in tooltips, then the cost. */}
+          <div className="ask-meta" data-testid="ask-meta">
+            <span className="ask-glyphs">
+              <span className={`ask-glyph ${r.checks.explained ? 'ok' : 'warn'}`} role="img" title={readOnly} aria-label={readOnly} data-testid="ask-read-only">
+                <Icon name={r.checks.explained ? 'shield' : 'shield-alert'} size={12} />
+              </span>
+              {r.checks.repairs ? (
+                <span className="ask-glyph" role="img" title={`Fixed ${r.checks.repairs}× after the database rejected it`} aria-label={`Fixed ${r.checks.repairs} times`}>
+                  <Icon name="wrench" size={12} />
+                  <span>{r.checks.repairs}</span>
+                </span>
+              ) : null}
+              {r.autoRun ? (
+                <span className="ask-glyph" role="img" title="Ran automatically" aria-label="Ran automatically" data-testid="ask-auto-ran">
+                  <Icon name="bolt" size={12} />
+                </span>
+              ) : null}
+            </span>
+            {/* Spelled out rather than a glyph: it is the way in to what was protected. */}
+            {privacy ? <span>{privacy}</span> : null}
+            <span title={`${formatTokens(r.usage.inputTokens)} in, ${formatTokens(r.usage.outputTokens)} out · ${prettyModelName(r.usage.model)} · schema from ${context} (~${formatTokens(r.context.schemaTokens)} tokens)`}>
+              {formatTokens(r.usage.inputTokens + r.usage.outputTokens)} tokens
+            </span>
           </div>
         </>
       )
     }
+    const run = m.result?.kind === 'query' ? m.result : null
     return (
       <div className={`chat-msg assistant ${m.result?.kind ?? (m.error ? 'error' : '')}`} key={m.id} data-testid="ask-result">
         {body}
-        {stepsToggle}
-        {m.stepsOpen ? renderSteps(m, false) : null}
+        {run || stepsToggle ? (
+          <div className="ask-actions">
+            {run ? (
+              <>
+                <button className="ask-action run" onClick={() => onSql(run.sql, true)} disabled={running} data-testid="ask-run">
+                  <Icon name="play" size={11} /> {run.autoRun ? 'Run again' : 'Run it'}
+                </button>
+                <button className="ask-action" onClick={() => onSql(run.sql, false)} title="Put this query in the editor without running it">
+                  To editor
+                </button>
+              </>
+            ) : null}
+            {stepsToggle}
+          </div>
+        ) : null}
+        {m.stepsOpen ? (
+          <>
+            {renderSteps(m, false)}
+            {whatWasSent}
+          </>
+        ) : null}
       </div>
     )
   }

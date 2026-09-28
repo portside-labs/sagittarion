@@ -3,7 +3,7 @@ import { resolve } from 'path'
 
 export default defineConfig({
   resolve: {
-    alias: { '@shared': resolve('src/shared') }
+    alias: { '@shared': resolve('src/shared'), '@': resolve('src/renderer/src') }
   },
   test: {
     include: ['test/**/*.test.ts'],

@@ -5,6 +5,7 @@ import { _electron as electron } from 'playwright'
 import { spawnSync } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import fs from 'node:fs'
+import http from 'node:http'
 import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -139,6 +140,16 @@ async function main() {
 
     await page.getByTestId('connect-button').click()
     const front = (testId) => page.locator(`.session-slot:not([hidden]) [data-testid=${testId}]`)
+    const theme = () => page.evaluate(() => [document.documentElement.dataset.theme, getComputedStyle(document.body).backgroundColor].join(' '))
+    const pickTheme = async (id) => {
+      await front('open-settings').click()
+      await page.getByTestId('settings-dialog').waitFor()
+      await page.getByTestId('settings-tab-appearance').click()
+      await page.getByTestId(`theme-${id}`).click()
+      await page.waitForFunction((t) => document.documentElement.dataset.theme === t, id)
+      await page.keyboard.press('Escape')
+      await page.waitForFunction(() => !document.querySelector('[data-testid=settings-dialog]'))
+    }
     await front('tree-table-users').waitFor({ timeout: 30000 })
     console.log('connected; schema loaded')
 
@@ -163,6 +174,15 @@ async function main() {
     await page.getByTestId('settings-dialog').waitFor()
     await page.getByTestId('connection-tabs-mode').getByRole('button', { name: 'Horizontal' }).click()
     await page.locator('.app-shell.tabs-horizontal .conn-tabs').waitFor()
+    // The theme recolours the window as soon as it is picked, and back.
+    assert((await theme()) === 'charcoal rgb(15, 15, 15)', `the window starts in Charcoal, neutral black (${await theme()})`)
+    await page.getByTestId('theme-cobalt').click()
+    await page.waitForFunction(() => document.documentElement.dataset.theme === 'cobalt')
+    assert((await theme()) === 'cobalt rgb(24, 25, 28)', `Cobalt is a lighter, blue-cast grey (${await theme()})`)
+    assert((await page.getByTestId('theme-cobalt').getAttribute('aria-pressed')) === 'true', 'the chosen theme is marked')
+    await shot('01e-cobalt-settings')
+    await page.getByTestId('theme-charcoal').click()
+    assert((await theme()) === 'charcoal rgb(15, 15, 15)', 'back to Charcoal')
     await page.keyboard.press('Escape')
     await page.waitForFunction(() => !document.querySelector('[data-testid=settings-dialog]'))
     // Closing the first connection's tab leaves the second one open and in front.
@@ -604,6 +624,83 @@ async function main() {
     await page.keyboard.press('Escape')
     await page.waitForFunction(() => !document.querySelector('[data-testid=settings-dialog]'))
     console.log('statement-aware suggestions and editor settings work')
+    // Code colours and the SQL pane's font, chosen over the theme's, then the theme's again.
+    const codeStyle = () =>
+      page.evaluate(() =>
+        [
+          document.documentElement.dataset.syntax ?? 'theme',
+          getComputedStyle(document.documentElement).getPropertyValue('--syntax-keyword').trim(),
+          getComputedStyle(document.querySelector('.tab-pane:not([hidden]) .query-tab .cm-scroller')).fontFamily.split(',')[0]
+        ].join(' ')
+      )
+    const themeCode = await codeStyle()
+    assert(themeCode.startsWith('theme #') && !themeCode.includes('JetBrains'), `the theme's code colours and font to begin with (${themeCode})`)
+    await front('open-settings').click()
+    await page.getByTestId('settings-dialog').waitFor()
+    await page.getByTestId('settings-tab-appearance').click()
+    await page.getByTestId('syntax-ocean').click()
+    await page.getByTestId('font-jetbrains-mono').click()
+    assert((await page.getByTestId('syntax-ocean').getAttribute('aria-pressed')) === 'true', 'the chosen code colours are marked')
+    await page.getByTestId('font-choices').scrollIntoViewIfNeeded()
+    await shot('06g-code-settings')
+    await page.keyboard.press('Escape')
+    await page.waitForFunction(() => !document.querySelector('[data-testid=settings-dialog]'))
+    const chosenCode = await codeStyle()
+    assert(chosenCode.startsWith('ocean #') && chosenCode.endsWith(' "Bundled JetBrains Mono"') && chosenCode.split(' ')[1] !== themeCode.split(' ')[1], `chosen code colours and font win over the theme's (${chosenCode})`)
+    await front('open-settings').click()
+    await page.getByTestId('settings-dialog').waitFor()
+    await page.getByTestId('settings-tab-appearance').click()
+    await page.getByTestId('syntax-theme').click()
+    await page.getByTestId('font-theme').click()
+    await page.keyboard.press('Escape')
+    await page.waitForFunction(() => !document.querySelector('[data-testid=settings-dialog]'))
+    assert((await codeStyle()) === themeCode, `the theme's code colours and font again (${await codeStyle()})`)
+    console.log("code colours and the SQL pane's font override the theme's, and go back to it")
+    // An answer from the chat with a value protected on its way out: "N protected" under the SQL opens what was sent.
+    const aiRequests = []
+    const ai = http.createServer((req, res) => {
+      let body = ''
+      req.on('data', (c) => (body += c))
+      req.on('end', () => {
+        res.writeHead(200, { 'content-type': 'application/json' })
+        if (req.url.endsWith('/models')) return res.end(JSON.stringify({ data: [{ id: 'mock-sql' }] }))
+        aiRequests.push(body)
+        const args = { sql: 'SELECT id, name FROM users ORDER BY id LIMIT 1', explanation: 'The first user.', tables_used: ['users'] }
+        const call = { id: 'c1', type: 'function', function: { name: 'propose_query', arguments: JSON.stringify(args) } }
+        res.end(JSON.stringify({ model: 'mock-sql', choices: [{ message: { content: null, tool_calls: [call] } }], usage: { prompt_tokens: 900, completion_tokens: 40 } }))
+      })
+    })
+    await new Promise((resolve) => ai.listen(0, '127.0.0.1', resolve))
+    try {
+      await front('open-settings').click()
+      await page.getByTestId('settings-dialog').waitFor()
+      await page.getByTestId('settings-tab-ai').click()
+      await page.getByTestId('ai-type-local').click()
+      await page.getByTestId('ai-local-type').selectOption('openai-compatible')
+      await page.getByTestId('ai-base-url').fill(`http://127.0.0.1:${ai.address().port}/v1`)
+      await page.getByTestId('ai-model').fill('mock-sql')
+      // The mock runs on this computer, so protect local models too.
+      await page.getByTestId('privacy-local').check()
+      await page.getByTestId('settings-save').click()
+      await page.locator('.toast.success', { hasText: 'Settings saved' }).waitFor()
+      await page.keyboard.press('Escape')
+      await page.waitForFunction(() => !document.querySelector('[data-testid=settings-dialog]'))
+      await front('ask-input').fill('Who is the user with the email radia.1@example.com?')
+      await front('ask-button').click()
+      const protectedLink = front('ask-privacy').last()
+      await protectedLink.waitFor({ timeout: 30000 })
+      const linkText = (await protectedLink.textContent()).trim()
+      assert(/^\d+ protected$/.test(linkText), `the answer says how many values were protected (${linkText})`)
+      assert(aiRequests.length > 0 && !aiRequests.join('\n').includes('radia.1@example.com'), 'the email never reached the model')
+      await protectedLink.click()
+      await page.getByTestId('exchange-summary').waitFor()
+      await shot('06h-what-was-sent')
+      await page.keyboard.press('Escape')
+      await page.waitForFunction(() => !document.querySelector('[data-testid=exchange-summary]'))
+      console.log('"N protected" under an answer opens what was sent to the model')
+    } finally {
+      ai.close()
+    }
 
     // Error handling
     await cm.click()
@@ -736,6 +833,7 @@ async function main() {
     await page.mouse.up()
     await page.waitForFunction(() => document.querySelector('[data-testid=conn-tab] .conn-tab-name')?.textContent === 'E2E local file')
     await shot('07c3-grouped-tabs')
+    await pickTheme('cobalt')
     await connTab('E2E via profile').click()
     await page.waitForTimeout(800)
     await app.close()
@@ -744,6 +842,7 @@ async function main() {
     watchConsole()
     await page.waitForLoadState('domcontentloaded')
     await page.getByTestId('conn-tab').nth(1).waitFor({ timeout: 15000 })
+    assert((await theme()) === 'cobalt rgb(24, 25, 28)', 'the theme comes back after a restart')
     assert((await page.getByTestId('conn-tab').count()) === 2, 'both connection tabs come back')
     assert((await page.locator('[data-testid=conn-tab] .conn-tab-name').allTextContents()).join() === 'E2E local file,E2E via profile', 'the tabs come back in the order they were dragged into')
     assert((await connTab('E2E via profile').getAttribute('aria-selected')) === 'true', 'the connection that was in front is in front again')
@@ -756,6 +855,7 @@ async function main() {
     await connTab('E2E local file').click()
     await front('tree-table-users').waitFor({ timeout: 30000 })
     console.log('workspace restored after a restart')
+    await pickTheme('charcoal')
     // A collapsed group stays collapsed through a restart.
     await page.locator('[data-testid=conn-tab-group][data-group="Acme Corp"]').getByTestId('conn-tab-group-label').click()
     await connTab('E2E via profile').waitFor({ state: 'hidden' })

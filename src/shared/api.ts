@@ -54,6 +54,8 @@ export interface Api {
   app: {
     info(): Promise<AppInfo>
     openExternal(url: string): Promise<void>
+    /** The window's own background, which shows while it is resized: the theme's. */
+    setBackgroundColor(color: string): Promise<void>
   }
   connections: {
     list(): Promise<ConnectionConfig[]>

@@ -1,17 +1,5 @@
 :root {
   color-scheme: dark;
-  --bg: #161616;
-  --bg-elev: #1e1e1e;
-  --bg-panel: #121212;
-  --bg-editor: #0c0c0c;
-  --bg-hover: #232323;
-  --bg-active: #2c2c2c;
-  --bg-input: #0e0e0e;
-  --border: #262626;
-  --border-strong: #353535;
-  --text: #e4e4e4;
-  --text-muted: #9b9b9b;
-  --text-faint: #646464;
   --accent: #ffffff;
   --accent-strong: #dcdcdc;
   --accent-soft: rgba(255, 255, 255, 0.12);
@@ -20,8 +8,8 @@
   --danger-soft: rgba(255, 95, 87, 0.14);
   --warn: #e6a23c;
   --warn-soft: rgba(230, 162, 60, 0.16);
-  --ok: #3ecf8e;
-  --ok-soft: rgba(62, 207, 142, 0.14);
+  --ok: #66c887;
+  --ok-soft: rgba(102, 200, 135, 0.14);
   --dirty: rgba(230, 162, 60, 0.28);
   --new-row: rgba(62, 207, 142, 0.12);
   --deleted-row: rgba(255, 95, 87, 0.14);
@@ -41,6 +29,273 @@
   --shadow: 0 10px 30px rgba(0, 0, 0, 0.45);
 }
 
+/* The themes: surfaces, lines, text and code colours. All are flat: one dark surface for the editor and results, the
+   side panels a shade lighter, thin dividers, and fills rather than outlines for the few things that need to stand
+   out. Charcoal is neutral black and Cobalt a shade lighter with a blue cast; the rest carry Cobalt's steps between
+   surfaces to other hues, each with code colours to suit. An element with its own data-theme (the previews in
+   Settings) takes that theme's colours. */
+:root,
+[data-theme="charcoal"] {
+  --bg: #0f0f0f;
+  --bg-elev: #181818;
+  --bg-panel: #121212;
+  --bg-titlebar: #141414;
+  --bg-editor: #0f0f0f;
+  --bg-hover: #1a1a1a;
+  --bg-active: #1d1d1d;
+  --bg-input: #0c0c0c;
+  --bg-fill-hover: #242424;
+  --bg-fill-press: #292929;
+  --bg-fill-selected: #262626;
+  --border: #1d1d1d;
+  --border-strong: #272727;
+  --border-focus: #424242;
+  --text: #f9faff;
+  --text-muted: #ccced7;
+  --text-faint: #92949f;
+  --text-dim: #6d6f79;
+  --line-number: #5c5e66;
+  --code-text: #e8e9ef;
+  --tree-text-strong: #f8f9fe;
+  --tree-text: #d2d6df;
+  --tree-meta: #7e808a;
+  --tree-heading: #9698a2;
+  --scrollbar: #3a3e47;
+  --scrollbar-hover: #4a4f5a;
+  --bg-selected: #262a33;
+  --syntax-keyword: #e68cc6;
+  --syntax-string: #e5a367;
+  --syntax-number: #e5a367;
+  --syntax-comment: #777982;
+}
+[data-theme="cobalt"] {
+  --bg: #18191c;
+  --bg-elev: #202126;
+  --bg-panel: #1a1b1f;
+  --bg-titlebar: #1c1d21;
+  --bg-editor: #18191c;
+  --bg-hover: #222328;
+  --bg-active: #25262c;
+  --bg-input: #17171a;
+  --bg-fill-hover: #2c2d33;
+  --bg-fill-press: #313238;
+  --bg-fill-selected: #2e2f36;
+  --border: #25262c;
+  --border-strong: #2f3037;
+  --border-focus: #4a4c55;
+  --text: #f9faff;
+  --text-muted: #ccced7;
+  --text-faint: #92949f;
+  --text-dim: #6d6f79;
+  --line-number: #5c5e66;
+  --code-text: #e8e9ef;
+  --tree-text-strong: #f8f9fe;
+  --tree-text: #d2d6df;
+  --tree-meta: #7e808a;
+  --tree-heading: #9698a2;
+  --scrollbar: #3a3e47;
+  --scrollbar-hover: #4a4f5a;
+  --bg-selected: #262a33;
+  --syntax-keyword: #e68cc6;
+  --syntax-string: #e5a367;
+  --syntax-number: #e5a367;
+  --syntax-comment: #777982;
+}
+/* Deep indigo: violet keywords, green strings, orange numbers. */
+[data-theme="midnight"] {
+  --bg: #101222;
+  --bg-elev: #181a2c;
+  --bg-panel: #121424;
+  --bg-titlebar: #141627;
+  --bg-editor: #101222;
+  --bg-hover: #1a1c2e;
+  --bg-active: #1d1f32;
+  --bg-input: #0f1020;
+  --bg-fill-hover: #23263b;
+  --bg-fill-press: #282b41;
+  --bg-fill-selected: #25283d;
+  --border: #1d1f32;
+  --border-strong: #26293e;
+  --border-focus: #404460;
+  --text: #f7f9ff;
+  --text-muted: #cbcedd;
+  --text-faint: #9194a3;
+  --text-dim: #6c6f7d;
+  --line-number: #5b5d6b;
+  --code-text: #e6e8f9;
+  --tree-text-strong: #f6f8ff;
+  --tree-text: #d1d6e5;
+  --tree-meta: #7d808e;
+  --tree-heading: #9598a6;
+  --scrollbar: #393c54;
+  --scrollbar-hover: #494d66;
+  --bg-selected: #25283f;
+  --syntax-keyword: #c5a8ff;
+  --syntax-string: #abdd84;
+  --syntax-number: #ffb076;
+  --syntax-comment: #717ba8;
+}
+/* Aubergine: iris keywords, gold strings, rose numbers. */
+[data-theme="plum"] {
+  --bg: #1b121e;
+  --bg-elev: #241a28;
+  --bg-panel: #1e1421;
+  --bg-titlebar: #201623;
+  --bg-editor: #1b121e;
+  --bg-hover: #261b2a;
+  --bg-active: #2a1e2d;
+  --bg-input: #1a101c;
+  --bg-fill-hover: #312535;
+  --bg-fill-press: #37293b;
+  --bg-fill-selected: #332737;
+  --border: #2a1e2d;
+  --border-strong: #352839;
+  --border-focus: #534258;
+  --text: #fff7ff;
+  --text-muted: #d3cbd6;
+  --text-faint: #9b919d;
+  --text-dim: #756d77;
+  --line-number: #635c65;
+  --code-text: #efe6f1;
+  --tree-text-strong: #fff6ff;
+  --tree-text: #dbd1de;
+  --tree-meta: #857e87;
+  --tree-heading: #9d96a0;
+  --scrollbar: #46384b;
+  --scrollbar-hover: #58495c;
+  --bg-selected: #322436;
+  --syntax-keyword: #d7b2fd;
+  --syntax-string: #fece86;
+  --syntax-number: #fcb3bb;
+  --syntax-comment: #877e9a;
+}
+/* Forest green: orchid keywords, straw strings, terracotta numbers. */
+[data-theme="moss"] {
+  --bg: #101911;
+  --bg-elev: #172119;
+  --bg-panel: #111b13;
+  --bg-titlebar: #131d15;
+  --bg-editor: #101911;
+  --bg-hover: #19231b;
+  --bg-active: #1b261d;
+  --bg-input: #0e1710;
+  --bg-fill-hover: #222e24;
+  --bg-fill-press: #263328;
+  --bg-fill-selected: #233026;
+  --border: #1b261d;
+  --border-strong: #243127;
+  --border-focus: #3d4e40;
+  --text: #f3fef5;
+  --text-muted: #c8d1c9;
+  --text-faint: #8e9890;
+  --text-dim: #6a736b;
+  --line-number: #59615a;
+  --code-text: #e3ede4;
+  --tree-text-strong: #f2fdf4;
+  --tree-text: #cedacf;
+  --tree-meta: #7b837c;
+  --tree-heading: #929b94;
+  --scrollbar: #354237;
+  --scrollbar-hover: #455348;
+  --bg-selected: #212e23;
+  --syntax-keyword: #e9acd6;
+  --syntax-string: #dad386;
+  --syntax-number: #f8a885;
+  --syntax-comment: #809085;
+}
+/* Warm earth brown: coral keywords, olive strings, mauve numbers. */
+[data-theme="umber"] {
+  --bg: #1d140d;
+  --bg-elev: #261c13;
+  --bg-panel: #1f160e;
+  --bg-titlebar: #211810;
+  --bg-editor: #1d140d;
+  --bg-hover: #281e15;
+  --bg-active: #2b2118;
+  --bg-input: #1b120b;
+  --bg-fill-hover: #33281e;
+  --bg-fill-press: #382c22;
+  --bg-fill-selected: #352a20;
+  --border: #2b2118;
+  --border-strong: #362a20;
+  --border-focus: #554538;
+  --text: #fff8ed;
+  --text-muted: #d8ccc2;
+  --text-faint: #9f9289;
+  --text-dim: #796d65;
+  --line-number: #665c54;
+  --code-text: #f4e7dd;
+  --tree-text-strong: #fff7ec;
+  --tree-text: #e0d3c8;
+  --tree-meta: #897e75;
+  --tree-heading: #a2968c;
+  --scrollbar: #483b30;
+  --scrollbar-hover: #5a4c41;
+  --bg-selected: #34271d;
+  --syntax-keyword: #ff9978;
+  --syntax-string: #cad37a;
+  --syntax-number: #e8a6c8;
+  --syntax-comment: #a19486;
+}
+
+/* Code colours chosen in Settings over the theme's own. They come after the themes, so on the same element they win. */
+/* Pink keywords; amber strings and numbers. */
+[data-syntax="blossom"] {
+  --syntax-keyword: #e68cc6;
+  --syntax-string: #e5a367;
+  --syntax-number: #e5a367;
+  --syntax-comment: #777982;
+}
+/* Violet keywords, green strings, orange numbers. */
+[data-syntax="twilight"] {
+  --syntax-keyword: #c5a8ff;
+  --syntax-string: #abdd84;
+  --syntax-number: #ffb076;
+  --syntax-comment: #717ba8;
+}
+/* Iris keywords, gold strings, rose numbers. */
+[data-syntax="iris"] {
+  --syntax-keyword: #d7b2fd;
+  --syntax-string: #fece86;
+  --syntax-number: #fcb3bb;
+  --syntax-comment: #877e9a;
+}
+/* Orchid keywords, straw strings, terracotta numbers. */
+[data-syntax="meadow"] {
+  --syntax-keyword: #e9acd6;
+  --syntax-string: #dad386;
+  --syntax-number: #f8a885;
+  --syntax-comment: #809085;
+}
+/* Coral keywords, olive strings, mauve numbers. */
+[data-syntax="ember"] {
+  --syntax-keyword: #ff9978;
+  --syntax-string: #cad37a;
+  --syntax-number: #e8a6c8;
+  --syntax-comment: #a19486;
+}
+/* Purple keywords, green strings, orange numbers. */
+[data-syntax="classic"] {
+  --syntax-keyword: #d882f1;
+  --syntax-string: #a4d381;
+  --syntax-number: #e3a76e;
+  --syntax-comment: #959aa5;
+}
+/* Sky-blue keywords, sea-green strings, sand numbers. */
+[data-syntax="ocean"] {
+  --syntax-keyword: #73c5ff;
+  --syntax-string: #87e4c6;
+  --syntax-number: #ffd783;
+  --syntax-comment: #75879c;
+}
+/* Greys only: bright keywords, quieter strings and numbers. */
+[data-syntax="mono"] {
+  --syntax-keyword: #f9fafd;
+  --syntax-string: #a9abb5;
+  --syntax-number: #a9abb5;
+  --syntax-comment: #6b6d78;
+}
+
 * {
   box-sizing: border-box;
 }
@@ -57,7 +312,8 @@ body {
   font-size: var(--fs);
   line-height: 1.4;
   overflow: hidden;
-  -webkit-font-smoothing: antialiased;
+  /* macOS's fuller rendering: "antialiased" thins light text on dark surfaces until it reads as dim. */
+  -webkit-font-smoothing: auto;
   user-select: none;
 }
 input,
@@ -83,13 +339,13 @@ code,
   height: 10px;
 }
 ::-webkit-scrollbar-thumb {
-  background: #3a3e47;
+  background: var(--scrollbar);
   border-radius: 6px;
   border: 2px solid transparent;
   background-clip: padding-box;
 }
 ::-webkit-scrollbar-thumb:hover {
-  background: #4a4f5a;
+  background: var(--scrollbar-hover);
   background-clip: padding-box;
   border: 2px solid transparent;
 }
@@ -157,19 +413,18 @@ body.mac .titlebar {
   height: 28px;
   padding: 0 11px;
   border-radius: var(--radius);
-  border: 1px solid var(--border-strong);
-  background: var(--bg-elev);
+  border: 1px solid transparent;
+  background: var(--bg-active);
   color: var(--text);
   cursor: pointer;
   white-space: nowrap;
   transition: background 0.12s, border-color 0.12s;
 }
 .btn:hover:not(:disabled) {
-  background: var(--bg-hover);
-  border-color: #4a4f5a;
+  background: var(--bg-fill-hover);
 }
 .btn:active:not(:disabled) {
-  background: var(--bg-active);
+  background: var(--bg-fill-press);
 }
 .btn:disabled {
   opacity: 0.45;
@@ -190,16 +445,14 @@ body.mac .titlebar {
 }
 .btn.danger:hover:not(:disabled) {
   background: var(--danger-soft);
-  border-color: var(--danger);
 }
 .btn.success {
-  background: #1f8a5b;
-  border-color: #1f8a5b;
-  color: #fff;
+  background: var(--ok-soft);
+  color: var(--ok);
   font-weight: 600;
 }
 .btn.success:hover:not(:disabled) {
-  background: #24a06a;
+  background: rgba(102, 200, 135, 0.22);
 }
 .btn.ghost {
   background: transparent;
@@ -234,9 +487,9 @@ body.mac .titlebar {
   font-weight: 600;
   letter-spacing: 0.02em;
   line-height: 1;
-  color: var(--text);
-  background: rgba(255, 255, 255, 0.08);
-  border: 1px solid rgba(255, 255, 255, 0.1);
+  color: var(--text-muted);
+  background: rgba(255, 255, 255, 0.05);
+  border: none;
   border-radius: 4px;
   padding: 0 5px;
   margin-left: 4px;
@@ -259,7 +512,7 @@ textarea.text {
   height: 28px;
   padding: 0 9px;
   border-radius: var(--radius);
-  border: 1px solid var(--border-strong);
+  border: 1px solid var(--border);
   background: var(--bg-input);
   color: var(--text);
   outline: none;
@@ -275,8 +528,7 @@ textarea.text {
 input.text:focus,
 select.select:focus,
 textarea.text:focus {
-  border-color: var(--accent);
-  box-shadow: 0 0 0 3px var(--accent-soft);
+  border-color: var(--border-focus);
 }
 input.text::placeholder {
   color: var(--text-faint);
@@ -306,7 +558,7 @@ select.select {
 }
 .segmented {
   display: inline-flex;
-  border: 1px solid var(--border-strong);
+  border: 1px solid var(--border);
   border-radius: var(--radius);
   overflow: hidden;
   background: var(--bg-input);
@@ -318,7 +570,7 @@ select.select {
   background: transparent;
   color: var(--text-muted);
   cursor: pointer;
-  border-right: 1px solid var(--border-strong);
+  border-right: 1px solid var(--border);
 }
 .segmented button:last-child {
   border-right: none;
@@ -683,17 +935,22 @@ select.select {
   display: flex;
   align-items: center;
   gap: 6px;
-  padding: 8px 6px 4px;
-  color: var(--text-muted);
-  font-size: 11px;
+  padding: 10px 6px 4px;
+  color: var(--tree-heading);
+  font-size: 10.5px;
   text-transform: uppercase;
   letter-spacing: 0.08em;
-  font-weight: 600;
+  font-weight: 400;
   cursor: pointer;
 }
+/* "Tables · 31": the count follows its label after a middle dot, in the same colour. */
 .tree-section-header .count {
-  color: var(--text-faint);
-  font-weight: 500;
+  color: inherit;
+  font-weight: 400;
+}
+.tree-section-header .count::before {
+  content: '·';
+  margin-right: 6px;
 }
 .tree-item {
   display: flex;
@@ -702,14 +959,18 @@ select.select {
   height: 25px;
   padding: 0 6px 0 4px;
   border-radius: var(--radius-sm);
+  color: var(--tree-text);
+  font-weight: 400;
   cursor: pointer;
   white-space: nowrap;
 }
 .tree-item:hover {
   background: var(--bg-hover);
+  color: var(--tree-text-strong);
 }
+/* The open table reads brighter, without a box around it. */
 .tree-item.active {
-  background: var(--accent-soft);
+  color: var(--tree-text-strong);
 }
 .tree-item .tree-toggle {
   width: 16px;
@@ -733,11 +994,11 @@ select.select {
   visibility: hidden;
 }
 .tree-item .tree-icon {
-  color: var(--text-muted);
+  color: var(--text-dim);
   flex: 0 0 auto;
 }
 .tree-item.active .tree-icon {
-  color: var(--accent);
+  color: var(--text-muted);
 }
 .tree-item .tree-name {
   flex: 1;
@@ -745,7 +1006,7 @@ select.select {
   text-overflow: ellipsis;
 }
 .tree-item .tree-meta {
-  color: var(--text-faint);
+  color: var(--tree-meta);
   font-size: 11px;
   font-family: var(--mono);
 }
@@ -828,7 +1089,7 @@ select.select {
   align-items: stretch;
   height: 36px;
   flex: 0 0 auto;
-  background: var(--bg-panel);
+  background: var(--bg);
   border-bottom: 1px solid var(--border);
   overflow-x: auto;
   overflow-y: hidden;
@@ -842,7 +1103,6 @@ select.select {
   align-items: center;
   gap: 7px;
   padding: 0 10px 0 12px;
-  border-right: 1px solid var(--border);
   color: var(--text-muted);
   cursor: pointer;
   max-width: 220px;
@@ -855,10 +1115,8 @@ select.select {
   background: var(--bg-hover);
   color: var(--text);
 }
-/* The tab in front is marked by its lighter background and brighter text; a line along its top edge would crowd the
-   group lines of the connection tabs just above it. */
+/* The tab in front is marked by its brighter text alone. */
 .tab.active {
-  background: var(--bg);
   color: var(--text);
 }
 .tab .tab-title {
@@ -975,8 +1233,18 @@ select.select {
   height: 40px;
   padding: 0 10px;
   border-bottom: 1px solid var(--border);
-  background: var(--bg-panel);
+  background: var(--bg);
   flex: 0 0 auto;
+}
+/* Selects in a toolbar, such as the row limit, read as text with a chevron. */
+.toolbar select.select {
+  background-color: transparent;
+  border-color: transparent;
+  color: var(--text-muted);
+}
+.toolbar select.select:hover {
+  background-color: var(--bg-hover);
+  color: var(--text);
 }
 .toolbar .spacer {
   flex: 1;
@@ -1115,12 +1383,12 @@ table.grid {
   position: sticky;
   top: 0;
   z-index: 3;
-  background: var(--bg-elev);
+  background: var(--bg);
   color: var(--text-muted);
-  font-weight: 600;
+  font-weight: 500;
   cursor: pointer;
   user-select: none;
-  border-bottom: 1px solid var(--border-strong);
+  border-bottom: 1px solid var(--border);
 }
 .grid thead th:hover {
   color: var(--text);
@@ -1230,7 +1498,7 @@ table.grid {
 }
 .grid tbody tr.row-selected td.rownum {
   color: var(--text);
-  background: #262a33;
+  background: var(--bg-selected);
 }
 .grid td.cell-dirty {
   background: var(--dirty) !important;
@@ -1254,7 +1522,7 @@ table.grid {
 .grid tbody tr.row-in-range td.rownum,
 .grid thead th.col-in-range {
   color: var(--text);
-  background: #262a33;
+  background: var(--bg-selected);
 }
 .grid td .cell-text {
   display: block;
@@ -1499,16 +1767,15 @@ table.struct {
   height: 24px;
   padding: 0 10px;
   border-radius: 999px;
-  border: 1px solid var(--border-strong);
-  background: var(--bg-elev);
+  border: 1px solid transparent;
+  background: var(--bg-active);
   color: var(--text-muted);
   cursor: pointer;
   white-space: nowrap;
   font-size: 12px;
 }
 .chip.active {
-  background: var(--accent-soft);
-  border-color: var(--accent);
+  background: var(--bg-fill-selected);
   color: var(--text);
 }
 .chip.error {
@@ -2086,45 +2353,6 @@ table.struct {
   color: var(--text);
   flex: 1 1 100%;
 }
-.ask-chip {
-  display: inline-flex;
-  align-items: center;
-  gap: 5px;
-  height: 22px;
-  padding: 0 8px;
-  border-radius: 999px;
-  border: 1px solid var(--border-strong);
-  background: var(--bg-elev);
-  color: var(--text-muted);
-  white-space: nowrap;
-}
-.ask-chip strong {
-  color: var(--text);
-  font-weight: 600;
-}
-.ask-chip.warn {
-  border-color: rgba(230, 162, 60, 0.5);
-  color: var(--warn);
-}
-.ask-badge {
-  display: inline-flex;
-  align-items: center;
-  gap: 4px;
-  padding: 2px 8px;
-  border-radius: 999px;
-  font-size: 11px;
-  font-weight: 600;
-  white-space: nowrap;
-  border: 1px solid transparent;
-}
-.ask-badge.ok {
-  color: var(--ok);
-  background: var(--ok-soft);
-}
-.ask-badge.warn {
-  color: var(--warn);
-  background: var(--warn-soft);
-}
 .ask-result .muted.small {
   font-size: 11px;
   white-space: nowrap;
@@ -2197,31 +2425,6 @@ table.struct {
 }
 
 /* ---- AI activity feed ---- */
-.ask-activity {
-  display: flex;
-  flex-direction: column;
-  gap: 2px;
-  padding: 6px 10px;
-  border-bottom: 1px solid var(--border);
-  background: var(--bg-panel);
-  font-size: 12px;
-}
-.ask-activity-summary {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  align-self: flex-start;
-  border: none;
-  background: transparent;
-  color: var(--text-muted);
-  padding: 2px 4px;
-  cursor: pointer;
-  font: inherit;
-  font-size: 11px;
-}
-.ask-activity-summary:hover {
-  color: var(--text);
-}
 .ask-step {
   display: flex;
   align-items: center;
@@ -2319,7 +2522,7 @@ table.struct {
   padding: 10px 12px;
   display: flex;
   flex-direction: column;
-  gap: 10px;
+  gap: 16px;
   font-size: 12.5px;
 }
 .chat-empty {
@@ -2339,8 +2542,8 @@ table.struct {
   align-items: flex-start;
 }
 .chat-example {
-  border: 1px solid var(--border-strong);
-  background: var(--bg-elev);
+  border: 1px solid transparent;
+  background: var(--bg-active);
   color: var(--text);
   border-radius: 999px;
   padding: 4px 10px;
@@ -2364,17 +2567,14 @@ table.struct {
 .chat-msg.user {
   align-self: flex-end;
   max-width: 88%;
-  background: var(--accent-soft);
-  border-bottom-right-radius: 3px;
+  padding: 8px 12px;
+  background: var(--bg-active);
 }
+/* The assistant's answer sits on the panel itself: no card around it. */
 .chat-msg.assistant {
   align-self: stretch;
-  background: var(--bg-elev);
-  border: 1px solid var(--border);
-  border-bottom-left-radius: 3px;
-}
-.chat-msg.assistant.clarify {
-  border-color: rgba(230, 162, 60, 0.45);
+  gap: 10px;
+  padding: 0 2px;
 }
 .chat-msg.assistant.error .chat-text.error {
   color: var(--danger);
@@ -2395,32 +2595,132 @@ table.struct {
 }
 .chat-sql {
   margin: 0;
-  padding: 6px 8px;
-  border-radius: 6px;
-  background: var(--bg-editor);
-  /* Plain text in One Dark's colour, as in the editor; keywords, strings and numbers carry their own. */
-  color: #abb2bf;
+  padding: 10px 12px;
+  border-radius: 8px;
+  background: var(--bg-input);
+  /* Plain text in the editor's colour; keywords, strings and numbers carry their own. */
+  color: var(--code-text);
   font-family: var(--mono);
   font-size: var(--code-size);
   line-height: var(--code-line);
   white-space: pre-wrap;
   word-break: break-word;
-  max-height: 140px;
+  max-height: 240px;
   overflow: auto;
-}
-.chat-chips {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 6px;
-}
-.chat-meta {
-  color: var(--text-faint);
-  font-size: 11px;
 }
 .chat-actions {
   display: flex;
   gap: 6px;
   flex-wrap: wrap;
+}
+/* An answer: the explanation, the SQL, a line of glyphs and details under it, then text actions. */
+/* Read-only, ran automatically, values protected: a glyph each, told apart in their tooltips. */
+.ask-glyphs {
+  display: inline-flex;
+  align-items: center;
+  gap: 9px;
+}
+.ask-glyph {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  color: var(--text-faint);
+  font-variant-numeric: tabular-nums;
+}
+.ask-glyph.ok {
+  color: var(--ok);
+}
+.ask-glyph.warn {
+  color: var(--warn);
+}
+/* "6 protected": a link to what was sent, a shade brighter than the details beside it. */
+.ask-protected {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  border: none;
+  background: none;
+  padding: 0;
+  font: inherit;
+  color: var(--text-muted);
+  cursor: pointer;
+}
+.ask-protected:hover:not(:disabled) {
+  color: var(--text);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+.ask-protected:disabled {
+  cursor: default;
+}
+.ask-note {
+  font-size: 12px;
+  color: var(--text-muted);
+}
+.ask-note.warn {
+  color: var(--warn);
+}
+.ask-meta {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 2px 6px;
+  font-size: 11.5px;
+  color: var(--text-faint);
+}
+.ask-meta > span + span::before {
+  content: '·';
+  margin-right: 6px;
+}
+.ask-actions {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+}
+.ask-action {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  border: none;
+  background: none;
+  padding: 2px 0;
+  font: inherit;
+  font-size: 12.5px;
+  color: var(--text-faint);
+  cursor: pointer;
+}
+.ask-action:hover:not(:disabled) {
+  color: var(--text);
+}
+.ask-action:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+.ask-action.run {
+  color: var(--text);
+  font-weight: 500;
+}
+.ask-action.run svg {
+  color: var(--ok);
+}
+.ask-steps-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  margin-left: auto;
+  border: none;
+  background: none;
+  padding: 2px 0;
+  font: inherit;
+  font-size: 11.5px;
+  color: var(--text-faint);
+  cursor: pointer;
+}
+.ask-steps-toggle:hover {
+  color: var(--text-muted);
+}
+.ask-steps-toggle.open svg {
+  transform: rotate(180deg);
 }
 .ask-steps {
   display: flex;
@@ -2503,17 +2803,17 @@ table.struct {
   justify-content: center;
   border: none;
   border-radius: 8px;
-  background: var(--accent);
-  color: var(--on-accent);
+  background: transparent;
+  color: var(--text);
   cursor: pointer;
   transition: background 0.12s, opacity 0.12s;
 }
 .chat-send:hover:not(:disabled) {
-  background: var(--accent-strong);
+  background: var(--bg-hover);
 }
 .chat-send:disabled {
-  background: var(--bg-active);
-  color: var(--text-faint);
+  background: transparent;
+  color: var(--text-dim);
   cursor: default;
 }
 .chat-send svg {
@@ -2552,8 +2852,7 @@ table.struct {
   text-transform: uppercase;
 }
 .toolbar .btn.active {
-  background: var(--accent-soft);
-  border-color: var(--accent);
+  background: var(--bg-active);
 }
 
 
@@ -2614,8 +2913,8 @@ table.struct {
   font-weight: 600;
   letter-spacing: 0.06em;
   text-transform: uppercase;
-  color: var(--text-muted);
-  background: var(--bg-panel);
+  color: var(--text-faint);
+  background: transparent;
   border-bottom: 1px solid var(--border);
   cursor: grab;
   user-select: none;
@@ -2624,11 +2923,14 @@ table.struct {
 .pane-header:active {
   cursor: grabbing;
 }
+/* The grip shows on hover: panes can be dragged, but it need not say so all the time. */
 .pane-header .pane-grip {
   color: var(--text-faint);
+  opacity: 0;
+  transition: opacity 0.12s;
 }
 .pane-header:hover .pane-grip {
-  color: var(--text);
+  opacity: 1;
 }
 .pane-header .spacer {
   flex: 1;
@@ -2839,21 +3141,22 @@ html.mac .conn-list-header {
 }
 
 
-/* ---- SQL editor: a deep neutral black that reads as its own surface ---- */
+/* ---- SQL editor: the same surface as the results around it, line numbers without a rule beside them ---- */
 .sql-editor .cm-editor,
 .sql-editor .cm-editor .cm-scroller,
 .sql-editor .cm-editor .cm-gutters {
   background: var(--bg-editor) !important;
 }
 .sql-editor .cm-editor .cm-gutters {
-  border-right: 1px solid #1c1c1c !important;
-  color: #4a4a4a !important;
+  border-right: none !important;
+  color: var(--line-number) !important;
 }
 .sql-editor .cm-editor .cm-activeLine {
-  background: rgba(255, 255, 255, 0.035) !important;
+  background: rgba(255, 255, 255, 0.02) !important;
 }
 .sql-editor .cm-editor .cm-activeLineGutter {
-  background: rgba(255, 255, 255, 0.05) !important;
+  background: transparent !important;
+  color: var(--text-muted) !important;
 }
 .sql-editor .cm-editor .cm-selectionBackground,
 .sql-editor .cm-editor.cm-focused .cm-selectionBackground {
@@ -3063,7 +3366,7 @@ html.mac .conn-list-header {
   height: var(--titlebar-h);
   padding: 0 8px;
   flex: 0 0 auto;
-  background: var(--bg);
+  background: var(--bg-titlebar);
   border-bottom: 1px solid var(--border);
   overflow: hidden;
   -webkit-app-region: drag;
@@ -3091,10 +3394,9 @@ html.mac .conn-tabs {
   color: var(--text);
 }
 /* Active state changes colour and background only: a heavier weight would widen the tab. */
+/* The connection in front reads brighter, beside its group's dot; no box around it. */
 .conn-tab.active {
-  background: var(--bg-elev);
   color: var(--text);
-  box-shadow: inset 0 0 0 1px var(--border-strong);
 }
 .conn-tab-dot {
   width: 8px;
@@ -3159,10 +3461,10 @@ html.mac .conn-tabs {
   flex-direction: column;
   align-items: center;
   gap: 6px;
-  width: 68px;
+  width: 72px;
   padding: 8px 0;
   flex: 0 0 auto;
-  background: var(--bg);
+  background: var(--bg-titlebar);
   border-right: 1px solid var(--border);
   overflow-y: auto;
   overflow-x: hidden;
@@ -3175,33 +3477,22 @@ html.mac .conn-rail {
   position: relative;
   flex-direction: column;
   gap: 4px;
-  width: 58px;
+  width: 62px;
   height: auto;
   margin: 0;
-  padding: 6px 3px 5px;
-  border-radius: 10px;
+  padding: 5px 3px;
+  border-radius: 8px;
   font-size: 10px;
   max-width: none;
 }
-.conn-rail .conn-tab.active::before {
-  content: '';
-  position: absolute;
-  left: -5px;
-  top: 12px;
-  bottom: 12px;
-  width: 3px;
-  border-radius: 2px;
-  background: var(--accent);
-}
+/* The logo stands where the strip has its dot: bare, ringed only when the connection is in trouble. */
 .conn-rail .conn-tab-logo {
-  width: 34px;
-  height: 34px;
-  border-radius: 9px;
+  width: 28px;
+  height: 28px;
+  border-radius: 8px;
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  background: var(--bg-elev);
-  box-shadow: inset 0 0 0 1.5px var(--tab-color, transparent);
 }
 .conn-rail .conn-tab-name {
   width: 100%;
@@ -3213,11 +3504,8 @@ html.mac .conn-rail {
   right: 1px;
   width: 16px;
   height: 16px;
-  background: var(--bg-elev);
 }
 .conn-rail .conn-tab-add {
-  width: 34px;
-  height: 34px;
   margin: 2px 0 0;
 }
 /* The strip or rail is the title bar now, so the inner headers give up their traffic-light inset. */
@@ -3363,22 +3651,22 @@ html.mac .app-shell.has-tabs .conn-list-header {
 .conn-rail .conn-tab-group {
   flex-direction: column;
   align-items: center;
+  align-self: stretch;
   gap: 6px;
   flex: 0 0 auto;
-  width: 64px;
   height: auto;
-  padding: 5px 0 4px;
-  border-radius: 12px;
-  background: var(--group-fill);
-  box-shadow: inset 0 0 0 1px var(--group-line);
 }
 .conn-rail .conn-tab-group.collapsed {
   gap: 0;
 }
+/* The group's line runs down the rail's edge beside its tabs, as it runs along the bottom of the strip under them. */
 .conn-rail .conn-tab-group::after {
-  display: none;
+  top: 3px;
+  left: auto;
+  width: 1px;
+  height: auto;
 }
-/* In the rail the tabs fold upwards, and the active tab's marker still shows beside them. */
+/* In the rail the tabs fold upwards. */
 .conn-rail .conn-tab-group-tabs,
 .conn-rail .conn-tab-group.collapsed .conn-tab-group-tabs {
   grid-template-columns: 1fr;
@@ -3399,42 +3687,15 @@ html.mac .app-shell.has-tabs .conn-list-header {
   overflow-x: visible;
   overflow-y: clip;
 }
-/* On the group's fill, its tabs hover and stand out in its colour rather than in grey. */
-.conn-rail .conn-tab-group.tinted .conn-tab:hover {
-  background: var(--group-fill-hover);
-}
-.conn-rail .conn-tab-group.tinted .conn-tab.active {
-  background: var(--group-fill-active);
-  box-shadow: inset 0 0 0 1px var(--group-line);
-}
+/* The strip's label, scaled to the rail's type. */
 .conn-rail .conn-tab-group-label {
-  flex-direction: column;
-  gap: 3px;
-  max-width: 62px;
-  height: auto;
+  gap: 4px;
+  max-width: calc(100% - 4px);
+  height: 20px;
   margin: 0;
-  padding: 1px 2px;
-  border-radius: 5px;
-  line-height: 14px;
-  background: none;
-  box-shadow: none;
-  font-size: 10px;
-}
-.conn-rail .conn-tab-group-label:hover {
-  background: var(--group-fill-hover);
-  box-shadow: none;
-}
-.conn-rail .conn-tab-group-name {
-  max-width: 100%;
-}
-.conn-rail .conn-tab-group-count {
-  min-width: 18px;
   padding: 0 5px;
-  border-radius: 7px;
-  background: var(--group-fill-active);
-  font-size: 9.5px;
-  text-align: center;
-  opacity: 1;
+  border-radius: 6px;
+  font-size: 10px;
 }
 
 /* ---- dragging tabs into a new order ---- */
@@ -3449,11 +3710,9 @@ html.mac .app-shell.has-tabs .conn-list-header {
   color: var(--text);
   box-shadow: 0 6px 18px rgba(0, 0, 0, 0.5), inset 0 0 0 1px var(--border-strong);
 }
-.conn-tabs .conn-tab-group.dragging {
-  background: var(--bg);
-}
+.conn-tabs .conn-tab-group.dragging,
 .conn-rail .conn-tab-group.dragging {
-  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.5), inset 0 0 0 1px var(--group-line);
+  background: var(--bg-titlebar);
 }
 html.drag-sorting,
 html.drag-sorting * {
@@ -3562,7 +3821,8 @@ html.drag-sorting * {
   gap: 8px;
   margin: 4px 0 14px;
 }
-.ai-type-tile {
+.ai-type-tile,
+.choice-tile {
   display: flex;
   flex-direction: column;
   align-items: flex-start;
@@ -3576,10 +3836,12 @@ html.drag-sorting * {
   font: inherit;
   cursor: pointer;
 }
-.ai-type-tile:hover:not(:disabled) {
+.ai-type-tile:hover:not(:disabled),
+.choice-tile:hover {
   background: var(--bg-hover);
 }
-.ai-type-tile.active {
+.ai-type-tile.active,
+.choice-tile.active {
   border-color: var(--accent);
   box-shadow: inset 0 0 0 1px var(--accent);
 }
@@ -3614,6 +3876,113 @@ html.drag-sorting * {
 .ai-type-account {
   font-size: 10.5px;
   color: var(--text-faint);
+}
+/* Choices shown as tiles, three to a row: a picture of each above its name. */
+.choice-tiles {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+}
+.choice-tile {
+  align-items: stretch;
+  gap: 8px;
+  padding: 8px 8px 9px;
+  font-size: 12.5px;
+  font-weight: 600;
+}
+.choice-tile-label {
+  padding: 0 3px;
+}
+.choice-tile-note {
+  margin-left: 2px;
+  color: var(--text-faint);
+  font-weight: 400;
+}
+/* Code colours: three lines of SQL on the editor's background. */
+.syntax-preview,
+.font-sample {
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg-editor);
+  color: var(--code-text);
+  font-family: var(--mono);
+  font-weight: 400;
+  white-space: pre;
+  overflow: hidden;
+}
+.syntax-preview {
+  display: flex;
+  flex-direction: column;
+  padding: 7px 9px;
+  font-size: 10.5px;
+  line-height: 1.5;
+}
+.syntax-preview .kw {
+  color: var(--syntax-keyword);
+}
+.syntax-preview .str {
+  color: var(--syntax-string);
+}
+.syntax-preview .num {
+  color: var(--syntax-number);
+}
+.syntax-preview .cmt {
+  color: var(--syntax-comment);
+  font-style: italic;
+}
+/* Fonts: a line of SQL set in each. */
+.font-sample {
+  padding: 9px 9px;
+  font-size: 12px;
+  text-overflow: ellipsis;
+}
+.theme-preview {
+  display: grid;
+  grid-template-columns: 32% minmax(0, 1fr);
+  grid-template-rows: 10px minmax(0, 1fr);
+  height: 64px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  overflow: hidden;
+  background: var(--bg);
+}
+.theme-preview-bar {
+  grid-column: 1 / -1;
+  background: var(--bg-titlebar);
+  border-bottom: 1px solid var(--border);
+}
+.theme-preview-side,
+.theme-preview-main {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 9px 8px;
+}
+.theme-preview-side {
+  background: var(--bg-panel);
+  border-right: 1px solid var(--border);
+}
+.theme-preview-main {
+  background: var(--bg-editor);
+}
+.theme-preview-line {
+  display: flex;
+  gap: 4px;
+}
+.theme-preview-line span {
+  height: 4px;
+  border-radius: 2px;
+  background: var(--text-dim);
+}
+.theme-preview-line .kw {
+  background: var(--syntax-keyword);
+}
+.theme-preview-line .str {
+  background: var(--syntax-string);
+}
+.theme-preview-line .tx {
+  background: var(--code-text);
+  opacity: 0.5;
 }
 .disclosure {
   display: inline-flex;
@@ -3744,37 +4113,8 @@ html.drag-sorting * {
   background: var(--accent);
   transition: width 0.2s ease-out;
 }
-.ask-badges {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 6px;
-}
-.ask-chip.privacy {
-  height: 20px;
-  font-size: 11px;
-  color: var(--text-muted);
-}
 
 /* ---- What was sent: the exchange inspector ---- */
-button.ask-chip.privacy {
-  cursor: pointer;
-  font: inherit;
-  font-size: 11px;
-}
-button.ask-chip.privacy:hover:not(:disabled) {
-  color: var(--text);
-  border-color: var(--text-faint);
-}
-button.ask-chip.privacy:disabled {
-  cursor: default;
-}
-.ask-activity-row {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 2px 10px;
-}
 .modal.exchange-modal {
   height: calc(100vh - 80px);
 }

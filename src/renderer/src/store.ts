@@ -7,6 +7,7 @@ import { defaultLayout, isValidLayout, type LayoutNode } from './lib/layout'
 import { clusterTabs, groupByConnection, nearestTab, settleCollapsed } from './lib/tab-groups'
 import { createSessionStore, snapshotSession, type SessionStore } from './session-store'
 import { ACCEPT_KEY_OPTIONS, type KeywordCase } from './lib/sql-complete'
+import { DEFAULT_THEME, isCodeFontId, isSyntaxId, isThemeId, type CodeFontId, type SyntaxId, type ThemeId } from './lib/theme'
 
 export type { Tab, SearchState } from './session-store'
 
@@ -24,6 +25,12 @@ export type ConnectionTabsMode = 'horizontal' | 'vertical'
 
 /** Preferences about the look of the app, kept on this machine. */
 export interface UiPrefs {
+  /** The colours of the window's surfaces, text and code. */
+  theme: ThemeId
+  /** Code colours chosen over the theme's; null keeps the theme's. */
+  syntax: SyntaxId | null
+  /** The SQL editor's font; null keeps the theme's. */
+  codeFont: CodeFontId | null
   /** Where open connections are listed: a strip across the top or a rail down the left. */
   connectionTabs: ConnectionTabsMode
   /** Re-case SQL keywords as they are typed. */
@@ -165,12 +172,15 @@ function loadLayout(): LayoutNode {
   return defaultLayout()
 }
 
-const DEFAULT_UI: UiPrefs = { connectionTabs: 'horizontal', keywordCase: 'upper', autocomplete: true, autoAlias: false, acceptKeys: ['Tab', 'Enter'] }
+const DEFAULT_UI: UiPrefs = { theme: DEFAULT_THEME, syntax: null, codeFont: null, connectionTabs: 'horizontal', keywordCase: 'upper', autocomplete: true, autoAlias: false, acceptKeys: ['Tab', 'Enter'] }
 
 function loadUiPrefs(): UiPrefs {
   try {
     const parsed = JSON.parse(localStorage.getItem(UI_KEY) ?? 'null') ?? {}
     return {
+      theme: isThemeId(parsed.theme) ? parsed.theme : DEFAULT_THEME,
+      syntax: isSyntaxId(parsed.syntax) ? parsed.syntax : null,
+      codeFont: isCodeFontId(parsed.codeFont) ? parsed.codeFont : null,
       connectionTabs: parsed.connectionTabs === 'vertical' ? 'vertical' : 'horizontal',
       keywordCase: parsed.keywordCase === 'lower' || parsed.keywordCase === 'off' ? parsed.keywordCase : 'upper',
       autocomplete: parsed.autocomplete !== false,

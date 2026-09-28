@@ -1,5 +1,5 @@
-import { useEffect } from 'react'
-import { applyAccent } from './lib/theme'
+import { useEffect, useLayoutEffect } from 'react'
+import { applyAccent, applySyntax, applyTheme } from './lib/theme'
 import { isModKey } from './lib/util'
 import { groupByConnection, tabsInSight } from './lib/tab-groups'
 import { getSessionStore, useStore } from './store'
@@ -22,6 +22,11 @@ export default function App() {
   const platform = useStore((s) => s.appInfo?.platform)
   const active = tabs.find((t) => t.connectionId === activeConnectionId) ?? null
   const connectVisible = showConnect || !active
+
+  // The theme and code colours, as they are changed in Settings; main.tsx puts the page in the saved ones before
+  // anything is painted.
+  useLayoutEffect(() => applyTheme(ui.theme), [ui.theme])
+  useLayoutEffect(() => applySyntax(ui.syntax), [ui.syntax])
 
   // The accent is white everywhere; a group's colour marks its tabs, not the whole window.
   useEffect(() => {

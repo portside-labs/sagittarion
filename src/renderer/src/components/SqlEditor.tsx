@@ -4,10 +4,12 @@ import { EditorView, keymap, placeholder as cmPlaceholder } from '@codemirror/vi
 import { indentWithTab } from '@codemirror/commands'
 import { acceptCompletion, autocompletion, completionKeymap } from '@codemirror/autocomplete'
 import { PostgreSQL, SQLite } from '@codemirror/lang-sql'
-import { oneDark } from '@codemirror/theme-one-dark'
+import { syntaxHighlighting } from '@codemirror/language'
+import { oneDarkTheme } from '@codemirror/theme-one-dark'
 import { basicSetup } from 'codemirror'
 import { boundaryEdit, DEFAULT_EDITOR_PREFS, sqlCompletionSource, type CompletionData, type EditorPrefs } from '@/lib/sql-complete'
 import { blockAt } from '@/lib/sql-block'
+import { sqlHighlightStyle } from '@/lib/sql-highlight'
 
 export interface SqlEditorHandle {
   getValue(): string
@@ -32,15 +34,17 @@ interface Props {
   readOnly?: boolean
   placeholder?: string
   className?: string
+  /** A font family chosen over the default code font. */
+  fontFamily?: string
 }
 
 const appTheme = EditorView.theme(
   {
-    '&': { backgroundColor: 'var(--bg-editor)', fontSize: 'var(--code-size)', height: '100%' },
+    '&': { backgroundColor: 'var(--bg-editor)', color: 'var(--code-text)', fontSize: 'var(--code-size)', height: '100%' },
     '.cm-scroller': { fontFamily: 'var(--mono)', lineHeight: 'var(--code-line)' },
-    '.cm-gutters': { backgroundColor: 'var(--bg-editor)', borderRight: '1px solid var(--border)', color: 'var(--text-faint)' },
-    '.cm-activeLineGutter': { backgroundColor: 'rgba(255,255,255,0.04)' },
-    '.cm-activeLine': { backgroundColor: 'rgba(255,255,255,0.03)' },
+    '.cm-gutters': { backgroundColor: 'var(--bg-editor)', border: 'none', color: 'var(--line-number)' },
+    '.cm-activeLineGutter': { backgroundColor: 'transparent', color: 'var(--text-muted)' },
+    '.cm-activeLine': { backgroundColor: 'rgba(255,255,255,0.02)' },
     '.cm-content': { padding: '8px 0' },
     '&.cm-focused': { outline: 'none' },
     '.cm-selectionBackground, &.cm-focused .cm-selectionBackground': { backgroundColor: 'var(--selection) !important' },
@@ -51,7 +55,7 @@ const appTheme = EditorView.theme(
 )
 
 export const SqlEditor = forwardRef<SqlEditorHandle, Props>(function SqlEditor(
-  { initialValue = '', onChange, onRun, onRunAll, completion, dialect = 'sqlite', prefs, readOnly = false, placeholder, className },
+  { initialValue = '', onChange, onRun, onRunAll, completion, dialect = 'sqlite', prefs, readOnly = false, placeholder, className, fontFamily },
   ref
 ) {
   const host = useRef<HTMLDivElement>(null)
@@ -59,6 +63,7 @@ export const SqlEditor = forwardRef<SqlEditorHandle, Props>(function SqlEditor(
   const schemaComp = useRef(new Compartment())
   const roComp = useRef(new Compartment())
   const keysComp = useRef(new Compartment())
+  const fontComp = useRef(new Compartment())
   const onRunRef = useRef(onRun)
   const onRunAllRef = useRef(onRunAll)
   const onChangeRef = useRef(onChange)
@@ -97,6 +102,9 @@ export const SqlEditor = forwardRef<SqlEditorHandle, Props>(function SqlEditor(
     return true
   })
   const roExt = (ro: boolean) => [EditorState.readOnly.of(ro), EditorView.editable.of(!ro)]
+  // A theme of its own, so a change of font is a change of theme and the editor measures its text again; above the
+  // app theme, which sets the default font on the same element.
+  const fontExt = (family: string | undefined) => (family ? Prec.high(EditorView.theme({ '.cm-scroller': { fontFamily: family } })) : [])
 
   useEffect(() => {
     if (!host.current) return
@@ -129,8 +137,11 @@ export const SqlEditor = forwardRef<SqlEditorHandle, Props>(function SqlEditor(
         schemaComp.current.of(langExt()),
         boundaryExt,
         roComp.current.of(roExt(readOnly)),
-        oneDark,
+        // One Dark's editor chrome (cursor, panels, search), with the app's own SQL colours.
+        oneDarkTheme,
+        syntaxHighlighting(sqlHighlightStyle),
         appTheme,
+        fontComp.current.of(fontExt(fontFamily)),
         placeholder ? cmPlaceholder(placeholder) : [],
         EditorView.lineWrapping,
         EditorView.updateListener.of((u) => {
@@ -155,6 +166,11 @@ export const SqlEditor = forwardRef<SqlEditorHandle, Props>(function SqlEditor(
   useEffect(() => {
     view.current?.dispatch({ effects: roComp.current.reconfigure(roExt(readOnly)) })
   }, [readOnly])
+
+  useEffect(() => {
+    view.current?.dispatch({ effects: fontComp.current.reconfigure(fontExt(fontFamily)) })
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [fontFamily])
 
   const acceptKeys = (prefs ?? DEFAULT_EDITOR_PREFS).acceptKeys.join(' ')
   useEffect(() => {

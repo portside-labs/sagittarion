@@ -12,7 +12,8 @@ function subscribe<T>(channel: string, cb: (payload: T) => void): () => void {
 const api: Api = {
   app: {
     info: () => ipcRenderer.invoke('app:info'),
-    openExternal: (url) => ipcRenderer.invoke('app:openExternal', url)
+    openExternal: (url) => ipcRenderer.invoke('app:openExternal', url),
+    setBackgroundColor: (color) => ipcRenderer.invoke('app:setBackgroundColor', color)
   },
   connections: {
     list: () => ipcRenderer.invoke('connections:list'),

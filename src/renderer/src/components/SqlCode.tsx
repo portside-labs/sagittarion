@@ -2,9 +2,9 @@
 // highlight style, as plain spans instead of an editor for every message.
 import { useLayoutEffect, useMemo } from 'react'
 import { PostgreSQL, SQLite } from '@codemirror/lang-sql'
-import { oneDarkHighlightStyle } from '@codemirror/theme-one-dark'
 import { highlightCode } from '@lezer/highlight'
 import { StyleModule } from 'style-mod'
+import { sqlHighlightStyle } from '@/lib/sql-highlight'
 
 export interface SqlPiece {
   text: string
@@ -19,7 +19,7 @@ export function highlightSql(sql: string, dialect: 'sqlite' | 'postgres'): SqlPi
   highlightCode(
     sql,
     parser.parse(sql),
-    oneDarkHighlightStyle,
+    sqlHighlightStyle,
     (text, className) => pieces.push({ text, className }),
     () => pieces.push({ text: '\n', className: '' })
   )
@@ -29,8 +29,8 @@ export function highlightSql(sql: string, dialect: 'sqlite' | 'postgres'): SqlPi
 /** An editor mounts the highlight style's rules; with no editor on screen yet, they are mounted here. */
 let mounted = false
 function mountHighlightStyle(): void {
-  if (mounted || !oneDarkHighlightStyle.module) return
-  StyleModule.mount(document, oneDarkHighlightStyle.module)
+  if (mounted || !sqlHighlightStyle.module) return
+  StyleModule.mount(document, sqlHighlightStyle.module)
   mounted = true
 }
 

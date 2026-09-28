@@ -1,4 +1,82 @@
-// The accent colour: white. Group colours mark the tabs of a group, not the window.
+// The window's colours: a theme for the surfaces, text and code, code colours and a code font that can be chosen over
+// the theme's, and a white accent. Group colours mark the tabs of a group, not the window.
+
+/**
+ * Code colours offered in Settings, in the order shown: keywords, strings, numbers and comments. Their colours are the
+ * [data-syntax] blocks in styles.css, and every theme's own are one of them.
+ */
+export const SYNTAX_PALETTES = [
+  { id: 'blossom', label: 'Blossom' },
+  { id: 'twilight', label: 'Twilight' },
+  { id: 'iris', label: 'Iris' },
+  { id: 'meadow', label: 'Meadow' },
+  { id: 'ember', label: 'Ember' },
+  { id: 'classic', label: 'Classic' },
+  { id: 'ocean', label: 'Ocean' },
+  { id: 'mono', label: 'Mono' }
+] as const
+
+export type SyntaxId = (typeof SYNTAX_PALETTES)[number]['id']
+
+/** The themes offered in Settings, in the order shown. Their colours are the [data-theme] blocks in styles.css. */
+export const THEMES = [
+  { id: 'charcoal', label: 'Charcoal', syntax: 'blossom' },
+  { id: 'cobalt', label: 'Cobalt', syntax: 'blossom' },
+  { id: 'midnight', label: 'Midnight', syntax: 'twilight' },
+  { id: 'plum', label: 'Plum', syntax: 'iris' },
+  { id: 'moss', label: 'Moss', syntax: 'meadow' },
+  { id: 'umber', label: 'Umber', syntax: 'ember' }
+] as const satisfies readonly { id: string; label: string; syntax: SyntaxId }[]
+
+export type ThemeId = (typeof THEMES)[number]['id']
+
+export const DEFAULT_THEME: ThemeId = 'charcoal'
+
+export function isThemeId(v: unknown): v is ThemeId {
+  return THEMES.some((t) => t.id === v)
+}
+
+export function isSyntaxId(v: unknown): v is SyntaxId {
+  return SYNTAX_PALETTES.some((p) => p.id === v)
+}
+
+/**
+ * Fonts for the SQL editor, bundled (fonts.ts) so each looks the same on every computer, under names of their own.
+ * Characters a font lacks come from the default code font.
+ */
+export const CODE_FONTS = [
+  { id: 'jetbrains-mono', label: 'JetBrains Mono', family: '"Bundled JetBrains Mono", var(--mono)' },
+  { id: 'fira-code', label: 'Fira Code', family: '"Bundled Fira Code", var(--mono)' },
+  { id: 'ibm-plex-mono', label: 'IBM Plex Mono', family: '"Bundled IBM Plex Mono", var(--mono)' },
+  { id: 'source-code-pro', label: 'Source Code Pro', family: '"Bundled Source Code Pro", var(--mono)' }
+] as const
+
+export type CodeFontId = (typeof CODE_FONTS)[number]['id']
+
+export function isCodeFontId(v: unknown): v is CodeFontId {
+  return CODE_FONTS.some((f) => f.id === v)
+}
+
+/** The CSS font family for a chosen code font; nothing for the theme's, which the editor has already. */
+export function codeFontFamily(id: CodeFontId | null): string | undefined {
+  return CODE_FONTS.find((f) => f.id === id)?.family
+}
+
+/** Code colours chosen over the theme's, or the theme's own again with null. */
+export function applySyntax(syntax: SyntaxId | null): void {
+  const root = document.documentElement
+  if (syntax) root.dataset.syntax = syntax
+  else delete root.dataset.syntax
+}
+
+/** Puts the page in a theme, and gives the window the same background: it shows while the window is resized. */
+export function applyTheme(theme: ThemeId): void {
+  const root = document.documentElement
+  if (root.dataset.theme === theme) return
+  root.dataset.theme = theme
+  const bg = getComputedStyle(root).getPropertyValue('--bg').trim()
+  if (bg) window.api.app.setBackgroundColor(bg).catch(() => {})
+}
 
 export const DEFAULT_ACCENT = '#ffffff'
 

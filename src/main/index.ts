@@ -173,7 +173,8 @@ function createWindow(): BrowserWindow {
     minHeight: 560,
     show: false,
     title: 'Sagittarion',
-    backgroundColor: '#17181b',
+    // Charcoal's; the page sends its own theme's once it loads.
+    backgroundColor: '#0f0f0f',
     titleBarStyle: isMac ? 'hiddenInset' : 'default',
     trafficLightPosition: isMac ? { x: 14, y: 13 } : undefined,
     webPreferences: {
@@ -343,6 +344,9 @@ function registerIpc(): void {
   }))
   ipcMain.handle('app:openExternal', async (_e, url: string) => {
     if (/^https?:\/\//.test(url)) await shell.openExternal(url)
+  })
+  ipcMain.handle('app:setBackgroundColor', (e, color: unknown) => {
+    if (typeof color === 'string' && /^#[0-9a-f]{6}$/i.test(color)) BrowserWindow.fromWebContents(e.sender)?.setBackgroundColor(color)
   })
 
   ipcMain.handle('connections:list', () => connectionStore.list())

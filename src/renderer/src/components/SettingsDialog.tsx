@@ -16,6 +16,7 @@ import { DEFAULT_PRIVACY, PRIVACY_POLICIES, classifyEndpoint, privacyApplies, ty
 import { formatBytes } from '@shared/export'
 import { useStore, type SettingsTab } from '@/store'
 import { ACCEPT_KEY_OPTIONS } from '@/lib/sql-complete'
+import { CODE_FONTS, SYNTAX_PALETTES, THEMES, type SyntaxId, type ThemeId } from '@/lib/theme'
 import { Modal } from './Modal'
 import { Icon } from './Icons'
 import { errorMessage } from '@/lib/util'
@@ -56,6 +57,56 @@ const MODEL_BADGE: Record<SemanticModelStatus['state'], string | null> = {
 }
 
 /** The on-device model's download, progress and removal, under its switch. */
+/** Bars standing in for a statement, as [kind, width]: keywords, names and a string, in the code colours. */
+const PREVIEW_LINES: [string, number][][] = [
+  [['kw', 18], ['tx', 22], ['kw', 12], ['tx', 20]],
+  [['kw', 14], ['tx', 16], ['str', 34]],
+  [['kw', 16], ['tx', 8]]
+]
+
+/** A small picture of the window in a theme's colours: the title bar, the side panel and the editor. */
+function ThemePreview({ theme }: { theme: ThemeId }) {
+  return (
+    <span className="theme-preview" data-theme={theme} aria-hidden="true">
+      <span className="theme-preview-bar" />
+      <span className="theme-preview-side">
+        {[70, 52, 62].map((w, i) => (
+          <span key={i} className="theme-preview-line">
+            <span style={{ width: `${w}%` }} />
+          </span>
+        ))}
+      </span>
+      <span className="theme-preview-main">
+        {PREVIEW_LINES.map((line, i) => (
+          <span key={i} className="theme-preview-line">
+            {line.map(([kind, w], j) => (
+              <span key={j} className={kind} style={{ width: w }} />
+            ))}
+          </span>
+        ))}
+      </span>
+    </span>
+  )
+}
+
+/** Three lines of SQL in a set of code colours: a palette's own, or a theme's when `theme` is given instead. */
+function SyntaxPreview({ syntax, theme }: { syntax?: SyntaxId; theme?: ThemeId }) {
+  return (
+    <span className="syntax-preview" data-syntax={syntax} data-theme={theme} aria-hidden="true">
+      <span>
+        <span className="kw">SELECT</span> name <span className="kw">FROM</span> users
+      </span>
+      <span>
+        <span className="kw">WHERE</span> city = <span className="str">'Oslo'</span>
+      </span>
+      <span>
+        {'  '}
+        <span className="kw">AND</span> age &gt; <span className="num">42</span> <span className="cmt">-- ok</span>
+      </span>
+    </span>
+  )
+}
+
 function ModelControls({ status, onInstall, onCancel, onRemove }: { status: SemanticModelStatus; onInstall: () => void; onCancel: () => void; onRemove: () => void }) {
   const m = status.model
   const bytes = (n: number) => formatBytes(n).replace(' ', '\u00a0')
@@ -116,6 +167,7 @@ export function SettingsDialog() {
   const toast = useStore((s) => s.toast)
   const ui = useStore((s) => s.ui)
   const setUiPref = useStore((s) => s.setUiPref)
+  const themeSyntax = THEMES.find((t) => t.id === ui.theme)?.syntax
 
   const [draft, setDraft] = useState<Draft>({ type: 'byok', provider: 'openai', baseUrl: PROVIDERS.openai.baseUrl, model: PROVIDERS.openai.defaultModel, embeddingModel: '' })
   const [key, setKey] = useState('')
@@ -365,6 +417,91 @@ export function SettingsDialog() {
                 </button>
               </div>
               <span className="hint">Open connections are listed as tabs across the top of the window, or as a rail down its left edge.</span>
+            </div>
+            <div className="field">
+              <label>Theme</label>
+              <div className="choice-tiles" data-testid="theme-choices">
+                {THEMES.map((t) => (
+                  <button
+                    key={t.id}
+                    type="button"
+                    className={`choice-tile ${ui.theme === t.id ? 'active' : ''}`}
+                    onClick={() => setUiPref({ theme: t.id })}
+                    aria-pressed={ui.theme === t.id}
+                    data-testid={`theme-${t.id}`}
+                  >
+                    <ThemePreview theme={t.id} />
+                    <span className="choice-tile-label">{t.label}</span>
+                  </button>
+                ))}
+              </div>
+              <span className="hint">Colours for the window, the editor and the code.</span>
+            </div>
+
+            <h2 className="section-gap">
+              <Icon name="code" /> Code
+            </h2>
+            <div className="field">
+              <label>Syntax colours</label>
+              <div className="choice-tiles" data-testid="syntax-choices">
+                <button
+                  type="button"
+                  className={`choice-tile ${ui.syntax === null ? 'active' : ''}`}
+                  onClick={() => setUiPref({ syntax: null })}
+                  aria-pressed={ui.syntax === null}
+                  data-testid="syntax-theme"
+                >
+                  <SyntaxPreview theme={ui.theme} />
+                  <span className="choice-tile-label">
+                    Theme default <span className="choice-tile-note">{SYNTAX_PALETTES.find((p) => p.id === themeSyntax)?.label}</span>
+                  </span>
+                </button>
+                {SYNTAX_PALETTES.map((p) => (
+                  <button
+                    key={p.id}
+                    type="button"
+                    className={`choice-tile ${ui.syntax === p.id ? 'active' : ''}`}
+                    onClick={() => setUiPref({ syntax: p.id })}
+                    aria-pressed={ui.syntax === p.id}
+                    data-testid={`syntax-${p.id}`}
+                  >
+                    <SyntaxPreview syntax={p.id} />
+                    <span className="choice-tile-label">{p.label}</span>
+                  </button>
+                ))}
+              </div>
+              <span className="hint">Keywords, strings, numbers and comments, wherever SQL is shown. Theme default changes along with the theme.</span>
+            </div>
+            <div className="field">
+              <label>Font</label>
+              <div className="choice-tiles" data-testid="font-choices">
+                <button
+                  type="button"
+                  className={`choice-tile ${ui.codeFont === null ? 'active' : ''}`}
+                  onClick={() => setUiPref({ codeFont: null })}
+                  aria-pressed={ui.codeFont === null}
+                  data-testid="font-theme"
+                >
+                  <span className="font-sample">WHERE id &gt;= 10</span>
+                  <span className="choice-tile-label">Theme default</span>
+                </button>
+                {CODE_FONTS.map((f) => (
+                  <button
+                    key={f.id}
+                    type="button"
+                    className={`choice-tile ${ui.codeFont === f.id ? 'active' : ''}`}
+                    onClick={() => setUiPref({ codeFont: f.id })}
+                    aria-pressed={ui.codeFont === f.id}
+                    data-testid={`font-${f.id}`}
+                  >
+                    <span className="font-sample" style={{ fontFamily: f.family }}>
+                      WHERE id &gt;= 10
+                    </span>
+                    <span className="choice-tile-label">{f.label}</span>
+                  </button>
+                ))}
+              </div>
+              <span className="hint">For the SQL pane only; the chat and the rest of the window keep theirs.</span>
             </div>
           </section>
         ) : tab === 'editor' ? (

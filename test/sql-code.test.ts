@@ -15,10 +15,9 @@ describe('highlighted SQL', () => {
     expect(cls("'a@b.io'")).not.toBe(cls('SELECT'))
     expect(cls('42')).toBeTruthy()
     expect(cls('-- adults')).toBeTruthy()
-    // Table and column names have a colour of their own too, as in the editor.
-    expect(cls('users')).toBeTruthy()
-    expect(cls('users')).toBe(cls('email'))
-    expect(cls('users')).not.toBe(cls('SELECT'))
+    // Table and column names stay in the text colour.
+    expect(cls('users')).toBeFalsy()
+    expect(cls('email')).toBeFalsy()
   })
 
   it('follows the dialect', () => {

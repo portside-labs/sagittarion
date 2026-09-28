@@ -66,3 +66,6 @@ public issue.
 
 Sagittarion is open-source software licensed under the
 [MIT license](LICENSE).
+
+The SQL editor's optional fonts, JetBrains Mono, Fira Code, IBM Plex Mono and
+Source Code Pro, are bundled under the SIL Open Font License 1.1.

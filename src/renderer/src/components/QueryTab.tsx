@@ -3,6 +3,7 @@ import type { QueryTabSnapshot, RowsResult, StatementResult } from '@shared/type
 import { tableKey } from '@shared/connections'
 import type { TableRef } from '@shared/types'
 import type { CompletionData, TableEntry } from '@/lib/sql-complete'
+import { codeFontFamily } from '@/lib/theme'
 import { AskPanel, emptyChat, type ChatMessage, type ChatState } from './AskPanel'
 import { PaneHeader, PaneLayout, type DragHandleProps } from './PaneLayout'
 import { defaultLayout, moveLeaf, setRatio, type PaneId } from '@/lib/layout'
@@ -221,6 +222,7 @@ export function QueryTab({ tab, active }: { tab: Extract<Tab, { kind: 'query' }>
               onRunAll={() => void run(undefined, true)}
               completion={completion}
               prefs={{ keywordCase: ui.keywordCase, autocomplete: ui.autocomplete, autoAlias: ui.autoAlias, acceptKeys: ui.acceptKeys }}
+              fontFamily={codeFontFamily(ui.codeFont)}
               dialect={session.kind}
               placeholder="SELECT * FROM …"
             />
@@ -285,7 +287,7 @@ export function QueryTab({ tab, active }: { tab: Extract<Tab, { kind: 'query' }>
           </button>
         ) : (
           <button
-            className="btn small primary"
+            className="btn small"
             onClick={() => void run()}
             title={`Run the statement block at the cursor (${modKey}↩). A selection runs on its own; ${modKey}⇧↩ runs everything.`}
             data-testid="run-button"
