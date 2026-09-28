@@ -1,7 +1,7 @@
 {
   "name": "sagittarion",
   "productName": "Sagittarion",
-  "version": "0.8.0",
+  "version": "0.9.0",
   "description": "AI-native database GUI for SQLite and PostgreSQL that protects PII",
   "main": "./out/main/index.js",
   "author": {
