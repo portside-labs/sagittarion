@@ -2,7 +2,7 @@
   "name": "sagittarion",
   "productName": "Sagittarion",
   "version": "0.8.0",
-  "description": "Desktop client for SQLite and PostgreSQL, local or over SSH",
+  "description": "AI-native database GUI for SQLite and PostgreSQL that protects PII",
   "main": "./out/main/index.js",
   "author": {
     "name": "Portside Labs LLC",

@@ -10,27 +10,28 @@
 
 ## About Sagittarion
 
-Sagittarion is a free, open-source desktop client for SQLite and PostgreSQL.
-Browse, edit and query your data, or ask for it in plain English.
+Sagittarion is a free, open-source, AI-native database GUI for SQLite and
+PostgreSQL that protects PII. Ask your database questions in plain English;
+sensitive values are masked on your machine before they reach the model.
 
-- **SQLite, local or over SSH.** Remote files are opened in place, with
-  nothing installed on the server.
-- **PostgreSQL, direct or through an SSH tunnel.** The sidebar stays quick
-  even with a hundred thousand tables.
-- **Staged edits.** Review your changes, then apply them together in a single
-  transaction.
-- **A statement-aware SQL editor.** It runs the statement under the cursor and
-  suggests what fits where you're typing.
 - **Ask in plain English.** Bring your own OpenAI, Anthropic, Gemini,
   OpenRouter or Groq key, or run a model locally with Ollama or LM Studio.
   Generated SQL is read-only and checked with `EXPLAIN` before it runs.
 - **[Local AI Privacy](docs/LOCAL_AI_PRIVACY.md).** Names, emails, card
-  numbers and other sensitive values are swapped for placeholders before a
-  request leaves your computer.
+  numbers and other sensitive values become placeholders before a request
+  leaves your computer, and are restored in the answer. You can inspect
+  exactly what was sent.
+- **Scales to huge schemas.** The model is sent only the tables a question
+  needs, and the sidebar stays quick with a hundred thousand tables.
+- **Staged edits.** Review your changes, then apply them together in a single
+  transaction.
+- **A statement-aware SQL editor.** It runs the statement under the cursor and
+  suggests what fits where you're typing.
 - **Several connections at once.** Group and colour-code them; every tab comes
   back as you left it.
 
-No account, no telemetry.
+Works with local and remote databases, over SSH when needed. No account, no
+telemetry.
 
 ## Download
 
