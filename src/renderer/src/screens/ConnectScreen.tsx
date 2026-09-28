@@ -413,9 +413,11 @@ export function ConnectScreen() {
   }
 
   async function saveOnly(): Promise<ConnectionConfig> {
-    const source = await saveDraftProfile(normalised())
+    const typed = normalised()
+    const source = await saveDraftProfile(typed)
     const saved = await window.api.connections.save(source)
-    const merged = withSecrets(saved, source)
+    // What was typed stays with the form, as a new profile may not have been able to keep it (no keyring on Linux).
+    const merged = withSecrets(saved, typed)
     setForm(merged)
     setSelectedId(saved.id)
     setDirty(false)

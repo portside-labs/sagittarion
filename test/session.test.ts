@@ -332,6 +332,9 @@ describe('SSH profiles', () => {
     const resolved = resolveSshProfile(cfg, [saved])
     expect(resolved.ssh.host).toBe(server.host)
     expect(resolved.ssh.password).toBe(server.password)
+    // A saved secret wins over one sent with the connection; one the profile lacks comes from the connection.
+    expect(resolveSshProfile({ ...cfg, ssh: { ...cfg.ssh, password: 'typed' } }, [saved]).ssh.password).toBe(server.password)
+    expect(resolveSshProfile({ ...cfg, ssh: { ...cfg.ssh, password: 'typed' } }, [{ ...saved, password: undefined }]).ssh.password).toBe('typed')
     expect(describeTarget(resolved)).toBe(`test@127.0.0.1:${server.port}`)
     // Secrets are dropped when the codec cannot store them.
     const plain = new SshProfileStore(path.join(tmp, 'profiles2.json'), noopCodec)
@@ -375,6 +378,18 @@ describe('ConnectionManager', () => {
     expect(conn.ssh).not.toBeNull()
     await manager.close(conn.id)
     await expect(manager.open({ id: 'r2', name: 'Gone', kind: 'sqlite', remote: true, sshProfileId: 'missing', ssh: { host: '', port: 22, username: '', auth: 'key' }, remotePath: db })).rejects.toThrow(/no longer exists/)
+  })
+
+  it('connects with a password typed this session when the profile could not keep it', async () => {
+    // As on Linux without a keyring: the profile is saved, its password is not.
+    const db = freshDb('unsaved-password.db')
+    const { password, ...withoutPassword } = baseConfig()
+    const profile = { id: 'p1', name: 'Mock box', ...withoutPassword }
+    const manager = new ConnectionManager({ agentSource, verifyHostKey: async () => true, resolveSshProfile: async () => profile })
+    const typed = { ...withoutPassword, host: '', username: '', password }
+    const conn = await manager.open({ id: 'r3', name: 'Via profile', kind: 'sqlite', remote: true, sshProfileId: 'p1', ssh: typed, remotePath: db })
+    expect(manager.info(conn).target).toBe(`test@127.0.0.1:${server.port}`)
+    await manager.close(conn.id)
   })
 
   it('opens a SQLite connection end to end and reports it', async () => {

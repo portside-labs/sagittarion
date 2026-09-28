@@ -68,7 +68,8 @@ export function resolveSshProfile(cfg: ConnectionConfig, profiles: SshProfile[])
   const p = profiles.find((x) => x.id === cfg.sshProfileId)
   if (!p) return cfg
   const { id: _id, name: _name, createdAt: _c, lastUsedAt: _l, ...ssh } = p
-  return { ...cfg, ssh }
+  // A secret the profile could not keep (no keyring to save it in) may still come with the connection, typed this session.
+  return { ...cfg, ssh: { ...ssh, password: ssh.password || cfg.ssh?.password, passphrase: ssh.passphrase || cfg.ssh?.passphrase } }
 }
 
 /** Parse a libpq-style URL such as postgres://user:pass@host:5432/db?sslmode=require. */

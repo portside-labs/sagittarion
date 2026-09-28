@@ -64,7 +64,8 @@ async function main() {
 
   const launchOptions = {
     args: [path.join(root, 'out', 'main', 'index.js')],
-    env: { ...process.env, SAGITTARION_USER_DATA: userData, NODE_ENV: 'production' }
+    // On Linux without a keyring (CI) saved passwords would otherwise be dropped, which a desktop keyring prevents.
+    env: { ...process.env, SAGITTARION_USER_DATA: userData, NODE_ENV: 'production', SAGITTARION_TEST_PLAINTEXT_SECRETS: '1' }
   }
   let app = await electron.launch(launchOptions)
   const consoleErrors = []

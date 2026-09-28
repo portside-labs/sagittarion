@@ -593,6 +593,9 @@ if (!app.requestSingleInstanceLock()) {
 
   app.whenReady().then(() => {
     const userData = app.getPath('userData')
+    // Tests on Linux without a keyring (CI): keep secrets under Chromium's fixed key, as a desktop's keyring would keep
+    // them, so saved passwords last across restarts. Nothing changes elsewhere, or without the variable.
+    if (process.platform === 'linux' && process.env['SAGITTARION_TEST_PLAINTEXT_SECRETS']) safeStorage.setUsePlainTextEncryption(true)
     const codec = makeCodec()
     connectionStore = new ConnectionStore(path.join(userData, 'connections.json'), codec)
     credentialStore = new CredentialStore(path.join(userData, 'credentials.json'), codec)
