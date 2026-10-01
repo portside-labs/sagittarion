@@ -58,7 +58,8 @@ export class AnthropicProvider implements LlmProvider {
     if (!this.model) throw new ProviderError('No model is configured. Pick one in Settings.', 'bad_request')
     const body: Record<string, unknown> = {
       model: this.model,
-      max_tokens: req.maxTokens ?? 2048,
+      // Room for a long answer in words, such as one drawn from a connector's documentation.
+      max_tokens: req.maxTokens ?? 8192,
       system: req.system.map((b) => ({ type: 'text', text: b.text, ...(b.cacheable ? { cache_control: { type: 'ephemeral' } } : {}) })),
       messages: mapMessages(req)
     }

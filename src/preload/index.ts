@@ -2,6 +2,7 @@ import { contextBridge, ipcRenderer, type IpcRendererEvent } from 'electron'
 import type { Api, ConnectProgressEvent, SessionLinkEvent } from '@shared/api'
 import type { AiProgressEvent } from '@shared/ai'
 import type { SemanticModelStatus } from '@shared/privacy'
+import type { ConnectorInfo, ToolApprovalRequest } from '@shared/connectors'
 
 function subscribe<T>(channel: string, cb: (payload: T) => void): () => void {
   const handler = (_event: IpcRendererEvent, payload: T) => cb(payload)
@@ -69,11 +70,29 @@ const api: Api = {
     listModels: (input) => ipcRenderer.invoke('settings:listModels', input ?? null)
   },
   ai: {
-    ask: (sessionId, question, history, requestId, conversationId) => ipcRenderer.invoke('ai:ask', sessionId, question, history ?? [], requestId ?? '', conversationId ?? ''),
+    ask: (sessionId, question, history, requestId, conversationId, opts) => ipcRenderer.invoke('ai:ask', sessionId, question, history ?? [], requestId ?? '', conversationId ?? '', opts ?? {}),
     cancel: (requestId) => ipcRenderer.invoke('ai:cancel', requestId),
     forget: (conversationId, opts) => ipcRenderer.invoke('ai:forget', conversationId, opts ?? {}),
     transcript: (requestId, opts) => ipcRenderer.invoke('ai:transcript', requestId, opts ?? {}),
-    onProgress: (cb) => subscribe<AiProgressEvent>('ai:progress', cb)
+    onProgress: (cb) => subscribe<AiProgressEvent>('ai:progress', cb),
+    approve: (approvalId, decision) => ipcRenderer.invoke('ai:approve', approvalId, decision),
+    onApproval: (cb) => subscribe<ToolApprovalRequest>('ai:approval', cb)
+  },
+  instructions: {
+    list: () => ipcRenderer.invoke('instructions:list'),
+    save: (input) => ipcRenderer.invoke('instructions:save', input),
+    setEnabled: (id, enabled) => ipcRenderer.invoke('instructions:setEnabled', id, enabled),
+    remove: (id) => ipcRenderer.invoke('instructions:remove', id)
+  },
+  connectors: {
+    list: () => ipcRenderer.invoke('connectors:list'),
+    save: (input) => ipcRenderer.invoke('connectors:save', input),
+    start: (id) => ipcRenderer.invoke('connectors:start', id),
+    refresh: (id) => ipcRenderer.invoke('connectors:refresh', id),
+    setEnabled: (id, enabled) => ipcRenderer.invoke('connectors:setEnabled', id, enabled),
+    setToolPermission: (id, tool, permission) => ipcRenderer.invoke('connectors:setToolPermission', id, tool, permission),
+    remove: (id) => ipcRenderer.invoke('connectors:remove', id),
+    onStatus: (cb) => subscribe<ConnectorInfo>('connectors:status', cb)
   },
   privacyModel: {
     status: () => ipcRenderer.invoke('privacy:model-status'),

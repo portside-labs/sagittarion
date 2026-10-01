@@ -22,7 +22,9 @@ import type {
   TableRef,
   WorkspaceState
 } from './types'
-import type { AiConnectionInput, AiProgressEvent, AiResult, AiSettings, AiSettingsUpdate, AiTurn } from './ai'
+import type { AiConnectionInput, AiProgressEvent, AiResult, AiSettings, AiSettingsUpdate, AiTurn, AskOptions } from './ai'
+import type { ConnectorInfo, ConnectorInput, ToolApprovalDecision, ToolApprovalRequest, ToolPermission } from './connectors'
+import type { Instruction, InstructionInput } from './instructions'
 import type { AiTranscript, SemanticModelStatus } from './privacy'
 
 export interface OpenOptions {
@@ -129,7 +131,7 @@ export interface Api {
      * Turn a plain-English question into a verified read-only query for the open database. `conversationId` scopes
      * Local AI Privacy's placeholders to one chat, so the same person keeps the same placeholder in follow-ups.
      */
-    ask(sessionId: string, question: string, history?: AiTurn[], requestId?: string, conversationId?: string): Promise<AiResult>
+    ask(sessionId: string, question: string, history?: AiTurn[], requestId?: string, conversationId?: string, opts?: AskOptions): Promise<AiResult>
     /** Stop a running ask; the pending call resolves with kind "cancelled". */
     cancel(requestId: string): Promise<void>
     /** Drop a chat's placeholders from memory; with `transcripts`, what its answers sent too (the chat was reset). */
@@ -142,6 +144,32 @@ export interface Api {
     transcript(requestId: string, opts?: { values?: boolean }): Promise<AiTranscript | null>
     /** Step-by-step progress of running asks, keyed by requestId. */
     onProgress(cb: (e: AiProgressEvent) => void): Unsubscribe
+    /** Answers a connector tool call waiting for approval. */
+    approve(approvalId: string, decision: ToolApprovalDecision): Promise<void>
+    /** Connector tool calls that need the user's approval before they run. */
+    onApproval(cb: (req: ToolApprovalRequest) => void): Unsubscribe
+  }
+  /** What the user tells the model about their data: for every database connection, or for chosen ones. */
+  instructions: {
+    list(): Promise<Instruction[]>
+    save(input: InstructionInput): Promise<Instruction>
+    setEnabled(id: string, enabled: boolean): Promise<Instruction>
+    remove(id: string): Promise<void>
+  }
+  /** MCP servers whose tools the chat can use, like Claude Desktop's connectors. */
+  connectors: {
+    list(): Promise<ConnectorInfo[]>
+    /** Creates or updates one; a secret whose value is null keeps the one saved. Starts it to read its tools. */
+    save(input: ConnectorInput): Promise<ConnectorInfo>
+    /** Starts it if it is not running, so its tools can be shown. */
+    start(id: string): Promise<void>
+    /** Starts it afresh and reads its tools again. */
+    refresh(id: string): Promise<ConnectorInfo>
+    setEnabled(id: string, enabled: boolean): Promise<ConnectorInfo>
+    setToolPermission(id: string, tool: string, permission: ToolPermission): Promise<ConnectorInfo>
+    remove(id: string): Promise<void>
+    /** A connector started, stopped, failed, or listed new tools. */
+    onStatus(cb: (info: ConnectorInfo) => void): Unsubscribe
   }
   /** The on-device model behind semantic detection: whether it can run here, its download, its removal. */
   privacyModel: {

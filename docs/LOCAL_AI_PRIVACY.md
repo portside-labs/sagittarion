@@ -31,11 +31,13 @@ question and the chat history over IPC and gets an `AiResult` back.
 | --- | --- | --- |
 | Rules block: dialect, server version, today's date, default schema | `systemRules` in `ai/prompt.ts` | no |
 | Schema block: table and column names, types, keys, row estimates, **table comments**, **sample values** (when *Send sample column values* is on) | `SchemaIndex.render` in `ai/schema-index.ts` | yes: samples, comments |
+| The user's instructions (Settings → Instructions): the global ones and the connection's own | `instructionsPrompt` in `ai/prompt.ts` | typed by the user; may name people or values |
 | The question, and earlier questions of the chat | renderer → `ai:ask` | typed by the user; often names, emails, ids |
 | Earlier SQL and clarifications of the chat | renderer → `ai:ask` (`AiTurn`) | literals in `WHERE` clauses |
 | `search_schema` / `describe_table` results | `SchemaIndex.search` / `describe` | yes: samples, comments |
 | `sample_values` results | `distinctValuesFor` in `main/index.ts` | yes: up to 20 distinct values |
 | Repair feedback: EXPLAIN errors | `runQuery` in `nl2sql.ts` | yes: errors echo literals, e.g. `invalid input syntax for type integer: "Jack"` |
+| Connector tool results (MCP servers the user connected) | `connectorsForAsk` in `connectors/ask.ts` | yes: whatever the connector returns |
 | Embedding requests: table descriptions and the question | `queryVector` in `nl2sql.ts` | comments, the question |
 | Connection test ping | `settings:testProvider` in `main/index.ts` | no (fixed text) |
 
@@ -88,6 +90,20 @@ Structural guarantees:
   `util.inspect` print its id and size only, and its maps are `#private`, so
   `structuredClone`, spreading or `Object.keys` cannot copy them out either. It
   is not part of any type that crosses IPC or reaches an adapter.
+
+### Connectors
+
+Connectors (MCP servers, `src/main/connectors/`) sit on the device side of the
+boundary, like the database. When the model calls a connector's tool, the
+placeholders in its arguments are restored first, so the connector gets the
+real email or name it needs; a tool that is not read-only shows those
+arguments in the chat and waits for approval. What the connector returns goes
+back to the model as an ordinary tool result: `protectRequest` scans it as
+prose with every other field, so personal data in a reply is replaced and
+counted before the next request leaves, and verification fails closed on it as
+on anything else. A connector is a system of its own: a remote one receives
+real values over its own connection, outside this boundary, which is why the
+approval card shows exactly what it would get.
 
 ## 3. Integration points
 

@@ -14,7 +14,8 @@ import { SshProfileStore } from './store/ssh-profiles'
 import { WorkspaceStore } from './store/workspace'
 import { qi, qualify } from './db/pg-values'
 import { cellToPlainText } from '@shared/export'
-import type { AiConnectionInput, AiProgressEvent, AiProgressStep, AiSettingsUpdate, AiTurn } from '@shared/ai'
+import type { AiConnectionInput, AiProgressEvent, AiProgressStep, AiSettingsUpdate, AiTurn, AskOptions } from '@shared/ai'
+import type { ToolApprovalDecision } from '@shared/connectors'
 import { PROVIDERS } from '@shared/ai'
 import { classifyEndpoint, privacyApplies, type PrivacySettings } from '@shared/privacy'
 import { createProvider, providerConfigFor } from './ai/providers/factory'
@@ -30,6 +31,14 @@ import { PrivacySession } from './privacy/session'
 import type { HostHandle } from './privacy/semantic/client'
 import type { HostReply } from './privacy/semantic/host'
 import { SemanticModel } from './privacy/semantic/manager'
+import { ConnectorStore, connectorInfo } from './connectors/store'
+import { InstructionStore } from './store/instructions'
+import { instructionsFor, type InstructionInput } from '@shared/instructions'
+import { ConnectorManager } from './connectors/manager'
+import { connectorsForAsk } from './connectors/ask'
+import { ApprovalBroker } from './connectors/approvals'
+import { registerConnectorIpc } from './connectors/ipc'
+import { connectorPath } from './connectors/shell-env'
 import { GLINER_PII_BASE } from './privacy/semantic/manifest'
 import { unsupportedReason } from './privacy/semantic/platform'
 import { ModelStore } from './privacy/semantic/store'
@@ -64,6 +73,13 @@ const conversations = new ConversationVaults()
 const transcripts = new TranscriptStore()
 /** The on-device model for semantic detection; its files live under userData/models. */
 let semanticModel: SemanticModel
+/** The user's instructions to the model (instructions.json). */
+let instructionStore: InstructionStore
+/** The user's MCP servers (connectors.json) and their running clients. */
+let connectorStore: ConnectorStore
+let connectorManager: ConnectorManager
+/** Connector tool calls waiting in the chat for the user's approval. */
+const approvals = new ApprovalBroker((req) => send('ai:approval', req))
 
 /** The model's own process: an Electron utility process running host.ts (Node and onnxruntime-node). */
 function spawnModelHost(): HostHandle {
@@ -189,6 +205,19 @@ function createWindow(): BrowserWindow {
   win.webContents.setWindowOpenHandler(({ url }) => {
     if (/^https?:/.test(url)) void shell.openExternal(url)
     return { action: 'deny' }
+  })
+  // A link followed inside the window would replace the app with the page: it opens in the browser instead.
+  win.webContents.on('will-navigate', (e, url) => {
+    const origin = (u: string) => {
+      try {
+        return new URL(u).origin
+      } catch {
+        return ''
+      }
+    }
+    if (origin(url) === origin(win.webContents.getURL())) return
+    e.preventDefault()
+    if (/^https?:/i.test(url)) void shell.openExternal(url)
   })
   if (process.env['ELECTRON_RENDERER_URL']) {
     void win.loadURL(process.env['ELECTRON_RENDERER_URL'])
@@ -351,7 +380,11 @@ function registerIpc(): void {
 
   ipcMain.handle('connections:list', () => connectionStore.list())
   ipcMain.handle('connections:save', (_e, cfg: ConnectionConfig) => connectionStore.save(cfg))
-  ipcMain.handle('connections:remove', (_e, id: string) => connectionStore.remove(id))
+  ipcMain.handle('connections:remove', async (_e, id: string) => {
+    await connectionStore.remove(id)
+    await connectorStore.forgetConnection(id)
+    await instructionStore.forgetConnection(id)
+  })
   ipcMain.handle('connections:setGroup', (_e, ids: string[], group: string | null) => connectionStore.setGroup(ids, group))
   ipcMain.handle('connections:duplicate', (_e, id: string) => connectionStore.duplicate(id))
   ipcMain.handle('connections:groupStyles', () => connectionStore.groupStyles())
@@ -461,7 +494,7 @@ function registerIpc(): void {
     return provider.listModels()
   })
 
-  ipcMain.handle('ai:ask', async (_e, sessionId: string, question: string, history: AiTurn[], requestId: string, conversationId?: string) => {
+  ipcMain.handle('ai:ask', async (_e, sessionId: string, question: string, history: AiTurn[], requestId: string, conversationId?: string, opts?: AskOptions) => {
     const conn = manager.get(sessionId)
     const kind = conn.config.kind
     const controller = new AbortController()
@@ -498,6 +531,18 @@ function registerIpc(): void {
           throw err
         }
       }
+      // The connectors on for this chat start now; one that cannot start is left out, and the steps say why.
+      const connectors = await connectorsForAsk({
+        store: connectorStore,
+        manager: connectorManager,
+        connectionId: conn.config.id || undefined,
+        overrides: opts?.connectors && typeof opts.connectors === 'object' ? opts.connectors : undefined,
+        approve: (c, tool, args, signal) => approvals.request(id, c, tool, args, signal),
+        onChange: (c) => send('connectors:status', connectorInfo(c, connectorManager.status(c))),
+        onProgress,
+        signal: controller.signal
+      })
+      const instructions = instructionsFor(await instructionStore.list(), conn.config.id || undefined)
       const result = await askDatabase(
         {
           kind,
@@ -509,6 +554,8 @@ function registerIpc(): void {
           runQuery: (sql, maxRows) => manager.read(sessionId, (d) => d.query(sql, [], maxRows, { readOnly: true })),
           distinctValues: (ref, column) => manager.read(sessionId, (d) => distinctValuesFor(d, kind, ref, column)),
           embeddingCache,
+          connectors,
+          instructions: instructions.map((i) => ({ name: i.name, text: i.text })),
           recentTables: recentTables.get(sessionId),
           onProgress,
           signal: controller.signal
@@ -549,6 +596,12 @@ function registerIpc(): void {
   ipcMain.handle('ai:cancel', (_e, requestId: string) => {
     aiRequests.get(requestId)?.abort()
   })
+  ipcMain.handle('ai:approve', (_e, approvalId: string, decision: ToolApprovalDecision) => approvals.answer(approvalId, decision))
+
+  ipcMain.handle('instructions:list', () => instructionStore.list())
+  ipcMain.handle('instructions:save', (_e, input: InstructionInput) => instructionStore.save(input))
+  ipcMain.handle('instructions:setEnabled', (_e, id: string, enabled: boolean) => instructionStore.setEnabled(id, enabled === true))
+  ipcMain.handle('instructions:remove', (_e, id: string) => instructionStore.remove(id))
   ipcMain.handle('ai:forget', (_e, conversationId: string, opts?: { transcripts?: boolean }) => {
     if (typeof conversationId !== 'string' || !conversationId) return
     conversations.forget(conversationId)
@@ -601,6 +654,9 @@ if (!app.requestSingleInstanceLock()) {
     credentialStore = new CredentialStore(path.join(userData, 'credentials.json'), codec)
     settingsStore = new SettingsStore(path.join(userData, 'settings.json'), credentialStore)
     sshProfileStore = new SshProfileStore(path.join(userData, 'ssh-profiles.json'), codec)
+    connectorStore = new ConnectorStore(path.join(userData, 'connectors.json'), codec)
+    instructionStore = new InstructionStore(path.join(userData, 'instructions.json'))
+    connectorManager = new ConnectorManager({ clientInfo: { name: 'Sagittarion', version: app.getVersion() }, path: () => connectorPath() })
     workspaceStore = new WorkspaceStore(path.join(userData, 'workspace.json'))
     embeddingCache = new EmbeddingCache(path.join(userData, 'ai-cache', 'embeddings.json'))
     semanticModel = new SemanticModel({
@@ -614,6 +670,7 @@ if (!app.requestSingleInstanceLock()) {
     manager = new ConnectionManager({ agentSource, verifyHostKey, resolveSshProfile: (id) => sshProfileStore.get(id) })
     manager.on('link', (e: SessionLinkEvent) => send('session:link', e))
     registerIpc()
+    registerConnectorIpc(connectorStore, connectorManager, send)
     buildMenu()
     mainWindow = createWindow()
 
@@ -629,5 +686,6 @@ if (!app.requestSingleInstanceLock()) {
   app.on('before-quit', () => {
     void manager?.closeAll()
     semanticModel?.dispose()
+    void connectorManager?.dispose()
   })
 }

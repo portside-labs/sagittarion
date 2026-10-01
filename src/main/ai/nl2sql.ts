@@ -7,8 +7,8 @@ import type { DatabaseKind, QueryResponse, TableRef } from '@shared/types'
 import type { AiClarification, AiProgressStep, AiQueryResult, AiResult, AiTurn, AiUsage } from '@shared/ai'
 import { describeCounts, type SealedText, type SealedTurn, type SensitiveEntityType } from '@shared/privacy'
 import { checkReadOnlySql, explainStatement } from './guard'
-import { isoDate, systemRules, TOOLS } from './prompt'
-import { parseJsonObject, ProviderError, throwIfAborted, type ChatMessage, type ChatRequest, type ChatResponse, type ToolCall } from './providers/types'
+import { instructionsPrompt, isoDate, systemRules, TOOLS } from './prompt'
+import { parseJsonObject, ProviderError, throwIfAborted, type ChatMessage, type ChatRequest, type ChatResponse, type ToolCall, type ToolDef } from './providers/types'
 import { estimateTokens, shortComment, tokenize, type RenderView, type SchemaIndex } from './schema-index'
 import type { EmbeddingCache } from './embeddings'
 import type { ModelGateway } from '../privacy/gateway'
@@ -17,6 +17,18 @@ import type { SchemaTableData } from '../privacy/session'
 import type { Restored } from '../privacy/restore'
 import { PrivacyBlockedError } from '../privacy/errors'
 import { safeSlice } from '../privacy/markers'
+
+/**
+ * Tools from the user's connectors (MCP servers), named as the model sees them. A connector sits on this side of Local
+ * AI Privacy, like the database: it gets real values, and what it returns is protected before the model sees it.
+ */
+export interface AgentConnectors {
+  tools: ToolDef[]
+  /** "GitHub: Create issue", for the steps shown; undefined for a name that is not a connector's tool. */
+  label(name: string): string | undefined
+  /** Runs a tool, asking the user first where its permission says so. The arguments hold real values. */
+  call(name: string, args: Record<string, unknown>, signal?: AbortSignal): Promise<{ content: string; isError?: boolean; declined?: boolean }>
+}
 
 export interface AskDeps {
   kind: DatabaseKind
@@ -30,6 +42,10 @@ export interface AskDeps {
   /** Distinct values of a column, or null when there are too many to be useful. */
   distinctValues: (ref: TableRef, column: string) => Promise<string[] | null>
   embeddingCache?: EmbeddingCache
+  /** Tools from the connectors on for this chat, if any. */
+  connectors?: AgentConnectors
+  /** The user's instructions for this database: the global ones, then its own. Sent to the model, never shown. */
+  instructions?: { name: string; text: string }[]
   now?: Date
   recentTables?: string[]
   maxToolSteps?: number
@@ -41,6 +57,8 @@ export interface AskDeps {
 }
 
 const MAX_SAMPLE_COLUMNS = 24
+/** The longest answer in words kept: a connector's documentation can make a long one, but not a runaway. */
+const MAX_PROSE_CHARS = 40_000
 const SAMPLE_LIMIT = 20
 
 interface Proposal {
@@ -218,6 +236,12 @@ async function run(deps: AskDeps, question: string, history: AiTurn[], usage: Ai
   // tables are described, so it is refreshed before each protection.
   privacy?.useSchema(index.identifiers())
 
+  // The user's instructions go to the model with every request; the steps say which are followed, not what they say.
+  const instructions = (deps.instructions ?? []).filter((i) => i.text.trim())
+  if (instructions.length) {
+    progress.note('instructions', instructions.length === 1 ? 'Following 1 instruction' : `Following ${instructions.length} instructions`, instructions.map((i) => i.name).join(', '))
+  }
+
   // Schema context: everything when it fits, otherwise retrieve.
   const retrieving = progress.start('retrieve', 'Choosing tables for the question')
   const vector = index.totalTokens > deps.settings.schemaBudgetTokens ? await queryVector(deps, question) : null
@@ -256,7 +280,8 @@ async function run(deps: AskDeps, question: string, history: AiTurn[], usage: Ai
   }
   messages.push({ role: 'user', content: (await provider.seal(question))?.text ?? question })
 
-  const maxSteps = deps.maxToolSteps ?? 6
+  // Connectors take steps of their own: looking something up elsewhere comes before the schema work.
+  const maxSteps = deps.maxToolSteps ?? (deps.connectors?.tools.length ? 10 : 6)
   const maxRepairs = deps.maxRepairs ?? 2
   let repairs = 0
   let explained = false
@@ -287,11 +312,13 @@ async function run(deps: AskDeps, question: string, history: AiTurn[], usage: Ai
     throwIfAborted(deps.signal)
     const req: ChatRequest = {
       system: [
-        { text: systemRules(deps.kind, deps.serverVersion, today, index.defaultSchema, toolsEnabled), structured: true },
+        { text: systemRules(deps.kind, deps.serverVersion, today, index.defaultSchema, toolsEnabled, Boolean(toolsEnabled && deps.connectors?.tools.length)), structured: true },
+        // Prose the user wrote, so protected as prose; before the schema, so its cache breakpoint covers both.
+        ...(instructions.length ? [{ text: instructionsPrompt(instructions) }] : []),
         { text: header + schemaText, cacheable: true, structured: true }
       ],
       messages,
-      tools: toolsEnabled ? TOOLS : undefined,
+      tools: toolsEnabled ? [...TOOLS, ...(deps.connectors?.tools ?? [])] : undefined,
       toolChoice: toolsEnabled ? ('auto' as const) : undefined
     }
     const outbound = await prepare(req)
@@ -331,11 +358,11 @@ async function run(deps: AskDeps, question: string, history: AiTurn[], usage: Ai
    * A reply that is not a query. `fromModel` is the model's own words, sealed for the history as it wrote them;
    * `local` is the app's message, which the history replays as shown and protects again.
    */
-  const clarify = async (fromModel: string, local?: string): Promise<AiClarification> => {
+  const clarify = async (fromModel: string, local?: string, cutShort = false): Promise<AiClarification> => {
     const restored = provider.restoreText(fromModel)
     const message = restored.text || (local ? shownText(local) : '')
     const sealed = await sealTurn(restored.text ? { answer: { text: fromModel, spans: restored.spans } } : {})
-    return { kind: 'clarify', message, usage, privacy: provider.report(sealed) }
+    return { kind: 'clarify', message, usage, privacy: provider.report(sealed), ...(cutShort ? { cutShort } : {}) }
   }
 
   const finish = async (p: Proposal, tokenizedSql: string, restored: Restored): Promise<AiQueryResult> => {
@@ -414,8 +441,36 @@ async function run(deps: AskDeps, question: string, history: AiTurn[], usage: Ai
         return { content: `Could not sample: ${e?.message ?? e}` }
       }
     }
+    const label = deps.connectors?.label(call.name)
+    if (deps.connectors && label) {
+      const step = progress.start('tool', `Model used ${label}`)
+      try {
+        // Placeholders become the values they stand for: the connector needs the real email, not a stand-in for it.
+        const res = await deps.connectors.call(call.name, restoreArgs(args), deps.signal)
+        if (res.declined) step.fail('you declined')
+        else if (res.isError) step.fail(safeSlice(res.content.trim().split('\n')[0] ?? 'failed', 160))
+        else step.done(`${formatTokens(estimateTokens(res.content))} tokens back`)
+        // Unstructured: what the connector returned is protected like any reply, before the next request leaves.
+        return { content: res.content || '(no content)' }
+      } catch (e: any) {
+        if (e instanceof PrivacyBlockedError || deps.signal?.aborted) throw e
+        step.fail(e?.message ?? String(e))
+        return { content: `The tool failed: ${e?.message ?? e}` }
+      }
+    }
     progress.note('tool', `Model called unknown tool ${call.name}`)
     return { content: `Unknown tool ${call.name}.` }
+  }
+
+  /** A tool call's arguments with placeholders turned back into their values, strings at any depth. */
+  const restoreArgs = (value: Record<string, unknown>): Record<string, unknown> => {
+    const walk = (v: unknown): unknown => {
+      if (typeof v === 'string') return shownText(v)
+      if (Array.isArray(v)) return v.map(walk)
+      if (v && typeof v === 'object') return Object.fromEntries(Object.entries(v).map(([k, x]) => [k, walk(x)]))
+      return v
+    }
+    return walk(value) as Record<string, unknown>
   }
 
   let lastText = ''
@@ -428,8 +483,9 @@ async function run(deps: AskDeps, question: string, history: AiTurn[], usage: Ai
       if (parsed && (typeof parsed.sql === 'string' || typeof parsed.needs_clarification === 'string')) {
         calls = [{ id: 'json', name: 'propose_query', args: parsed }]
       } else if (res.text.trim()) {
-        progress.note('done', 'Model answered in prose instead of a query')
-        return clarify(safeSlice(res.text.trim(), 800))
+        progress.note('done', 'Model answered in words, without a query')
+        // "max_tokens" (Anthropic) and "length" (OpenAI and the like): the reply stopped at the model's limit.
+        return clarify(safeSlice(res.text.trim(), MAX_PROSE_CHARS), undefined, /^(max_tokens|length)$/.test(res.stopReason))
       } else {
         progress.note('error', 'Model returned an empty answer')
         return clarify('', 'The model returned an empty answer. Try rephrasing the question.')
@@ -496,7 +552,7 @@ async function run(deps: AskDeps, question: string, history: AiTurn[], usage: Ai
     for (const call of calls) messages.push({ role: 'tool', toolCallId: call.id, name: call.name, ...(await runTool(call)) })
   }
   progress.note('error', 'Model kept exploring without proposing a query')
-  return clarify(safeSlice(lastText.trim(), 800), 'The model kept exploring the schema without proposing a query. Try naming the tables you mean.')
+  return clarify(safeSlice(lastText.trim(), MAX_PROSE_CHARS), 'The model kept exploring the schema without proposing a query. Try naming the tables you mean.')
 }
 
 export function questionTerms(question: string): string[] {

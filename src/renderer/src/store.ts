@@ -1,6 +1,8 @@
 import { create } from 'zustand'
 import type { AppInfo, ConnectionConfig, DatabaseKind, GroupStyle, SessionInfo, SshProfile, WorkspaceConnection, WorkspaceState } from '@shared/types'
 import type { AiSettings, ProviderId } from '@shared/ai'
+import type { ConnectorInfo } from '@shared/connectors'
+import type { Instruction } from '@shared/instructions'
 import { describeTarget, resolveSshProfile } from '@shared/connections'
 import { errorMessage } from './lib/util'
 import { defaultLayout, isValidLayout, type LayoutNode } from './lib/layout'
@@ -11,7 +13,7 @@ import { DEFAULT_THEME, isCodeFontId, isSyntaxId, isThemeId, type CodeFontId, ty
 
 export type { Tab, SearchState } from './session-store'
 
-export type SettingsTab = 'appearance' | 'editor' | 'ai'
+export type SettingsTab = 'appearance' | 'editor' | 'models' | 'connectors' | 'instructions'
 
 /** What the settings dialog should start on when opened for a reason. */
 export interface SettingsIntent {
@@ -108,6 +110,10 @@ interface State {
   toasts: Toast[]
   confirmRequest: ConfirmRequest | null
   settings: AiSettings | null
+  /** MCP servers whose tools the chat can use, with how each is doing; kept current by the main process. */
+  connectors: ConnectorInfo[]
+  /** What the user tells the model about their data, for every connection or chosen ones. */
+  instructions: Instruction[]
   settingsOpen: boolean
   settingsIntent: SettingsIntent | null
   /** Arrangement of the editor, chat and results panes in query tabs. */
@@ -119,6 +125,13 @@ interface State {
   setUiPref(patch: Partial<UiPrefs>): void
   init(): Promise<void>
   loadSettings(): Promise<void>
+  loadConnectors(): Promise<void>
+  /** A connector as it is now: added, changed, or in a new state. */
+  putConnector(info: ConnectorInfo): void
+  dropConnector(id: string): void
+  loadInstructions(): Promise<void>
+  putInstruction(instruction: Instruction): void
+  dropInstruction(id: string): void
   setSettingsOpen(open: boolean, intent?: SettingsIntent): void
   confirm(message: string, detail?: string, confirmLabel?: string, destructive?: boolean): Promise<boolean>
   resolveConfirm(ok: boolean): void
@@ -221,6 +234,8 @@ export const useStore = create<State>()((set, get) => {
     toasts: [],
     confirmRequest: null,
     settings: null,
+    connectors: [],
+    instructions: [],
     settingsOpen: false,
     settingsIntent: null,
     queryLayout: loadLayout(),
@@ -262,6 +277,40 @@ export const useStore = create<State>()((set, get) => {
       }
     },
 
+    async loadConnectors() {
+      try {
+        set({ connectors: await window.api.connectors.list() })
+      } catch (e) {
+        get().toast('error', 'Could not load connectors', errorMessage(e))
+      }
+    },
+
+    putConnector(info) {
+      const list = get().connectors
+      set({ connectors: list.some((c) => c.id === info.id) ? list.map((c) => (c.id === info.id ? info : c)) : [...list, info] })
+    },
+
+    dropConnector(id) {
+      set({ connectors: get().connectors.filter((c) => c.id !== id) })
+    },
+
+    async loadInstructions() {
+      try {
+        set({ instructions: await window.api.instructions.list() })
+      } catch (e) {
+        get().toast('error', 'Could not load instructions', errorMessage(e))
+      }
+    },
+
+    putInstruction(instruction) {
+      const list = get().instructions
+      set({ instructions: list.some((i) => i.id === instruction.id) ? list.map((i) => (i.id === instruction.id ? instruction : i)) : [...list, instruction] })
+    },
+
+    dropInstruction(id) {
+      set({ instructions: get().instructions.filter((i) => i.id !== id) })
+    },
+
     setSettingsOpen(open, intent) {
       set({ settingsOpen: open, settingsIntent: open ? (intent ?? null) : null })
     },
@@ -291,6 +340,9 @@ export const useStore = create<State>()((set, get) => {
       // Profiles and connections arrive together: a connection's profile is checked against the list on select.
       await Promise.all([get().loadSshProfiles(), get().loadConnections()])
       await get().loadSettings()
+      await get().loadConnectors()
+      await get().loadInstructions()
+      window.api.connectors.onStatus((info) => get().putConnector(info))
       // A connection whose link drops by itself stays open where it is; the next call that needs the database reconnects.
       window.api.session.onLink((e) => {
         const tab = get().tabs.find((t) => t.session?.sessionId === e.sessionId)

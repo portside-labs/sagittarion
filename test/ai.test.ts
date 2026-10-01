@@ -583,7 +583,7 @@ describe('Anthropic adapter', () => {
     expect(headers['x-api-key']).toBe('sk-ant')
     expect(headers['anthropic-version']).toBe('2023-06-01')
     const body = calls[0].json
-    expect(body.max_tokens).toBe(2048)
+    expect(body.max_tokens).toBe(8192)
     expect(body.system).toEqual([
       { type: 'text', text: 'rules' },
       { type: 'text', text: 'schema', cache_control: { type: 'ephemeral' } }

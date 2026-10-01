@@ -3,12 +3,15 @@ import { createPortal } from 'react-dom'
 import type { AiProgressEvent, AiResult, AiTurn, CatalogModel } from '@shared/ai'
 import { BYOK_PROVIDERS, LOCAL_PROVIDERS, MODEL_CATALOG, PROVIDERS, activeConnection, connectionReady, modelTitle, prettyModelName, vendorOf } from '@shared/ai'
 import { describeCounts, type AiPrivacyReport } from '@shared/privacy'
+import type { ToolApprovalDecision, ToolApprovalRequest } from '@shared/connectors'
 import { useStore } from '@/store'
 import { useSession } from '@/session-store'
 import { SqlCode } from './SqlCode'
 import { Icon } from './Icons'
 import { PaneHeader, type DragHandleProps } from './PaneLayout'
 import { ExchangeInspector } from './ExchangeInspector'
+import { ChatConnectorsButton, ToolApprovalCard } from './ChatConnectors'
+import { ChatMarkdown } from './ChatMarkdown'
 import { errorMessage } from '@/lib/util'
 
 type Step = AiProgressEvent & { endedAt?: number }
@@ -40,6 +43,8 @@ export interface ChatState {
   requestId: string | null
   /** Scopes Local AI Privacy's placeholders to this chat. New for every chat and after a relaunch; never saved. */
   conversationId: string
+  /** Connectors this chat switched on or off over their usual scope, by id. */
+  connectors?: Record<string, boolean>
 }
 
 export function emptyChat(): ChatState {
@@ -95,6 +100,10 @@ export function AskPanel({ sessionId, chat, setChat, handle, onSql, running, onC
   const setSettingsOpen = useStore((s) => s.setSettingsOpen)
   const setStatus = useSession((s) => s.setStatus)
   const dialect = useSession((s) => s.session?.kind) ?? 'sqlite'
+  /** The saved connection, which decides the connectors on by default. */
+  const connectionId = useSession((s) => s.session?.connectionId)
+  /** Connector tool calls waiting for the user, shown in the answer being worked on. */
+  const [approvals, setApprovals] = useState<ToolApprovalRequest[]>([])
   const toast = useStore((s) => s.toast)
 
   const listRef = useRef<HTMLDivElement>(null)
@@ -119,6 +128,22 @@ export function AskPanel({ sessionId, chat, setChat, handle, onSql, running, onC
   const providerReady = Boolean(settings && active && connectionReady(active) && settings.activeModel)
   const lastAssistant = [...messages].reverse().find((m): m is Extract<ChatMessage, { role: 'assistant' }> => m.role === 'assistant')
   const awaitingReply = lastAssistant?.status === 'done' && lastAssistant.result?.kind === 'clarify'
+
+  // Only this chat's: every query tab's chat hears every request.
+  const requestIdRef = useRef(chat.requestId)
+  requestIdRef.current = chat.requestId
+  useEffect(
+    () =>
+      window.api.ai.onApproval((req) => {
+        if (req.requestId === requestIdRef.current) setApprovals((list) => [...list, req])
+      }),
+    []
+  )
+
+  const answerApproval = (req: ToolApprovalRequest, decision: ToolApprovalDecision) => {
+    setApprovals((list) => list.filter((a) => a.approvalId !== req.approvalId))
+    void window.api.ai.approve(req.approvalId, decision)
+  }
 
   // Progress events for the ask in flight update the working message in place.
   useEffect(() => {
@@ -312,7 +337,7 @@ export function AskPanel({ sessionId, chat, setChat, handle, onSql, running, onC
     if (!question || asking) return
     if (!providerReady) {
       toast('info', 'Set up a language model first', 'Plain-English questions are answered by a provider of your choice with your own key. Open Settings to pick one.')
-      setSettingsOpen(true, { tab: 'ai' })
+      setSettingsOpen(true, { tab: 'models' })
       return
     }
     const requestId = crypto.randomUUID()
@@ -323,14 +348,16 @@ export function AskPanel({ sessionId, chat, setChat, handle, onSql, running, onC
       input: '',
       messages: [...c.messages, { id: crypto.randomUUID(), role: 'user', text: question, ts: Date.now() }, { id: assistantId, role: 'assistant', question, ts: Date.now(), status: 'working', steps: [], requestId }]
     }))
-    const finish = (patch: Partial<Extract<ChatMessage, { role: 'assistant' }>>) =>
+    const finish = (patch: Partial<Extract<ChatMessage, { role: 'assistant' }>>) => {
+      setApprovals((list) => list.filter((a) => a.requestId !== requestId))
       setChat((c) => ({
         ...c,
         requestId: c.requestId === requestId ? null : c.requestId,
         messages: c.messages.map((m) => (m.id === assistantId && m.role === 'assistant' ? { ...m, ...patch, status: 'done', endedAt: Date.now() } : m))
       }))
+    }
     try {
-      const res = await window.api.ai.ask(sessionId, question, history, requestId, chat.conversationId)
+      const res = await window.api.ai.ask(sessionId, question, history, requestId, chat.conversationId, { connectors: chat.connectors })
       finish({ result: res })
       if (res.kind === 'query') {
         const u = res.usage
@@ -394,6 +421,11 @@ export function AskPanel({ sessionId, chat, setChat, handle, onSql, running, onC
               </span>
             ) : null}
           </div>
+          {approvals
+            .filter((a) => a.requestId === m.requestId)
+            .map((a) => (
+              <ToolApprovalCard key={a.approvalId} request={a} onAnswer={(d) => answerApproval(a, d)} />
+            ))}
           <div className="chat-actions">
             <button className="btn small ghost" onClick={cancel} data-testid="ask-cancel">
               <Icon name="stop" size={11} /> Cancel
@@ -419,10 +451,17 @@ export function AskPanel({ sessionId, chat, setChat, handle, onSql, running, onC
     if (m.error) body = <div className="chat-text error">{m.error}</div>
     else if (!m.result || m.result.kind === 'cancelled') body = <div className="chat-text muted">Cancelled.</div>
     else if (m.result.kind === 'clarify') {
+      const message = m.result.message
       body = (
         <>
-          <div className="chat-text">{m.result.message}</div>
-          <div className="chat-hint">Reply below to continue.</div>
+          <ChatMarkdown text={message} dialect={dialect} className="chat-text" />
+          {m.result.cutShort ? (
+            <div className="ask-note warn" data-testid="ask-cut-short">
+              The answer was cut short at the model&apos;s length limit for one reply.
+            </div>
+          ) : null}
+          {/* A question back to the user, rather than an answer in words. */}
+          {/\?\s*$/.test(message) ? <div className="chat-hint">Reply below to continue.</div> : null}
         </>
       )
     } else {
@@ -434,7 +473,7 @@ export function AskPanel({ sessionId, chat, setChat, handle, onSql, running, onC
       const privacy = privacyLink(r.privacy, inspect)
       body = (
         <>
-          <div className="chat-text">{r.explanation}</div>
+          <ChatMarkdown text={r.explanation} dialect={dialect} className="chat-text" />
           <SqlCode sql={r.sql} dialect={dialect} className="chat-sql" title="The query placed in the editor" />
           {r.warnings?.map((w) => (
             <div key={w} className="ask-note warn" data-testid="ask-warning">
@@ -528,7 +567,7 @@ export function AskPanel({ sessionId, chat, setChat, handle, onSql, running, onC
                 ))}
               </div>
             ) : (
-              <button className="btn small" onClick={() => setSettingsOpen(true, { tab: 'ai' })} title="Plain-English questions need a language model provider" data-testid="ask-needs-key">
+              <button className="btn small" onClick={() => setSettingsOpen(true, { tab: 'models' })} title="Plain-English questions need a language model provider" data-testid="ask-needs-key">
                 <Icon name="settings" /> Set up provider
               </button>
             )}
@@ -625,7 +664,7 @@ export function AskPanel({ sessionId, chat, setChat, handle, onSql, running, onC
                 role="menuitem"
                 onClick={() => {
                   setMenuOpen(false)
-                  setSettingsOpen(true, { tab: 'ai' })
+                  setSettingsOpen(true, { tab: 'models' })
                 }}
               >
                 <Icon name="settings" size={12} /> Manage providers…
@@ -635,6 +674,7 @@ export function AskPanel({ sessionId, chat, setChat, handle, onSql, running, onC
             )
           ) : null}
         </div>
+        <ChatConnectorsButton connectionId={connectionId} overrides={chat.connectors} onChange={(next) => setChat((c) => ({ ...c, connectors: next }))} />
       </div>
     </div>
   )

@@ -5,7 +5,7 @@ export function isoDate(d: Date): string {
   return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
 }
 
-export function systemRules(kind: DatabaseKind, serverVersion: string, today: string, defaultSchema?: string, tools = true): string {
+export function systemRules(kind: DatabaseKind, serverVersion: string, today: string, defaultSchema?: string, tools = true, connectors = false): string {
   const dialect = kind === 'postgres' ? 'PostgreSQL' : 'SQLite'
   const lines = [
     `You translate questions about a database into one read-only SQL query for ${dialect} (${serverVersion}).`,
@@ -27,6 +27,24 @@ export function systemRules(kind: DatabaseKind, serverVersion: string, today: st
       ? '- When ready, call propose_query. When the question is ambiguous or not answerable from this database, set needs_clarification instead of guessing.'
       : '- Respond with a single JSON object: {"sql": "...", "explanation": "...", "tables_used": ["..."], "assumptions": ["..."], "needs_clarification": null}. Set needs_clarification to a question when the request is ambiguous.'
   ]
+  if (connectors) {
+    lines.push(
+      '- Tools whose names start with mcp__ come from connectors the user linked: other systems, such as an issue tracker or a CRM. Use them when the question needs something the database does not hold, then write the query as usual. If a connector alone answers the question, reply in plain text instead of calling propose_query.'
+    )
+  }
+  return lines.join('\n')
+}
+
+/**
+ * The user's own instructions for this database. They come after the fixed rules, which win where the two disagree:
+ * an instruction cannot make the query write, or name a table the schema does not have.
+ */
+export function instructionsPrompt(list: { name: string; text: string }[]): string {
+  const lines = [
+    '## Instructions from the user',
+    'The user wrote these for questions on this database. Follow them, unless one asks for something the rules above forbid.'
+  ]
+  for (const i of list) lines.push('', `### ${i.name.trim() || 'Instruction'}`, i.text.trim())
   return lines.join('\n')
 }
 

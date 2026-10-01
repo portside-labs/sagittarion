@@ -17,6 +17,10 @@ sensitive values are masked on your machine before they reach the model.
 - **Ask in plain English.** Bring your own OpenAI, Anthropic, Gemini,
   OpenRouter or Groq key, or run a model locally with Ollama or LM Studio.
   Generated SQL is read-only and checked with `EXPLAIN` before it runs.
+  Instructions teach it your definitions, for every database or just one.
+- **Connectors.** Plug MCP servers into Ask, as you would in Claude Desktop,
+  so a question can draw on your issue tracker, CRM or files. Choose the
+  connections each one is on for, and which tools ask before they run.
 - **[Local AI Privacy](docs/LOCAL_AI_PRIVACY.md).** Names, emails, card
   numbers and other sensitive values become placeholders before a request
   leaves your computer, and are restored in the answer. You can inspect

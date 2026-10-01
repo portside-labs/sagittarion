@@ -85,8 +85,8 @@ async function main() {
     await page.getByTestId('open-settings').click()
     await page.getByTestId('settings-dialog').waitFor()
     assert((await page.getByTestId('settings-appearance').count()) === 1, 'settings open on the Appearance tab')
-    assert((await page.locator('.settings-nav-item').allTextContents()).map((s) => s.trim()).join(', ') === 'AI, Appearance, Editor', 'settings sections are listed alphabetically')
-    await page.getByTestId('settings-tab-ai').click()
+    assert((await page.locator('.settings-nav-item').allTextContents()).map((s) => s.trim()).join(', ') === 'Appearance, Connectors, Editor, Instructions, Models', 'settings sections are listed alphabetically')
+    await page.getByTestId('settings-tab-models').click()
     await page.getByTestId('send-sample-values').check()
     await page.getByTestId('settings-save').click()
     await page.locator('.toast.success', { hasText: 'Settings saved' }).waitFor()
@@ -659,6 +659,20 @@ async function main() {
     console.log("code colours and the SQL pane's font override the theme's, and go back to it")
     // An answer from the chat with a value protected on its way out: "N protected" under the SQL opens what was sent.
     const aiRequests = []
+    const DOCS_ANSWER = [
+      '## Using the client',
+      '',
+      'Install it with **npm**, then call `connect()` before anything else:',
+      '',
+      '1. Create a client',
+      '2. Run a query',
+      '',
+      '```sql',
+      'SELECT id, name FROM users LIMIT 5',
+      '```',
+      '',
+      `${'Failed requests are retried with exponential backoff. '.repeat(30)}END-OF-ANSWER`
+    ].join('\n')
     const ai = http.createServer((req, res) => {
       let body = ''
       req.on('data', (c) => (body += c))
@@ -666,16 +680,32 @@ async function main() {
         res.writeHead(200, { 'content-type': 'application/json' })
         if (req.url.endsWith('/models')) return res.end(JSON.stringify({ data: [{ id: 'mock-sql' }] }))
         aiRequests.push(body)
+        const r = JSON.parse(body)
+        // Given the test connector's tools, the model first looks up and flags the email in the question, by its placeholder:
+        // two calls in one turn, one read-only (runs freely, with a structured result to check) and one that asks first.
+        const flag = (r.tools ?? []).some((t) => t.function?.name === 'mcp__crm__flag_account') && !r.messages.some((m) => m.role === 'tool')
+        const question = [...r.messages].reverse().find((m) => m.role === 'user')?.content ?? ''
+        const email = /<\|PII:EMAIL:[0-9A-F]{6}\|>/.exec(typeof question === 'string' ? question : JSON.stringify(question))?.[0]
+        // A question a connector's documentation would answer: a long reply in markdown, without a query.
+        if (/how do i use the client library/i.test(String(question))) {
+          return res.end(JSON.stringify({ model: 'mock-sql', choices: [{ message: { content: DOCS_ANSWER }, finish_reason: 'stop' }], usage: { prompt_tokens: 900, completion_tokens: 700 } }))
+        }
         const args = { sql: 'SELECT id, name FROM users ORDER BY id LIMIT 1', explanation: 'The first user.', tables_used: ['users'] }
-        const call = { id: 'c1', type: 'function', function: { name: 'propose_query', arguments: JSON.stringify(args) } }
-        res.end(JSON.stringify({ model: 'mock-sql', choices: [{ message: { content: null, tool_calls: [call] } }], usage: { prompt_tokens: 900, completion_tokens: 40 } }))
+        const calls =
+          flag && email
+            ? [
+                { id: 'c0', type: 'function', function: { name: 'mcp__crm__lookup_customer', arguments: JSON.stringify({ email }) } },
+                { id: 'c1', type: 'function', function: { name: 'mcp__crm__flag_account', arguments: JSON.stringify({ email, reason: 'Late payments' }) } }
+              ]
+            : [{ id: 'c2', type: 'function', function: { name: 'propose_query', arguments: JSON.stringify(args) } }]
+        res.end(JSON.stringify({ model: 'mock-sql', choices: [{ message: { content: null, tool_calls: calls } }], usage: { prompt_tokens: 900, completion_tokens: 40 } }))
       })
     })
     await new Promise((resolve) => ai.listen(0, '127.0.0.1', resolve))
     try {
       await front('open-settings').click()
       await page.getByTestId('settings-dialog').waitFor()
-      await page.getByTestId('settings-tab-ai').click()
+      await page.getByTestId('settings-tab-models').click()
       await page.getByTestId('ai-type-local').click()
       await page.getByTestId('ai-local-type').selectOption('openai-compatible')
       await page.getByTestId('ai-base-url').fill(`http://127.0.0.1:${ai.address().port}/v1`)
@@ -699,6 +729,111 @@ async function main() {
       await page.keyboard.press('Escape')
       await page.waitForFunction(() => !document.querySelector('[data-testid=exchange-summary]'))
       console.log('"N protected" under an answer opens what was sent to the model')
+
+      // ------------------------------------------------------------ connectors: an MCP server whose tools the chat can use
+      const quote = (p) => `'${p.replace(/'/g, `'\\''`)}'`
+      const frontName = (await page.locator('[data-testid=conn-tab][aria-selected=true] .conn-tab-name').textContent()).trim()
+      await front('open-settings').click()
+      await page.getByTestId('settings-dialog').waitFor()
+      await page.getByTestId('settings-tab-connectors').click()
+      await page.getByTestId('connector-add').click()
+      await page.getByTestId('connector-name').fill('CRM')
+      await page.getByTestId('connector-command').fill(`${quote(process.execPath)} ${quote(path.join(root, 'test', 'fixtures', 'mcp-server.mjs'))}`)
+      await page.getByTestId('connector-env').fill('CRM_TOKEN=e2e-token-123')
+      await page.getByTestId('connector-scope-selected').click()
+      await page.getByTestId(`connector-connection-${frontName}`).check()
+      await page.getByTestId('connector-save').click()
+      await page.locator('[data-testid=connector-tool][data-tool=lookup_customer]').waitFor({ timeout: 30000 })
+      assert((await page.getByTestId('connector-status').textContent()).includes('Running sagittarion-test-crm 1.2.0'), 'the connector started and listed its tools')
+      const crmTool = (name) => page.locator(`[data-testid=connector-tool][data-tool=${name}] [data-testid=tool-permission]`)
+      assert((await crmTool('lookup_customer').inputValue()) === 'allow' && (await crmTool('flag_account').inputValue()) === 'ask', 'read-only tools run freely and the rest ask first')
+      assert(!fs.readFileSync(path.join(userData, 'connectors.json'), 'utf8').includes('e2e-token-123'), 'the connector\'s secret is not saved in plain text')
+      await shot('06i-connectors')
+      await page.keyboard.press('Escape')
+      await page.waitForFunction(() => !document.querySelector('[data-testid=settings-dialog]'))
+      // The chat's menu has it on for this connection.
+      await front('connectors-button').click()
+      const chatSwitch = page.locator('[data-testid=chat-connector][data-name=CRM] [data-testid=chat-connector-switch]')
+      assert((await chatSwitch.getAttribute('aria-checked')) === 'true', 'the connector is on in a chat on its connection')
+      await page.keyboard.press('Escape')
+      // A tool that changes things asks first, with what it would be sent: the real email, on this computer only.
+      const answers = await front('ask-result').count()
+      const before = aiRequests.length
+      await front('ask-input').fill('Flag zed@corp.io for review, then show the first user')
+      await front('ask-button').click()
+      const approval = front('tool-approval')
+      await approval.waitFor({ timeout: 30000 })
+      const asking = await approval.textContent()
+      assert(asking.includes('Flag an account') && asking.includes('zed@corp.io'), `the approval names the tool and shows the real value it would get (${asking})`)
+      await shot('06j-connector-approval')
+      await approval.getByTestId('tool-allow-once').click()
+      await page.waitForFunction((n) => document.querySelectorAll('.session-slot:not([hidden]) [data-testid=ask-result]').length > n, answers, { timeout: 30000 })
+      const sent = aiRequests.slice(before)
+      assert(sent.length === 2 && sent[1].includes('Flagged <|PII:EMAIL:'), 'the connector\'s reply reached the model with the email protected')
+      assert(sent[1].includes('plan Pro'), 'the read-only lookup ran without asking')
+      assert(!sent.join('\n').includes('zed@corp.io'), 'the email never reached the model')
+      // Switched off for this chat, the model is not offered its tools.
+      await front('connectors-button').click()
+      await chatSwitch.click()
+      await page.keyboard.press('Escape')
+      const beforeOff = aiRequests.length
+      await front('ask-input').fill('Show the first user')
+      await front('ask-button').click()
+      await page.waitForFunction((n) => document.querySelectorAll('.session-slot:not([hidden]) [data-testid=ask-result]').length > n, answers + 1, { timeout: 30000 })
+      assert(!aiRequests.slice(beforeOff).join('\n').includes('mcp__crm__'), 'a connector switched off in the chat offers no tools')
+      console.log('connectors: added in Settings, scoped to a connection, asked first, protected, and switched off per chat')
+      // An answer in words comes whole, as markdown.
+      const shownAnswers = await front('ask-result').count()
+      await front('ask-input').fill('How do I use the client library?')
+      await front('ask-button').click()
+      await page.waitForFunction((n) => document.querySelectorAll('.session-slot:not([hidden]) [data-testid=ask-result]').length > n, shownAnswers, { timeout: 30000 })
+      const docs = front('ask-result').last()
+      await docs.locator('.chat-markdown h2', { hasText: 'Using the client' }).waitFor()
+      assert((await docs.locator('.chat-markdown ol li').count()) === 2, 'the answer\'s list is a list')
+      assert((await docs.locator('.chat-markdown .md-code', { hasText: 'connect()' }).count()) === 1, 'inline code is code')
+      assert((await docs.locator('.chat-markdown .chat-sql span').count()) > 0, 'SQL in the answer is highlighted like the editor')
+      assert((await docs.locator('.chat-markdown').textContent()).trim().endsWith('END-OF-ANSWER'), 'the whole answer is shown, however long')
+      assert((await docs.locator('.chat-hint').count()) === 0, 'an answer that asks nothing does not ask for a reply')
+      await docs.screenshot({ path: path.join(artifacts, '06k-markdown-answer.png') })
+      console.log('answers in words show whole, as markdown')
+
+      // ------------------------------------------------------------ instructions: global, and for chosen connections
+      const addInstruction = async (name, text, connection) => {
+        await page.getByTestId('instruction-add').click()
+        await page.getByTestId('instruction-name').fill(name)
+        await page.getByTestId('instruction-text').fill(text)
+        if (connection) {
+          await page.getByTestId('instruction-scope-selected').click()
+          const boxes = await page.locator('[data-testid^="instruction-connection-"]').evaluateAll((els) => els.map((e) => e.dataset.testid.slice('instruction-connection-'.length)))
+          const target = connection === 'other' ? boxes.find((n) => n !== frontName) : connection
+          await page.getByTestId(`instruction-connection-${target}`).check()
+        }
+        await page.getByTestId('instruction-save').click()
+        await page.locator(`[data-testid=instruction][data-name="${name}"]`).waitFor()
+      }
+      await front('open-settings').click()
+      await page.getByTestId('settings-dialog').waitFor()
+      await page.getByTestId('settings-tab-instructions').click()
+      await addInstruction('Revenue', 'Revenue means paid orders only. GLOBAL-RULE-7Q')
+      await addInstruction('This database', 'Users here are customers. FRONT-RULE-3K', frontName)
+      await addInstruction('Elsewhere', 'Never used here. OTHER-RULE-9Z', 'other')
+      assert((await page.locator('[data-testid=instruction][data-name=Revenue] .setting-card-sub').textContent()).startsWith('Global'), 'an instruction for all connections is global')
+      await shot('06l-instructions')
+      await page.keyboard.press('Escape')
+      await page.waitForFunction(() => !document.querySelector('[data-testid=settings-dialog]'))
+      const beforeAsk = aiRequests.length
+      const answersNow = await front('ask-result').count()
+      await front('ask-input').fill('What was revenue last month?')
+      await front('ask-button').click()
+      await page.waitForFunction((n) => document.querySelectorAll('.session-slot:not([hidden]) [data-testid=ask-result]').length > n, answersNow, { timeout: 30000 })
+      const sentNow = aiRequests.slice(beforeAsk).join('\n')
+      assert(sentNow.includes('GLOBAL-RULE-7Q') && sentNow.includes('FRONT-RULE-3K'), 'the global instruction and this connection\'s reach the model')
+      assert(!sentNow.includes('OTHER-RULE-9Z'), 'another connection\'s instruction does not')
+      const ruled = front('ask-result').last()
+      assert(!(await ruled.textContent()).includes('RULE-'), 'instructions are not shown in the chat')
+      await ruled.locator('.ask-steps-toggle').click()
+      assert((await ruled.locator('.ask-step', { hasText: 'Following 2 instructions' }).textContent()).includes('Revenue, This database'), 'the steps name the instructions followed')
+      console.log('instructions: global and per connection reach the model, named in the steps, never shown in the chat')
     } finally {
       ai.close()
     }

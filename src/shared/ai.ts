@@ -448,9 +448,12 @@ export interface AiQueryResult {
 
 export interface AiClarification {
   kind: 'clarify'
+  /** Markdown, as the model wrote it. */
   message: string
   usage: AiUsage
   privacy?: AiPrivacyReport
+  /** The model stopped at its length limit for one reply: the message ends early. */
+  cutShort?: boolean
 }
 
 export interface AiCancelled {
@@ -460,7 +463,7 @@ export interface AiCancelled {
 
 export type AiResult = AiQueryResult | AiClarification | AiCancelled
 
-export type AiStage = 'index' | 'retrieve' | 'sample' | 'privacy' | 'request' | 'tool' | 'check' | 'repair' | 'done' | 'error' | 'cancelled'
+export type AiStage = 'index' | 'instructions' | 'retrieve' | 'sample' | 'privacy' | 'request' | 'tool' | 'check' | 'repair' | 'done' | 'error' | 'cancelled'
 
 /** One step of an ask, streamed to the renderer while the model works. A step is reported twice: running, then done or error. */
 export interface AiProgressEvent {
@@ -475,3 +478,9 @@ export interface AiProgressEvent {
 }
 
 export type AiProgressStep = Omit<AiProgressEvent, 'requestId' | 'seq' | 'ts'>
+
+/** Choices a chat makes for one ask. */
+export interface AskOptions {
+  /** Connectors the chat switched on or off over their usual scope, by id. */
+  connectors?: Record<string, boolean>
+}

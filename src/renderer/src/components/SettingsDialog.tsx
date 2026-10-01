@@ -19,12 +19,16 @@ import { ACCEPT_KEY_OPTIONS } from '@/lib/sql-complete'
 import { CODE_FONTS, SYNTAX_PALETTES, THEMES, type SyntaxId, type ThemeId } from '@/lib/theme'
 import { Modal } from './Modal'
 import { Icon } from './Icons'
+import { ConnectorsSettings } from './ConnectorsSettings'
+import { InstructionsSettings } from './InstructionsSettings'
 import { errorMessage } from '@/lib/util'
 
 /** The sidebar, in alphabetical order so a new section lands in its place. */
 const SETTINGS_TABS = [
-  { id: 'ai' as const, label: 'AI', icon: 'chat' as const },
+  { id: 'models' as const, label: 'Models', icon: 'chat' as const },
   { id: 'appearance' as const, label: 'Appearance', icon: 'layout' as const },
+  { id: 'connectors' as const, label: 'Connectors', icon: 'plug' as const },
+  { id: 'instructions' as const, label: 'Instructions', icon: 'note' as const },
   { id: 'editor' as const, label: 'Editor', icon: 'code' as const }
 ].sort((a, b) => a.label.localeCompare(b.label))
 
@@ -191,7 +195,7 @@ export function SettingsDialog() {
   useLayoutEffect(() => {
     if (!open) return
     if (intent?.tab) setTab(intent.tab)
-    else if (intent?.provider) setTab('ai')
+    else if (intent?.provider) setTab('models')
   }, [open, intent])
 
   // Load the saved values each time the dialog opens, before the first paint so no stale draft shows. Only once per
@@ -557,10 +561,14 @@ export function SettingsDialog() {
               <span className="hint">FROM phone_numbers becomes FROM phone_numbers pn when the name is typed or picked from a suggestion.</span>
             </div>
           </section>
+        ) : tab === 'connectors' ? (
+          <ConnectorsSettings />
+        ) : tab === 'instructions' ? (
+          <InstructionsSettings />
         ) : (
-        <section data-testid="settings-ai">
+        <section data-testid="settings-models">
           <h2>
-            <Icon name="chat" /> AI connection
+            <Icon name="chat" /> Model provider
           </h2>
           <p className="hint">
             Questions typed into the Ask box are turned into SQL by a model of your choice. Bring your own key or run a model locally. The database
@@ -848,7 +856,7 @@ export function SettingsDialog() {
           <button className="btn" onClick={close}>
             Close
           </button>
-          {tab === 'ai' ? (
+          {tab === 'models' ? (
             <button className="btn primary" onClick={() => void save()} disabled={busy !== null || !dirty} data-testid="settings-save">
               {busy === 'save' ? <span className="spinner" /> : null} Save
             </button>

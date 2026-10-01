@@ -78,9 +78,22 @@ only what a question needs:
   added until the budget is full.
 - The model can look further with `search_schema`, `describe_table`,
   `sample_values` and `propose_query`.
+- Instructions from Settings → Instructions, global or for chosen connections,
+  go into the system prompt after the fixed rules, which win where they
+  disagree. They are protected as prose, and the steps name the ones followed.
 - The answer must be a single `SELECT` (or `WITH … SELECT`). It is run through
   `EXPLAIN` first, with errors sent back for up to two repairs, and executes
   under SQLite's `query_only` pragma or a PostgreSQL `READ ONLY` transaction.
+
+**Connectors** (`src/main/connectors/`) are MCP servers whose tools Ask can
+use, like connectors in Claude Desktop. `ConnectorManager` runs each one with
+the official MCP SDK, bundled into the main process: a local command over
+stdio, started with the login shell's `PATH` so `npx` and `uvx` resolve, or a
+remote server over Streamable HTTP with an SSE fallback. Clients start when
+first needed and stop after ten idle minutes. An ask offers the tools of the
+connectors on for its chat as `mcp__<connector>__<tool>`; read-only tools run
+freely, and the rest wait for approval in the chat unless Settings says
+otherwise.
 
 **Local AI Privacy** (`src/main/privacy/`) sits between Ask and every remote
 provider. [LOCAL_AI_PRIVACY.md](LOCAL_AI_PRIVACY.md) has the design, the
@@ -97,6 +110,7 @@ src/main/agent/             sqlite_agent.py, the helper that opens SQLite files
 src/main/ai/                Ask: provider adapters, schema index and retrieval, read-only guard, orchestrator
 src/main/privacy/           Local AI Privacy: detectors, policies, placeholder vault, restoration, verification
 src/main/privacy/semantic/  the optional on-device model: manifest, download, tokenizer, ONNX Runtime process
+src/main/connectors/        MCP connectors: settings store, clients, tools for an ask, approvals
 src/main/store/             saved connections, SSH profiles, settings, workspace (secrets encrypted with safeStorage)
 src/preload/                contextBridge API exposed as window.api
 src/shared/                 types shared by main and renderer, export helpers
@@ -155,6 +169,10 @@ npm run test:docker      # real OpenSSH servers in Docker
 - The renderer runs with `contextIsolation`, `sandbox` and a strict CSP, and
   reaches the main process only through the typed API in `src/shared/api.ts`.
 - The `WHERE` filter box takes raw SQL by design, exactly like the query tab.
+- Connectors run the commands and reach the servers the user configured, as in
+  Claude Desktop. Their environment variables and headers are encrypted like
+  other secrets and never sent to the renderer. A tool that is not read-only
+  asks in the chat first, showing the arguments it would get.
 - Provider adapters accept only requests that passed Local AI Privacy or carry
   an explicit exemption (privacy off, a model on this computer, fixed text such
   as the connection test); the types in `src/main/privacy/boundary.ts` enforce
@@ -167,6 +185,8 @@ npm run test:docker      # real OpenSSH servers in Docker
 - Hosts without Python 3 are not supported; a `sqlite3`-CLI fallback would fit
   behind the driver interface.
 - Export covers the rows currently loaded, not whole tables.
+- Remote connectors that need OAuth sign-in are not supported yet; they need an
+  API key in a header instead.
 
 ## Releasing
 

@@ -46,6 +46,8 @@ export type IconName =
   | 'shield-alert'
   | 'bolt'
   | 'wrench'
+  | 'plug'
+  | 'note'
 
 const paths: Record<IconName, ReactNode> = {
   table: (
@@ -226,6 +228,19 @@ const paths: Record<IconName, ReactNode> = {
     </>
   ),
   bolt: <path d="M13 2L4 14h7l-1 8 9-12h-7l1-8z" />,
+  note: (
+    <>
+      <path d="M6 3h9l4 4v14H6z" />
+      <path d="M14 3v5h5M9 12h7M9 16h7" />
+    </>
+  ),
+  plug: (
+    <>
+      <path d="M9 2v5M15 2v5" />
+      <path d="M6 7h12v4a6 6 0 0 1-12 0V7z" />
+      <path d="M12 17v5" />
+    </>
+  ),
   wrench: (
     <path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.8-3.8a6 6 0 0 1-7.9 7.9l-6.9 6.9a2.1 2.1 0 0 1-3-3l6.9-6.9a6 6 0 0 1 7.9-7.9l-3.8 3.8z" />
   ),

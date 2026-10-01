@@ -64,7 +64,7 @@ await page.waitForLoadState('domcontentloaded')
 
 try {
   await page.getByTestId('open-settings').click()
-  await page.getByTestId('settings-tab-ai').click()
+  await page.getByTestId('settings-tab-models').click()
   await page.getByTestId('ai-type-local').click()
   await page.getByTestId('ai-local-type').selectOption('openai-compatible')
   await page.getByTestId('ai-base-url').fill(`http://127.0.0.1:${server.address().port}/v1`)

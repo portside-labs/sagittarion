@@ -57,6 +57,7 @@ export function unrestored(text: string): Restored {
 function toolWhere(name: string): string {
   if (name === 'search_schema' || name === 'describe_table') return 'schema details'
   if (name === 'sample_values') return 'sample values'
+  if (name.startsWith('mcp__')) return "a connector's reply"
   return 'database feedback'
 }
 
