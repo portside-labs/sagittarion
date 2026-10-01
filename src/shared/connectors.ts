@@ -86,21 +86,23 @@ export function permissionFor(connector: Pick<ConnectorInfo, 'toolPermissions'>,
   return connector.toolPermissions[tool.name] ?? defaultPermission(tool)
 }
 
-/** Whether a connector is on for a database connection before a chat says otherwise. */
-export function appliesTo(connector: Pick<ConnectorInput, 'enabled' | 'scope' | 'connectionIds'>, connectionId: string | undefined): boolean {
+/** Whether a connector is on for a database connection, or for any of a chat's, before the chat says otherwise. */
+export function appliesTo(connector: Pick<ConnectorInput, 'enabled' | 'scope' | 'connectionIds'>, connection: string | (string | undefined)[] | undefined): boolean {
   if (!connector.enabled) return false
-  return connector.scope === 'all' || (Boolean(connectionId) && connector.connectionIds.includes(connectionId!))
+  if (connector.scope === 'all') return true
+  const ids = Array.isArray(connection) ? connection : [connection]
+  return ids.some((id) => Boolean(id) && connector.connectionIds.includes(id!))
 }
 
 /** Whether a connector takes part in a chat: the chat's own choice where it made one, otherwise the connector's scope. */
 export function activeInChat(
   connector: Pick<ConnectorInput, 'id' | 'enabled' | 'scope' | 'connectionIds'>,
-  connectionId: string | undefined,
+  connection: string | (string | undefined)[] | undefined,
   overrides?: Record<string, boolean>
 ): boolean {
   if (!connector.enabled) return false
   const chosen = overrides?.[connector.id]
-  return chosen === undefined ? appliesTo(connector, connectionId) : chosen
+  return chosen === undefined ? appliesTo(connector, connection) : chosen
 }
 
 function slug(text: string, max: number): string {

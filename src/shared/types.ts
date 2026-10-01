@@ -482,7 +482,20 @@ export interface QueryTabSnapshot {
     error: string | null
     resultsDropped?: boolean
   }
-  chat?: { messages: unknown[]; input: string }
+  /** The chat this query tab had before the chat moved beside every connection; read once, to bring it along. */
+  chat?: SavedChat
+}
+
+/** The chat as kept between launches: its messages, the text not yet sent, and the databases in context. */
+export interface SavedChat {
+  /** Its tab in the chat pane. */
+  id?: string
+  /** The model's short name for it, from its first question. */
+  title?: string
+  messages: unknown[]
+  input: string
+  /** The saved connections in context, by id. */
+  databases?: string[]
 }
 
 export type WorkspaceTab =
@@ -497,6 +510,20 @@ export interface WorkspaceConnection {
   tabs: WorkspaceTab[]
 }
 
+/** A closed conversation, as listed to find and continue it. */
+export interface ChatHistoryItem {
+  id: string
+  title: string
+  /** Its last message, ms since the epoch. */
+  updatedAt: number
+  questions: number
+  /** Its first question. */
+  preview: string
+  databases: string[]
+  /** Its questions and answers, shortened, for searching. */
+  text: string
+}
+
 export interface WorkspaceState {
   version: 1
   activeConnectionId: string | null
@@ -504,4 +531,9 @@ export interface WorkspaceState {
   connections: WorkspaceConnection[]
   /** Tab groups folded up to their label, by group name. */
   collapsedGroups?: string[]
+  /** The conversations of the chat beside the connections, as its tabs, in order. */
+  chats?: SavedChat[]
+  activeChatId?: string
+  /** The one chat there was before the chat had tabs. */
+  chat?: SavedChat
 }

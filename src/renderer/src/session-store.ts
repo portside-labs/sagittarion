@@ -55,7 +55,8 @@ export interface SessionState {
   runSearch(query: string): Promise<void>
   openDefinition(ref: ObjectRef): Promise<void>
   openTable(ref: TableRef): void
-  newQueryTab(sql?: string, title?: string): void
+  /** `run`: the new tab runs its query as soon as it opens. */
+  newQueryTab(sql?: string, title?: string, run?: boolean): void
   closeTab(id: string): Promise<void>
   setActiveTab(id: string): void
   setTabDirty(id: string, dirty: boolean): void
@@ -76,6 +77,19 @@ export interface SessionDeps {
 }
 
 export type SessionStore = StoreApi<SessionState>
+
+/** Query tabs opened to run their query straight away; in memory only, so a relaunch does not run it again. */
+const runOnOpen = new Set<string>()
+
+/** Whether a query tab was opened to run its query and has not yet. */
+export function wantsRunOnOpen(tabId: string): boolean {
+  return runOnOpen.has(tabId)
+}
+
+/** The tab ran it: true once, for whoever takes it first. */
+export function takeRunOnOpen(tabId: string): boolean {
+  return runOnOpen.delete(tabId)
+}
 
 /** Tabs and query snapshots from a previous launch, ready for a fresh session store. */
 function restoreTabs(saved: WorkspaceConnection): { tabs: Tab[]; activeTabId: string | null; snapshots: Record<string, QueryTabSnapshot> } {
@@ -255,9 +269,10 @@ export function createSessionStore(session: SessionInfo, deps: SessionDeps, rest
       set({ tabs: [...tabs, tab], activeTabId: tab.id })
     },
 
-    newQueryTab(sql = '', title) {
+    newQueryTab(sql = '', title, run = false) {
       const n = get().queryCounter + 1
       const tab: Tab = { id: crypto.randomUUID(), kind: 'query', title: title ?? `Query ${n}`, initialSql: sql }
+      if (run && sql.trim()) runOnOpen.add(tab.id)
       set({ tabs: [...get().tabs, tab], activeTabId: tab.id, queryCounter: n })
     },
 

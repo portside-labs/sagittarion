@@ -34,8 +34,15 @@ function keep(text: string, max: number): { text: string; size?: number } {
 
 export class WireRecorder {
   readonly exchanges: AiWireExchange[] = []
+  /** Response bodies still being recorded. */
+  private readonly pending = new Set<Promise<void>>()
 
   constructor(private readonly base: typeof fetch = fetch) {}
+
+  /** Once every response body has been recorded in full: before the exchanges are kept. */
+  async settled(): Promise<void> {
+    while (this.pending.size) await Promise.all([...this.pending])
+  }
 
   /** A fetch for the provider adapters that records each exchange and otherwise behaves exactly like fetch. */
   readonly fetch = (async (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
@@ -59,21 +66,30 @@ export class WireRecorder {
     try {
       const res = await this.base(input, init)
       exchange.status = res.status
-      const text = await res
+      // Recorded alongside, not before: a streamed answer reaches the adapter as it is written.
+      const recording = res
         .clone()
         .text()
-        .catch(() => null)
-      if (text !== null) {
-        const response = keep(text, MAX_RESPONSE)
-        exchange.response = response.text
-        if (response.size) exchange.truncated = { ...exchange.truncated, response: response.size }
-      }
+        .then(
+          (text) => {
+            const response = keep(text, MAX_RESPONSE)
+            exchange.response = response.text
+            if (response.size) exchange.truncated = { ...exchange.truncated, response: response.size }
+          },
+          (err) => {
+            exchange.error = err instanceof Error ? err.message : String(err)
+          }
+        )
+        .finally(() => {
+          exchange.durationMs = Math.round(performance.now() - started)
+          this.pending.delete(recording)
+        })
+      this.pending.add(recording)
       return res
     } catch (err) {
       exchange.error = err instanceof Error ? err.message : String(err)
-      throw err
-    } finally {
       exchange.durationMs = Math.round(performance.now() - started)
+      throw err
     }
   }) as typeof fetch
 }

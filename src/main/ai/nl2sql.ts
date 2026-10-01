@@ -4,12 +4,13 @@
 // verified before it leaves; the model's answers keep their placeholders in the transcript (that is what it wrote),
 // and are restored only where they are used here: the SQL that runs, and the words shown in the chat.
 import type { DatabaseKind, QueryResponse, TableRef } from '@shared/types'
-import type { AiClarification, AiProgressStep, AiQueryResult, AiResult, AiTurn, AiUsage } from '@shared/ai'
+import type { AiClarification, AiDatabaseRef, AiProgressStep, AiQueryResult, AiRanQuery, AiResult, AiTurn, AiUsage } from '@shared/ai'
+import { cellToPlainText } from '@shared/export'
 import { describeCounts, type SealedText, type SealedTurn, type SensitiveEntityType } from '@shared/privacy'
 import { checkReadOnlySql, explainStatement } from './guard'
-import { instructionsPrompt, isoDate, systemRules, TOOLS } from './prompt'
+import { acrossRules, acrossTools, instructionsPrompt, isoDate, RESULT_CHARS, RESULT_ROWS, systemRules, TOOLS } from './prompt'
 import { parseJsonObject, ProviderError, throwIfAborted, type ChatMessage, type ChatRequest, type ChatResponse, type ToolCall, type ToolDef } from './providers/types'
-import { estimateTokens, shortComment, tokenize, type RenderView, type SchemaIndex } from './schema-index'
+import { estimateTokens, shortComment, tokenize, type RenderView, type SchemaIndex, type Selection } from './schema-index'
 import type { EmbeddingCache } from './embeddings'
 import type { ModelGateway } from '../privacy/gateway'
 import type { OutboundRequest } from '../privacy/boundary'
@@ -30,28 +31,58 @@ export interface AgentConnectors {
   call(name: string, args: Record<string, unknown>, signal?: AbortSignal): Promise<{ content: string; isError?: boolean; declined?: boolean }>
 }
 
+/** One database an ask can see: the chat's own, or another it has in context. */
+export interface AgentDatabase {
+  /** What the model calls it in tools: a short key, unique in the ask. */
+  key: string
+  /** The connection's name, for the steps and the answer. */
+  name: string
+  /** The saved connection, so an answer can say where its queries belong. */
+  connectionId?: string
+  kind: DatabaseKind
+  serverVersion: string
+  index: SchemaIndex
+  /** Runs SQL under the database's read-only guard. */
+  runQuery: (sql: string, maxRows: number) => Promise<QueryResponse>
+  distinctValues: (ref: TableRef, column: string) => Promise<string[] | null>
+  recentTables?: string[]
+}
+
 export interface AskDeps {
   kind: DatabaseKind
   serverVersion: string
   index: SchemaIndex
   /** The way to the model: protects and verifies every request when Local AI Privacy applies to the connection. */
   provider: ModelGateway
-  settings: { sendSampleValues: boolean; autoRun: boolean; schemaBudgetTokens: number; embeddingModel?: string }
+  settings: { sendSampleValues: boolean; autoRun: boolean; schemaBudgetTokens: number; embeddingModel?: string; readResults?: boolean }
   /** Runs SQL under the database's read-only guard. */
   runQuery: (sql: string, maxRows: number) => Promise<QueryResponse>
   /** Distinct values of a column, or null when there are too many to be useful. */
   distinctValues: (ref: TableRef, column: string) => Promise<string[] | null>
   embeddingCache?: EmbeddingCache
+  /**
+   * Every database the chat has in context, its own first. With more than one, the model looks across all of them;
+   * otherwise the fields above describe the only one.
+   */
+  databases?: AgentDatabase[]
   /** Tools from the connectors on for this chat, if any. */
   connectors?: AgentConnectors
-  /** The user's instructions for this database: the global ones, then its own. Sent to the model, never shown. */
-  instructions?: { name: string; text: string }[]
+  /**
+   * The user's instructions for this database: the global ones, then its own. Sent to the model, never shown. Across
+   * databases, one written for some of them lists their keys.
+   */
+  instructions?: { name: string; text: string; databases?: string[] }[]
   now?: Date
   recentTables?: string[]
   maxToolSteps?: number
   maxRepairs?: number
   /** Streams what is happening to the UI. */
   onProgress?: (step: AiProgressStep) => void
+  /**
+   * The answer as the model writes it, restored for display, for providers that stream: the whole text so far each
+   * time, and '' when what was written turns out to lead into tool calls rather than be the answer.
+   */
+  onStream?: (text: string) => void
   /** Stops at the next step and aborts the request in flight. */
   signal?: AbortSignal
 }
@@ -62,6 +93,8 @@ const MAX_PROSE_CHARS = 40_000
 const SAMPLE_LIMIT = 20
 
 interface Proposal {
+  /** The database key, in a chat across several. */
+  database: string
   sql: string
   explanation: string
   tablesUsed: string[]
@@ -72,6 +105,7 @@ interface Proposal {
 function readProposal(args: Record<string, unknown>): Proposal {
   const list = (v: unknown) => (Array.isArray(v) ? v.map((x) => String(x)).filter(Boolean) : [])
   return {
+    database: typeof args.database === 'string' ? args.database : '',
     sql: typeof args.sql === 'string' ? args.sql : '',
     explanation: typeof args.explanation === 'string' ? args.explanation : '',
     tablesUsed: list(args.tables_used ?? args.tablesUsed),
@@ -82,6 +116,54 @@ function readProposal(args: Record<string, unknown>): Proposal {
 
 function formatTokens(n: number): string {
   return n >= 10_000 ? `${(n / 1000).toFixed(0)}k` : n >= 1000 ? `${(n / 1000).toFixed(1)}k` : String(n)
+}
+
+/** The answer being written, passed on restored at most every 50ms, so a fast stream does not flood the window. */
+class Draft {
+  private raw = ''
+  private shown = ''
+  private timer: ReturnType<typeof setTimeout> | null = null
+
+  constructor(
+    private readonly emit: (text: string) => void,
+    private readonly preview: (raw: string) => string
+  ) {}
+
+  add(delta: string): void {
+    this.raw += delta
+    this.timer ??= setTimeout(() => {
+      this.timer = null
+      this.send()
+    }, 50)
+  }
+
+  /** The reply is the answer: everything written so far goes out now. */
+  flush(): void {
+    this.stop()
+    this.send()
+  }
+
+  /** The reply leads into tool calls, or failed: what was shown of it goes. */
+  clear(): void {
+    this.stop()
+    this.raw = ''
+    if (this.shown) {
+      this.shown = ''
+      this.emit('')
+    }
+  }
+
+  private stop(): void {
+    if (this.timer) clearTimeout(this.timer)
+    this.timer = null
+  }
+
+  private send(): void {
+    const text = this.preview(this.raw)
+    if (text === this.shown) return
+    this.shown = text
+    this.emit(text)
+  }
 }
 
 /** Reports steps as running, then done or failed. */
@@ -121,16 +203,22 @@ function tableData(index: SchemaIndex, keys: string[]): SchemaTableData[] {
   return out
 }
 
-/** A render view for these tables, or none when nothing is protected. */
-async function viewFor(deps: AskDeps, keys: string[]): Promise<RenderView | undefined> {
-  const privacy = deps.provider.privacy
-  if (!privacy) return undefined
-  privacy.useSchema(deps.index.identifiers())
-  return privacy.schemaView(tableData(deps.index, keys))
+/** The databases of an ask: those given, or the one the single-database fields describe. */
+function databasesOf(deps: AskDeps): AgentDatabase[] {
+  if (deps.databases?.length) return deps.databases
+  return [{ key: 'main', name: 'this database', kind: deps.kind, serverVersion: deps.serverVersion, index: deps.index, runQuery: deps.runQuery, distinctValues: deps.distinctValues, recentTables: deps.recentTables }]
 }
 
-async function loadSamples(deps: AskDeps, keys: string[]): Promise<number> {
-  const { index } = deps
+/** A render view for these tables, or none when nothing is protected. */
+async function viewFor(deps: AskDeps, db: AgentDatabase, keys: string[]): Promise<RenderView | undefined> {
+  const privacy = deps.provider.privacy
+  if (!privacy) return undefined
+  privacy.useSchema(databasesOf(deps).flatMap((d) => d.index.identifiers()))
+  return privacy.schemaView(tableData(db.index, keys))
+}
+
+async function loadSamples(deps: AskDeps, db: AgentDatabase, keys: string[]): Promise<number> {
+  const { index } = db
   const jobs: { key: string; column: string; ref: TableRef }[] = []
   for (const key of keys) {
     const t = index.tables.get(key)
@@ -148,7 +236,7 @@ async function loadSamples(deps: AskDeps, keys: string[]): Promise<number> {
   for (const job of jobs) {
     throwIfAborted(deps.signal)
     try {
-      const values = await deps.distinctValues(job.ref, job.column)
+      const values = await db.distinctValues(job.ref, job.column)
       const existing = index.samples.get(job.key) ?? {}
       if (values && values.length && values.length <= SAMPLE_LIMIT && values.every((v) => v.length <= 40)) {
         existing[job.column] = values
@@ -163,14 +251,15 @@ async function loadSamples(deps: AskDeps, keys: string[]): Promise<number> {
   return sampled
 }
 
-async function queryVector(deps: AskDeps, question: string): Promise<number[] | null> {
+async function queryVector(deps: AskDeps, db: AgentDatabase, question: string): Promise<number[] | null> {
   const model = deps.settings.embeddingModel?.trim()
   if (!model || !deps.provider.supportsEmbeddings) return null
-  const { index, embeddingCache } = deps
+  const { embeddingCache } = deps
+  const { index } = db
   try {
     const keys = [...index.tables.keys()]
     const commented = keys.filter((k) => index.tables.get(k)?.comment)
-    const view = commented.length ? await viewFor(deps, commented) : undefined
+    const view = commented.length ? await viewFor(deps, db, commented) : undefined
     const vectors = new Map<string, number[]>()
     const missing: { key: string; text: string }[] = []
     for (const key of keys) {
@@ -207,11 +296,11 @@ async function queryVector(deps: AskDeps, question: string): Promise<number[] | 
 
 export async function askDatabase(deps: AskDeps, rawQuestion: string, history: AiTurn[] = []): Promise<AiResult> {
   const question = rawQuestion.trim()
-  const { index, provider } = deps
+  const { provider } = deps
   const usage: AiUsage = { inputTokens: 0, outputTokens: 0, cachedInputTokens: 0, requests: 0, toolCalls: 0, provider: provider.kind, model: provider.model }
   const progress = new Progress(deps.onProgress)
   if (!question) return { kind: 'clarify', message: 'Type a question about the data first.', usage }
-  if (!index.tables.size) return { kind: 'clarify', message: 'This database has no tables to ask about.', usage }
+  if (databasesOf(deps).every((d) => !d.index.tables.size)) return { kind: 'clarify', message: 'This database has no tables to ask about.', usage }
   try {
     return await run(deps, question, history, usage, progress)
   } catch (err) {
@@ -229,12 +318,20 @@ function total(counts: Partial<Record<SensitiveEntityType, number>>): number {
 }
 
 async function run(deps: AskDeps, question: string, history: AiTurn[], usage: AiUsage, progress: Progress): Promise<AiResult> {
-  const { index, provider } = deps
+  const { provider } = deps
   const privacy = provider.privacy
   const fmt = new Intl.NumberFormat('en-US')
+  const dbs = databasesOf(deps)
+  /** More than one database in the chat: the model looks across them all, and may read query results. */
+  const across = dbs.length > 1
+  const readResults = across && deps.settings.readResults === true
+  const identifiers = () => dbs.flatMap((d) => d.index.identifiers())
+  const refOf = (db: AgentDatabase): AiDatabaseRef => ({ connectionId: db.connectionId ?? '', name: db.name })
+  /** The queries the model ran to look into the question, as they ran here. */
+  const ranQueries: AiRanQuery[] = []
   // Table and column names are never protected, so the model can still write SQL with them. The list grows as
   // tables are described, so it is refreshed before each protection.
-  privacy?.useSchema(index.identifiers())
+  privacy?.useSchema(identifiers())
 
   // The user's instructions go to the model with every request; the steps say which are followed, not what they say.
   const instructions = (deps.instructions ?? []).filter((i) => i.text.trim())
@@ -242,31 +339,49 @@ async function run(deps: AskDeps, question: string, history: AiTurn[], usage: Ai
     progress.note('instructions', instructions.length === 1 ? 'Following 1 instruction' : `Following ${instructions.length} instructions`, instructions.map((i) => i.name).join(', '))
   }
 
-  // Schema context: everything when it fits, otherwise retrieve.
-  const retrieving = progress.start('retrieve', 'Choosing tables for the question')
-  const vector = index.totalTokens > deps.settings.schemaBudgetTokens ? await queryVector(deps, question) : null
-  throwIfAborted(deps.signal)
-  const selection = await index.select(question, deps.settings.schemaBudgetTokens, { recentKeys: deps.recentTables, queryVector: vector })
-  retrieving.done(
-    selection.mode === 'all'
-      ? `all ${fmt.format(selection.totalTables)} tables, ~${formatTokens(selection.tokens)} tokens`
-      : `${selection.keys.length} of ${fmt.format(selection.totalTables)} tables, ~${formatTokens(selection.tokens)} tokens${vector ? ', with embeddings' : ''}`
-  )
+  // Schema context for each database: everything when it fits, otherwise retrieve. Several share the budget.
+  const budget = across ? Math.max(1500, Math.floor(deps.settings.schemaBudgetTokens / dbs.length)) : deps.settings.schemaBudgetTokens
+  const retrieving = progress.start('retrieve', across ? `Choosing tables in ${dbs.length} databases` : 'Choosing tables for the question')
+  const contexts: { db: AgentDatabase; selection: Selection; shown: Set<string> }[] = []
+  let embedded = false
+  for (const db of dbs) {
+    const vector = db.index.totalTokens > budget ? await queryVector(deps, db, question) : null
+    if (vector) embedded = true
+    throwIfAborted(deps.signal)
+    const selection = await db.index.select(question, budget, { recentKeys: db.recentTables, queryVector: vector })
+    contexts.push({ db, selection, shown: new Set(selection.keys) })
+  }
+  const describeSelection = (sel: Selection) =>
+    sel.mode === 'all'
+      ? `all ${fmt.format(sel.totalTables)} tables, ~${formatTokens(sel.tokens)} tokens`
+      : `${sel.keys.length} of ${fmt.format(sel.totalTables)} tables, ~${formatTokens(sel.tokens)} tokens${!across && embedded ? ', with embeddings' : ''}`
+  retrieving.done(across ? contexts.map((c) => `${c.db.name}: ${describeSelection(c.selection)}`).join('; ') : describeSelection(contexts[0].selection))
   throwIfAborted(deps.signal)
   if (deps.settings.sendSampleValues) {
-    const targets = selection.keys.slice(0, 12)
-    const sampling = progress.start('sample', `Sampling values in ${targets.length} table${targets.length === 1 ? '' : 's'}`)
-    const n = await loadSamples(deps, targets)
+    const targets = contexts.map((c) => ({ db: c.db, keys: c.selection.keys.slice(0, across ? 6 : 12) }))
+    const count = targets.reduce((n, t) => n + t.keys.length, 0)
+    const sampling = progress.start('sample', `Sampling values in ${count} table${count === 1 ? '' : 's'}`)
+    let n = 0
+    for (const t of targets) n += await loadSamples(deps, t.db, t.keys)
     sampling.done(`${n} column${n === 1 ? '' : 's'} with short value lists`)
   }
-  const shown = new Set(selection.keys)
   // Sample values and comments are protected with their columns as context before the question is, so a value
   // seen in the data is recognised wherever else it appears.
-  const schemaText = index.render(selection, question, await viewFor(deps, selection.keys))
-  const header =
-    selection.mode === 'all'
-      ? `## Schema (all ${selection.totalTables} tables)\n`
-      : `## Schema excerpt (${selection.keys.length} of ${selection.totalTables} tables; use search_schema for others)\n`
+  const sections: string[] = []
+  let schemaTokens = 0
+  for (const c of contexts) {
+    const text = c.db.index.render(c.selection, question, await viewFor(deps, c.db, c.selection.keys))
+    schemaTokens += estimateTokens(text)
+    const sel = c.selection
+    if (across) {
+      const what = sel.mode === 'all' ? `all ${sel.totalTables} tables` : `${sel.keys.length} of ${sel.totalTables} tables; use search_schema for others`
+      sections.push(`## Database "${c.db.key}": ${c.db.name} (${what})\n${text}`)
+    } else {
+      const header = sel.mode === 'all' ? `## Schema (all ${sel.totalTables} tables)\n` : `## Schema excerpt (${sel.keys.length} of ${sel.totalTables} tables; use search_schema for others)\n`
+      sections.push(header + text)
+    }
+  }
+  const schemaBlock = sections.join('\n\n')
   const today = isoDate(deps.now ?? new Date())
 
   let toolsEnabled = true
@@ -276,12 +391,12 @@ async function run(deps: AskDeps, question: string, history: AiTurn[], usage: Ai
     const sealed = provider.adoptTurn(turn)
     messages.push({ role: 'user', content: sealed?.question.text ?? turn.question })
     const sql = turn.sql ? (sealed?.sql?.text ?? turn.sql) : undefined
-    messages.push({ role: 'assistant', content: sql ? `SQL used:\n${sql}` : (sealed?.answer?.text ?? turn.answer ?? '(no answer)') })
+    messages.push({ role: 'assistant', content: sql ? `SQL used${turn.database ? ` on ${turn.database}` : ''}:\n${sql}` : (sealed?.answer?.text ?? turn.answer ?? '(no answer)') })
   }
   messages.push({ role: 'user', content: (await provider.seal(question))?.text ?? question })
 
-  // Connectors take steps of their own: looking something up elsewhere comes before the schema work.
-  const maxSteps = deps.maxToolSteps ?? (deps.connectors?.tools.length ? 10 : 6)
+  // Connectors take steps of their own, and following a trail across databases takes more again.
+  const maxSteps = deps.maxToolSteps ?? (across ? 16 : deps.connectors?.tools.length ? 10 : 6)
   const maxRepairs = deps.maxRepairs ?? 2
   let repairs = 0
   let explained = false
@@ -292,7 +407,7 @@ async function run(deps: AskDeps, question: string, history: AiTurn[], usage: Ai
     if (!privacy) return provider.prepare(req)
     const step = protectedSoFar < 0 ? progress.start('privacy', 'Protecting sensitive values') : null
     try {
-      privacy.useSchema(index.identifiers())
+      privacy.useSchema(identifiers())
       const outbound = await provider.prepare(req)
       const counts = privacy.report().counts
       const n = total(counts)
@@ -308,24 +423,37 @@ async function run(deps: AskDeps, question: string, history: AiTurn[], usage: Ai
     }
   }
 
-  const complete = async (): Promise<ChatResponse> => {
+  /** `last`: the final step of a chat across databases, where the model answers with what it found instead of looking further. */
+  const complete = async (last = false): Promise<ChatResponse> => {
     throwIfAborted(deps.signal)
+    const connectorTools = deps.connectors?.tools ?? []
+    const rules = across
+      ? acrossRules(
+          dbs.map((d) => ({ key: d.key, name: d.name, kind: d.kind, serverVersion: d.serverVersion, defaultSchema: d.index.defaultSchema })),
+          today,
+          { tools: toolsEnabled, readResults, connectors: Boolean(toolsEnabled && connectorTools.length) }
+        )
+      : systemRules(dbs[0].kind, dbs[0].serverVersion, today, dbs[0].index.defaultSchema, toolsEnabled, Boolean(toolsEnabled && connectorTools.length))
     const req: ChatRequest = {
       system: [
-        { text: systemRules(deps.kind, deps.serverVersion, today, index.defaultSchema, toolsEnabled, Boolean(toolsEnabled && deps.connectors?.tools.length)), structured: true },
+        { text: rules, structured: true },
         // Prose the user wrote, so protected as prose; before the schema, so its cache breakpoint covers both.
-        ...(instructions.length ? [{ text: instructionsPrompt(instructions) }] : []),
-        { text: header + schemaText, cacheable: true, structured: true }
+        ...(instructions.length ? [{ text: instructionsPrompt(instructions, across) }] : []),
+        { text: schemaBlock, cacheable: true, structured: true }
       ],
       messages,
-      tools: toolsEnabled ? [...TOOLS, ...(deps.connectors?.tools ?? [])] : undefined,
-      toolChoice: toolsEnabled ? ('auto' as const) : undefined
+      tools: toolsEnabled ? [...(across ? acrossTools(dbs.map((d) => d.key), readResults) : TOOLS), ...connectorTools] : undefined,
+      toolChoice: toolsEnabled ? (last ? ('none' as const) : ('auto' as const)) : undefined
     }
     const outbound = await prepare(req)
     throwIfAborted(deps.signal)
     const asking = progress.start('request', `Asking ${provider.model || provider.kind}${usage.requests ? ` (request ${usage.requests + 1})` : ''}`)
+    // Prose the model writes is shown as it streams; a JSON answer, asked for when tools are not, is not prose.
+    const draft = deps.onStream && toolsEnabled ? new Draft(deps.onStream, (raw) => provider.previewText(raw)) : null
     try {
-      const res = await provider.send(outbound, deps.signal)
+      const res = await provider.send(outbound, deps.signal, draft ? (delta) => draft.add(delta) : undefined)
+      if (res.toolCalls.length) draft?.clear()
+      else draft?.flush()
       usage.requests++
       usage.inputTokens += res.usage.inputTokens
       usage.outputTokens += res.usage.outputTokens
@@ -334,10 +462,11 @@ async function run(deps: AskDeps, question: string, history: AiTurn[], usage: Ai
       asking.done(`${formatTokens(res.usage.inputTokens)} in / ${formatTokens(res.usage.outputTokens)} out${res.usage.cachedInputTokens ? `, ${formatTokens(res.usage.cachedInputTokens)} cached` : ''}`)
       return res
     } catch (err) {
+      draft?.clear()
       if (err instanceof ProviderError && err.errorKind === 'tools_unsupported' && toolsEnabled) {
         asking.done('no tool support; switching to JSON answers')
         toolsEnabled = false
-        return complete()
+        return complete(last)
       }
       asking.fail(err instanceof Error ? err.message : String(err))
       throw err
@@ -362,12 +491,12 @@ async function run(deps: AskDeps, question: string, history: AiTurn[], usage: Ai
     const restored = provider.restoreText(fromModel)
     const message = restored.text || (local ? shownText(local) : '')
     const sealed = await sealTurn(restored.text ? { answer: { text: fromModel, spans: restored.spans } } : {})
-    return { kind: 'clarify', message, usage, privacy: provider.report(sealed), ...(cutShort ? { cutShort } : {}) }
+    return { kind: 'clarify', message, usage, privacy: provider.report(sealed), ...(cutShort ? { cutShort } : {}), ...(ranQueries.length ? { queries: ranQueries } : {}) }
   }
 
-  const finish = async (p: Proposal, tokenizedSql: string, restored: Restored): Promise<AiQueryResult> => {
+  const finish = async (p: Proposal, tokenizedSql: string, restored: Restored, db: AgentDatabase): Promise<AiQueryResult> => {
     const tablesUsed = p.tablesUsed.map(shownText)
-    progress.note('done', 'Query ready', tablesUsed.length ? `uses ${tablesUsed.join(', ')}` : undefined)
+    progress.note('done', across ? `Query ready for ${db.name}` : 'Query ready', tablesUsed.length ? `uses ${tablesUsed.join(', ')}` : undefined)
     const warnings = restored.withheld
       ? [`The query refers to ${restored.withheld === 1 ? 'a value' : `${restored.withheld} values`} the model never saw in full (masked or withheld by the privacy policy). Replace ${restored.withheld === 1 ? 'it' : 'them'} before running.`]
       : []
@@ -379,46 +508,143 @@ async function run(deps: AskDeps, question: string, history: AiTurn[], usage: Ai
       tablesUsed,
       assumptions: p.assumptions.map(shownText),
       checks: { readOnly: true, explained, repairs },
-      context: { mode: selection.mode, tables: selection.keys.length, totalTables: selection.totalTables, schemaTokens: estimateTokens(schemaText) },
+      context: {
+        mode: contexts.every((c) => c.selection.mode === 'all') ? 'all' : 'retrieved',
+        tables: contexts.reduce((n, c) => n + c.selection.keys.length, 0),
+        totalTables: contexts.reduce((n, c) => n + c.selection.totalTables, 0),
+        schemaTokens
+      },
       usage,
       autoRun: deps.settings.autoRun && explained && !warnings.length,
+      ...(across ? { database: refOf(db) } : {}),
+      ...(ranQueries.length ? { queries: ranQueries } : {}),
       ...(warnings.length ? { warnings } : {}),
       privacy: provider.report(sealed)
     }
   }
 
+  /** The database a tool call names; with one database, that one. A string is the error to send back. */
+  const dbFor = (args: Record<string, unknown>): AgentDatabase | string => {
+    if (!across) return dbs[0]
+    const key = String(args.database ?? '').trim()
+    return dbs.find((d) => d.key === key) ?? `Unknown database "${key}". Use one of: ${dbs.map((d) => `"${d.key}"`).join(', ')}.`
+  }
+  const contextOf = (db: AgentDatabase) => contexts.find((c) => c.db === db)!
+
+  /**
+   * Runs one read-only query for the model to read: checked, restored for this database, and its result sent back as
+   * a short table with every value protected with its column as context, like sample values.
+   */
+  const readQuery = async (db: AgentDatabase, raw: string, step: ReturnType<Progress['start']>): Promise<{ content: string; structured?: boolean }> => {
+    const gate = checkReadOnlySql(raw)
+    if (!gate.ok) {
+      step.fail(shownText(gate.reason))
+      return { content: `${gate.reason} Send one read-only SELECT.` }
+    }
+    const restored = provider.restoreSql(gate.sql, db.kind)
+    if (restored.unknown.length || restored.damaged.length) {
+      const bad = [...new Set([...restored.unknown, ...restored.damaged])].slice(0, 5)
+      step.fail('a placeholder that matches nothing')
+      return { content: `The query uses placeholders that do not match any protected value: ${bad.join(', ')}. Copy each one exactly as it appears, including the <| and |>.` }
+    }
+    if (restored.withheld) {
+      step.fail('refers to a value withheld from the model')
+      return { content: 'The query refers to a value you were never shown in full, so it cannot run. Use another column to find the records.' }
+    }
+    const gate2 = checkReadOnlySql(restored.text)
+    if (!gate2.ok) {
+      step.fail(gate2.reason)
+      return { content: `${gate2.reason} Send one read-only SELECT.` }
+    }
+    let message: string | null = null
+    let first: QueryResponse['results'][number] | undefined
+    try {
+      first = (await db.runQuery(restored.text, RESULT_ROWS + 1)).results.find((r) => r.kind === 'rows' || r.kind === 'error')
+      if (!first) message = 'The statement returned no rows.'
+      else if (first.kind === 'error') message = first.message
+    } catch (e: any) {
+      message = e?.message ?? String(e)
+    }
+    if (message !== null || !first || first.kind !== 'rows') {
+      ranQueries.push({ database: refOf(db), sql: restored.text, error: message ?? 'No rows.' })
+      step.fail(shownText(message ?? 'no rows'))
+      return { content: `The database rejected the query: ${message}` }
+    }
+    const rows = first.rows.slice(0, RESULT_ROWS)
+    const cells = rows.map((r) => r.map((v) => (v === null ? 'NULL' : safeSlice(cellToPlainText(v).replace(/\s*\n\s*/g, ' '), 200))))
+    if (privacy) {
+      privacy.useSchema(identifiers())
+      for (let c = 0; c < first.columns.length; c++) {
+        const at = cells.map((r, i) => (r[c] === 'NULL' ? -1 : i)).filter((i) => i >= 0)
+        if (!at.length) continue
+        const column = first.columns[c]
+        const safe = await privacy.protectValues({ column: column.name, declaredType: column.declType }, at.map((i) => cells[i][c]), 'query results')
+        at.forEach((i, k) => (cells[i][c] = safe[k]))
+      }
+    }
+    // As many rows as fit: wide ones show fewer.
+    const lines: string[] = []
+    let size = 0
+    for (const r of cells) {
+      const line = r.join(' | ')
+      if (lines.length && size + line.length > RESULT_CHARS) break
+      lines.push(line)
+      size += line.length + 1
+    }
+    const more = first.rows.length > lines.length || first.truncated
+    ranQueries.push({ database: refOf(db), sql: restored.text, rows: rows.length })
+    step.done(`${rows.length}${first.rows.length > RESULT_ROWS || first.truncated ? '+' : ''} row${rows.length === 1 ? '' : 's'}`)
+    const head = `${lines.length} row${lines.length === 1 ? '' : 's'} from "${db.key}"${more ? ', more not shown: narrow the query or select fewer columns' : ''}:`
+    return { content: [head, first.columns.map((c) => c.name).join(' | '), ...lines].join('\n'), structured: true }
+  }
+
   const runTool = async (call: ToolCall): Promise<{ content: string; structured?: boolean }> => {
     usage.toolCalls++
     const args = call.args ?? {}
+    const named = call.name === 'search_schema' || call.name === 'describe_table' || call.name === 'sample_values' || (call.name === 'run_query' && readResults)
+    const target = named ? dbFor(args) : dbs[0]
+    if (typeof target === 'string') {
+      progress.note('tool', 'Model named a database that is not in the chat', String(args.database ?? ''))
+      return { content: target }
+    }
+    const db = target
+    const ctx = contextOf(db)
+    /** " in Orders" in a chat across databases. */
+    const inDb = across ? ` in ${db.name}` : ''
+    if (call.name === 'run_query' && readResults) {
+      const purpose = shownText(String(args.purpose ?? '')).trim()
+      const step = progress.start('query', `Queried ${db.name}${purpose ? `: ${safeSlice(purpose, 80)}` : ''}`)
+      return readQuery(db, String(args.sql ?? ''), step)
+    }
     if (call.name === 'search_schema') {
       const query = shownText(String(args.query ?? ''))
-      const step = progress.start('tool', `Model searched the schema for "${query}"`)
-      const lines = await index.search(query, 10, shown, privacy ? (keys) => viewFor(deps, keys) as Promise<RenderView> : undefined)
-      for (const l of lines) shown.add(l.slice(0, l.indexOf('(')))
+      const step = progress.start('tool', across ? `Model searched ${db.name} for "${query}"` : `Model searched the schema for "${query}"`)
+      const lines = await db.index.search(query, 10, ctx.shown, privacy ? (keys) => viewFor(deps, db, keys) as Promise<RenderView> : undefined)
+      for (const l of lines) ctx.shown.add(l.slice(0, l.indexOf('(')))
       step.done(lines.length ? `${lines.length} table${lines.length === 1 ? '' : 's'}` : 'nothing new')
       return { content: lines.length ? lines.join('\n') : 'No further tables match. The excerpt already shows every relevant table.', structured: true }
     }
     if (call.name === 'describe_table') {
       const name = shownText(String(args.table ?? ''))
-      const step = progress.start('tool', `Model asked to describe ${name}`)
-      const t = index.find(name)
+      const step = progress.start('tool', `Model asked to describe ${name}${inDb}`)
+      const t = db.index.find(name)
       if (!t) {
         step.fail('unknown table')
         return { content: `Unknown table: ${name}. Use search_schema to find the right name.`, structured: true }
       }
-      await index.ensureColumns([t.key])
-      if (deps.settings.sendSampleValues) await loadSamples(deps, [t.key])
-      const text = await index.describe(t.key, await viewFor(deps, [t.key]))
-      shown.add(t.key)
+      await db.index.ensureColumns([t.key])
+      if (deps.settings.sendSampleValues) await loadSamples(deps, db, [t.key])
+      const text = await db.index.describe(t.key, await viewFor(deps, db, [t.key]))
+      ctx.shown.add(t.key)
       step.done(`${t.meta?.columns.length ?? 0} columns`)
       return { content: text, structured: true }
     }
     if (call.name === 'sample_values') {
       const table = shownText(String(args.table ?? ''))
       const column = shownText(String(args.column ?? ''))
-      const step = progress.start('tool', `Model asked for sample values of ${table}.${column}`)
-      const t = index.find(table)
-      if (t) await index.ensureColumns([t.key])
+      const step = progress.start('tool', `Model asked for sample values of ${table}.${column}${inDb}`)
+      const t = db.index.find(table)
+      if (t) await db.index.ensureColumns([t.key])
       const meta = t?.meta?.columns.find((c) => c.name === column)
       if (!t || !meta) {
         step.fail('unknown column')
@@ -429,8 +655,8 @@ async function run(deps: AskDeps, question: string, history: AiTurn[], usage: Ai
         return { content: "Sample values are disabled in this app's settings; rely on the column type and the question instead.", structured: true }
       }
       try {
-        const values = await deps.distinctValues(t.ref, column)
-        privacy?.useSchema(index.identifiers())
+        const values = await db.distinctValues(t.ref, column)
+        privacy?.useSchema(identifiers())
         const shownValues = values && privacy ? await privacy.protectValues({ table: t.ref.name, column, declaredType: meta.type }, values.slice(0, SAMPLE_LIMIT)) : values
         const text = shownValues ? (shownValues.length ? shownValues.slice(0, SAMPLE_LIMIT).join(' | ') : 'No values (column is empty or all NULL).') : 'Too many distinct values to list; treat the column as free text.'
         step.done(values ? `${values.length} value${values.length === 1 ? '' : 's'}` : 'too many values')
@@ -475,7 +701,7 @@ async function run(deps: AskDeps, question: string, history: AiTurn[], usage: Ai
 
   let lastText = ''
   for (let step = 0; step < maxSteps; step++) {
-    const res = await complete()
+    const res = await complete(across && step === maxSteps - 1)
     lastText = res.text
     let calls = res.toolCalls
     if (!calls.length) {
@@ -498,12 +724,14 @@ async function run(deps: AskDeps, question: string, history: AiTurn[], usage: Ai
         progress.note('done', 'Model asked for clarification')
         return clarify(p.needsClarification)
       }
-      const checking = progress.start('check', 'Checking the query is read-only and valid')
-      // The model's SQL is checked in its own terms, then restored for this database and checked again.
+      const target = dbFor(proposal.args)
+      const db = typeof target === 'string' ? dbs[0] : target
+      const checking = progress.start('check', across ? `Checking the query for ${db.name} is read-only and valid` : 'Checking the query is read-only and valid')
+      // The model's SQL is checked in its own terms, then restored for its database and checked again.
       const gate = checkReadOnlySql(p.sql)
-      let problem: string | null = gate.ok ? null : gate.reason
+      let problem: string | null = typeof target === 'string' ? target : gate.ok ? null : gate.reason
       const tokenizedSql = gate.ok ? gate.sql : p.sql
-      const restored = provider.restoreSql(tokenizedSql, deps.kind)
+      const restored = provider.restoreSql(tokenizedSql, db.kind)
       if (!problem && (restored.unknown.length || restored.damaged.length)) {
         const bad = [...new Set([...restored.unknown, ...restored.damaged])].slice(0, 5)
         problem = `The query uses placeholders that do not match any protected value: ${bad.join(', ')}. Copy each placeholder exactly as it appears in the conversation, including the <| and |> around it.`
@@ -514,7 +742,7 @@ async function run(deps: AskDeps, question: string, history: AiTurn[], usage: Ai
       }
       if (!problem) {
         try {
-          const res2 = await deps.runQuery(explainStatement(deps.kind, restored.text), 50)
+          const res2 = await db.runQuery(explainStatement(db.kind, restored.text), 50)
           const first = res2.results[0]
           if (first && first.kind === 'error') problem = `The database rejected the query: ${first.message}`
           else explained = true
@@ -524,7 +752,7 @@ async function run(deps: AskDeps, question: string, history: AiTurn[], usage: Ai
       }
       if (!problem) {
         checking.done('EXPLAIN passed')
-        return finish(p, tokenizedSql, restored)
+        return finish(p, tokenizedSql, restored, db)
       }
       checking.fail(shownText(problem))
       if (repairs >= maxRepairs) {
@@ -552,7 +780,12 @@ async function run(deps: AskDeps, question: string, history: AiTurn[], usage: Ai
     for (const call of calls) messages.push({ role: 'tool', toolCallId: call.id, name: call.name, ...(await runTool(call)) })
   }
   progress.note('error', 'Model kept exploring without proposing a query')
-  return clarify(safeSlice(lastText.trim(), MAX_PROSE_CHARS), 'The model kept exploring the schema without proposing a query. Try naming the tables you mean.')
+  return clarify(
+    safeSlice(lastText.trim(), MAX_PROSE_CHARS),
+    across
+      ? 'The model used every step it has without finishing. Ask about one part at a time, or name the databases and tables you mean.'
+      : 'The model kept exploring the schema without proposing a query. Try naming the tables you mean.'
+  )
 }
 
 export function questionTerms(question: string): string[] {

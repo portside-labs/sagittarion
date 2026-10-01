@@ -1,11 +1,12 @@
 import { create } from 'zustand'
 import type { AppInfo, ConnectionConfig, DatabaseKind, GroupStyle, SessionInfo, SshProfile, WorkspaceConnection, WorkspaceState } from '@shared/types'
 import type { AiSettings, ProviderId } from '@shared/ai'
-import type { ConnectorInfo } from '@shared/connectors'
+import type { ConnectorInfo, ToolApprovalRequest } from '@shared/connectors'
 import type { Instruction } from '@shared/instructions'
 import { describeTarget, resolveSshProfile } from '@shared/connections'
 import { errorMessage } from './lib/util'
-import { defaultLayout, isValidLayout, type LayoutNode } from './lib/layout'
+import { defaultLayout, isValidLayout, withoutLeaf, type LayoutNode } from './lib/layout'
+import { chatsFromWorkspace, closeChatTab, emptyChat, restoreChat, saveChat, withoutTabChats, type ChatState } from './lib/chat'
 import { clusterTabs, groupByConnection, nearestTab, settleCollapsed } from './lib/tab-groups'
 import { createSessionStore, snapshotSession, type SessionStore } from './session-store'
 import { ACCEPT_KEY_OPTIONS, type KeywordCase } from './lib/sql-complete'
@@ -118,10 +119,40 @@ interface State {
   settingsIntent: SettingsIntent | null
   /** Arrangement of the editor, chat and results panes in query tabs. */
   queryLayout: LayoutNode
+  /** The chat beside the connections: open, or folded to a strip at the right edge. */
   chatOpen: boolean
+  chatWidth: number
+  /** The conversations of the chat pane, as its tabs, kept while the user moves between connections. */
+  chats: ChatState[]
+  activeChatId: string
+  /** Connector tools waiting for the user's yes or no, in any conversation. */
+  approvals: ToolApprovalRequest[]
 
   setQueryLayout(layout: LayoutNode): void
   setChatOpen(open: boolean): void
+  setChatWidth(width: number): void
+  /** Changes one conversation, whichever tab is in front. */
+  updateChat(id: string, update: (chat: ChatState) => ChatState): void
+  /** Changes every conversation the function returns changed, e.g. the one an ask's progress belongs to. */
+  updateChats(update: (chat: ChatState) => ChatState): void
+  /** Opens a new conversation in a tab of its own and brings it to the front. */
+  newChat(): void
+  selectChat(id: string): void
+  /**
+   * Closes a conversation: an ask it has running stops, and its placeholders and what it sent are forgotten. One with
+   * questions in it goes to the history, to find and continue later.
+   */
+  closeChat(id: string): void
+  /** A past conversation, back in a tab: taking the place of an empty one in front, or in a tab of its own. */
+  openPastChat(id: string): Promise<void>
+  addApproval(request: ToolApprovalRequest): void
+  /** Approvals answered, or of asks that ended. */
+  dropApprovals(match: (request: ToolApprovalRequest) => boolean): void
+  /**
+   * Puts SQL in the editor of a connection's query tab in front, or a new query tab, connecting first, and brings the
+   * connection to the front; runs it when asked.
+   */
+  openSql(connectionId: string, sql: string, run: boolean): Promise<void>
   setUiPref(patch: Partial<UiPrefs>): void
   init(): Promise<void>
   loadSettings(): Promise<void>
@@ -142,6 +173,11 @@ interface State {
   /** Brings a tab to the front, connecting it first when it has not been connected yet. */
   activateTab(connectionId: string): void
   connectTab(connectionId: string): Promise<void>
+  /**
+   * The live session of a saved connection, connecting it first when needed: its tab joins the strip without coming
+   * to the front. For a chat that has other databases in context.
+   */
+  ensureSession(connectionId: string): Promise<string>
   /** Disconnects a live tab, or just drops one that never connected. */
   closeTab(connectionId: string): Promise<void>
   /** Puts the tabs in the given order, as dragged; the order is kept with the workspace. */
@@ -177,12 +213,38 @@ const UI_KEY = 'uiPrefs.v1'
 
 function loadLayout(): LayoutNode {
   try {
-    const parsed = JSON.parse(localStorage.getItem(LAYOUT_KEY) ?? 'null')
+    // A layout from when the chat was a pane of the query tab, without it.
+    const parsed = withoutLeaf(JSON.parse(localStorage.getItem(LAYOUT_KEY) ?? 'null'), 'chat')
     if (isValidLayout(parsed)) return parsed
   } catch {
     /* fall through */
   }
   return defaultLayout()
+}
+
+const CHAT_WIDTH_KEY = 'chatWidth'
+export const CHAT_WIDTH = { min: 300, max: 760, initial: 400 }
+
+function loadChatWidth(): number {
+  const saved = Number(localStorage.getItem(CHAT_WIDTH_KEY))
+  return Number.isFinite(saved) && saved >= CHAT_WIDTH.min && saved <= CHAT_WIDTH.max ? saved : CHAT_WIDTH.initial
+}
+
+/** What the chat needs from a query tab to put SQL in its editor. */
+export interface QueryTabHandle {
+  setSql(sql: string): void
+  run(sql: string): void
+}
+
+/** The query tabs on screen, by tab id, so the chat can reach their editors. */
+const queryTabHandles = new Map<string, QueryTabHandle>()
+
+/** A query tab makes its editor reachable while it is mounted. */
+export function registerQueryTab(tabId: string, handle: QueryTabHandle): () => void {
+  queryTabHandles.set(tabId, handle)
+  return () => {
+    if (queryTabHandles.get(tabId) === handle) queryTabHandles.delete(tabId)
+  }
 }
 
 const DEFAULT_UI: UiPrefs = { theme: DEFAULT_THEME, syntax: null, codeFont: null, connectionTabs: 'horizontal', keywordCase: 'upper', autocomplete: true, autoAlias: false, acceptKeys: ['Tab', 'Enter'] }
@@ -216,7 +278,7 @@ function tabFromConfig(cfg: ConnectionConfig, profiles: SshProfile[]): Pick<Open
   return { connectionId: cfg.id, name: cfg.name, kind: cfg.kind, target: describeTarget(resolveSshProfile(cfg, profiles)) }
 }
 
-export const useStore = create<State>()((set, get) => {
+export const useStore = create<State>()((set, get, api) => {
   const patchTab = (connectionId: string, patch: Partial<OpenTab>) => set({ tabs: get().tabs.map((t) => (t.connectionId === connectionId ? { ...t, ...patch } : t)) })
 
   return {
@@ -240,6 +302,12 @@ export const useStore = create<State>()((set, get) => {
     settingsIntent: null,
     queryLayout: loadLayout(),
     chatOpen: localStorage.getItem('askPanelOpen') !== 'false',
+    chatWidth: loadChatWidth(),
+    ...(() => {
+      const first = emptyChat()
+      return { chats: [first], activeChatId: first.id }
+    })(),
+    approvals: [],
 
     setQueryLayout(layout) {
       set({ queryLayout: layout })
@@ -251,12 +319,102 @@ export const useStore = create<State>()((set, get) => {
     },
 
     setChatOpen(open) {
-      set({ chatOpen: open })
+      // Opened, the conversation in front is seen.
+      const { chats, activeChatId } = get()
+      set({ chatOpen: open, ...(open && chats.some((c) => c.id === activeChatId && c.unread) ? { chats: chats.map((c) => (c.id === activeChatId ? { ...c, unread: false } : c)) } : {}) })
       try {
         localStorage.setItem('askPanelOpen', String(open))
       } catch {
         /* storage is optional */
       }
+    },
+
+    setChatWidth(width) {
+      // The connection beside it keeps room to work in.
+      const max = Math.max(CHAT_WIDTH.min, Math.min(CHAT_WIDTH.max, window.innerWidth - 560))
+      const w = Math.round(Math.min(max, Math.max(CHAT_WIDTH.min, width)))
+      set({ chatWidth: w })
+      try {
+        localStorage.setItem(CHAT_WIDTH_KEY, String(w))
+      } catch {
+        /* storage is optional */
+      }
+    },
+
+    updateChat(id, update) {
+      const { chats } = get()
+      const at = chats.findIndex((c) => c.id === id)
+      if (at < 0) return
+      const next = update(chats[at])
+      if (next !== chats[at]) set({ chats: chats.map((c, i) => (i === at ? next : c)) })
+    },
+
+    updateChats(update) {
+      const { chats } = get()
+      const next = chats.map(update)
+      if (next.some((c, i) => c !== chats[i])) set({ chats: next })
+    },
+
+    newChat() {
+      const chat = emptyChat()
+      set({ chats: [...get().chats, chat], activeChatId: chat.id })
+    },
+
+    selectChat(id) {
+      const { chats, chatOpen } = get()
+      if (!chats.some((c) => c.id === id)) return
+      // Brought to the front, its new answer is seen.
+      set({ activeChatId: id, ...(chatOpen ? { chats: chats.map((c) => (c.id === id && c.unread ? { ...c, unread: false } : c)) } : {}) })
+    },
+
+    addApproval(request) {
+      set({ approvals: [...get().approvals, request] })
+    },
+
+    dropApprovals(match) {
+      const { approvals } = get()
+      if (approvals.some(match)) set({ approvals: approvals.filter((a) => !match(a)) })
+    },
+
+    closeChat(id) {
+      const { chats, activeChatId } = get()
+      const closing = chats.find((c) => c.id === id)
+      if (!closing) return
+      if (closing.requestId) {
+        void window.api.ai.cancel(closing.requestId)
+        get().dropApprovals((a) => a.requestId === closing.requestId)
+      }
+      // A closed chat forgets its placeholders and what its answers sent; the history keeps the conversation itself.
+      void window.api.ai.forget(closing.conversationId, { transcripts: true })
+      if (closing.messages.some((m) => m.role === 'user')) {
+        window.api.chats.archive(saveChat(closing)).catch((e) => get().toast('error', 'Could not keep the conversation', errorMessage(e)))
+      }
+      set(closeChatTab(chats, id, activeChatId))
+    },
+
+    async openPastChat(id) {
+      if (get().chats.some((c) => c.id === id)) return get().selectChat(id)
+      const saved = await window.api.chats.take(id)
+      if (!saved) throw new Error('That conversation is no longer kept.')
+      const chat = restoreChat(saved)
+      const { chats, activeChatId } = get()
+      const front = chats.find((c) => c.id === activeChatId)
+      const emptyFront = front && !front.messages.length && !front.input.trim() && !front.requestId
+      set({ chats: emptyFront ? chats.map((c) => (c.id === front.id ? chat : c)) : [...chats, chat], activeChatId: chat.id })
+    },
+
+    async openSql(connectionId, sql, run) {
+      const sessionId = await get().ensureSession(connectionId)
+      const store = sessionStores.get(sessionId)
+      if (!store) throw new Error('The connection closed before the query could open.')
+      const { tabs, activeTabId } = store.getState()
+      const front = tabs.find((t) => t.id === activeTabId)
+      const handle = front?.kind === 'query' ? queryTabHandles.get(front.id) : undefined
+      get().activateTab(connectionId)
+      if (handle) {
+        handle.setSql(sql)
+        if (run) handle.run(sql)
+      } else store.getState().newQueryTab(sql, undefined, run)
     },
 
     setUiPref(patch) {
@@ -463,6 +621,35 @@ export const useStore = create<State>()((set, get) => {
       }
     },
 
+    async ensureSession(connectionId) {
+      const tabOf = () => get().tabs.find((t) => t.connectionId === connectionId)
+      const live = tabOf()
+      if (live?.status === 'live' && live.session) return live.session.sessionId
+      if (!live) {
+        let cfg = get().connections.find((c) => c.id === connectionId)
+        if (!cfg) {
+          await get().loadConnections()
+          cfg = get().connections.find((c) => c.id === connectionId)
+        }
+        if (!cfg) throw new Error('This saved connection no longer exists.')
+        const groupOf = groupByConnection(get().connections)
+        set({ tabs: clusterTabs([...get().tabs, { ...tabFromConfig(cfg, get().sshProfiles), status: 'pending', session: null }], groupOf) })
+      }
+      if (tabOf()?.status === 'connecting') {
+        // Already on its way, from the tab strip or another chat.
+        await new Promise<void>((resolve) => {
+          const unsubscribe = api.subscribe(() => {
+            if (tabOf()?.status === 'connecting') return
+            unsubscribe()
+            resolve()
+          })
+        })
+      } else await get().connectTab(connectionId)
+      const tab = tabOf()
+      if (tab?.status === 'live' && tab.session) return tab.session.sessionId
+      throw new Error(tab?.error ?? 'The connection was closed before it was made.')
+    },
+
     async closeTab(connectionId) {
       const tab = get().tabs.find((t) => t.connectionId === connectionId)
       if (!tab) return
@@ -545,7 +732,14 @@ export const useStore = create<State>()((set, get) => {
       set({ connectSelect: id })
     },
 
-    restoreWorkspace(state) {
+    restoreWorkspace(workspace) {
+      // The chat comes back first: it stays whether or not its connections do.
+      const savedChats = chatsFromWorkspace(workspace)
+      if (savedChats.chats.length) {
+        const chats = savedChats.chats.map(restoreChat)
+        set({ chats, activeChatId: chats.find((c) => c.id === savedChats.activeChatId)?.id ?? chats[chats.length - 1].id })
+      }
+      const state = withoutTabChats(workspace)
       const { connections, sshProfiles } = get()
       const tabs: OpenTab[] = []
       for (const saved of state.connections) {
@@ -593,12 +787,14 @@ let lastSaved = ''
 
 /** Everything worth bringing back next time: the tabs, and for live ones their query tabs as they stand. */
 export function snapshotWorkspace(): WorkspaceState {
-  const { tabs, activeConnectionId, showConnect, collapsedTabGroups } = useStore.getState()
+  const { tabs, activeConnectionId, showConnect, collapsedTabGroups, chats, activeChatId } = useStore.getState()
   return {
     version: 1,
     activeConnectionId,
     showConnect,
     collapsedGroups: collapsedTabGroups,
+    chats: chats.map(saveChat),
+    activeChatId,
     connections: tabs.map((t) => {
       const store = t.session ? sessionStores.get(t.session.sessionId) : undefined
       return store ? snapshotSession(store.getState()) : (t.restore ?? { connectionId: t.connectionId, activeTabId: null, queryCounter: 0, tabs: [] })
@@ -637,7 +833,15 @@ function startPersistence(): void {
   if (persistenceOn) return
   persistenceOn = true
   useStore.subscribe((next, prev) => {
-    if (next.tabs !== prev.tabs || next.activeConnectionId !== prev.activeConnectionId || next.showConnect !== prev.showConnect || next.collapsedTabGroups !== prev.collapsedTabGroups) schedulePersist()
+    if (
+      next.tabs !== prev.tabs ||
+      next.activeConnectionId !== prev.activeConnectionId ||
+      next.showConnect !== prev.showConnect ||
+      next.collapsedTabGroups !== prev.collapsedTabGroups ||
+      next.chats !== prev.chats ||
+      next.activeChatId !== prev.activeChatId
+    )
+      schedulePersist()
   })
   // The window is closing: write whatever the debounce has not written yet, synchronously on the other side.
   window.addEventListener('beforeunload', () => {

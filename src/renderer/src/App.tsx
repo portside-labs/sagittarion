@@ -1,4 +1,4 @@
-import { useEffect, useLayoutEffect } from 'react'
+import { useEffect, useLayoutEffect, type CSSProperties } from 'react'
 import { applyAccent, applySyntax, applyTheme } from './lib/theme'
 import { isModKey } from './lib/util'
 import { groupByConnection, tabsInSight } from './lib/tab-groups'
@@ -8,6 +8,7 @@ import { ConnectScreen } from './screens/ConnectScreen'
 import { Workspace } from './screens/Workspace'
 import { ConnectionTabs } from './components/ConnectionTabs'
 import { ConnectingPane } from './components/ConnectingPane'
+import { ChatPane } from './components/ChatPane'
 import { Toasts } from './components/Toasts'
 import { ConfirmDialog } from './components/ConfirmDialog'
 import { SettingsDialog } from './components/SettingsDialog'
@@ -20,6 +21,8 @@ export default function App() {
   const ui = useStore((s) => s.ui)
   const activateTab = useStore((s) => s.activateTab)
   const platform = useStore((s) => s.appInfo?.platform)
+  const chatOpen = useStore((s) => s.chatOpen)
+  const chatWidth = useStore((s) => s.chatWidth)
   const active = tabs.find((t) => t.connectionId === activeConnectionId) ?? null
   const connectVisible = showConnect || !active
 
@@ -64,25 +67,33 @@ export default function App() {
   }, [activateTab])
 
   return (
-    <div className={`app-shell tabs-${ui.connectionTabs} ${tabs.length ? 'has-tabs' : ''}`}>
+    <div
+      className={`app-shell tabs-${ui.connectionTabs} ${tabs.length ? 'has-tabs' : ''}`}
+      // Toasts keep clear of the chat down the right side.
+      style={{ '--chat-offset': `${tabs.length ? (chatOpen ? chatWidth + 1 : 28) : 0}px` } as CSSProperties}
+    >
       {tabs.length ? <ConnectionTabs /> : null}
-      <div className="app-view">
-        {tabs.map((t) => {
-          const isActive = t.connectionId === activeConnectionId && !showConnect
-          const store = t.session ? getSessionStore(t.session.sessionId) : undefined
-          return (
-            <div key={t.connectionId} className="session-slot" hidden={!isActive} data-testid="session-slot">
-              {t.status === 'live' && store ? (
-                <SessionContext.Provider value={store}>
-                  <Workspace active={isActive} />
-                </SessionContext.Provider>
-              ) : (
-                <ConnectingPane tab={t} />
-              )}
-            </div>
-          )
-        })}
-        {connectVisible ? <ConnectScreen /> : null}
+      <div className="app-main">
+        <div className="app-view">
+          {tabs.map((t) => {
+            const isActive = t.connectionId === activeConnectionId && !showConnect
+            const store = t.session ? getSessionStore(t.session.sessionId) : undefined
+            return (
+              <div key={t.connectionId} className="session-slot" hidden={!isActive} data-testid="session-slot">
+                {t.status === 'live' && store ? (
+                  <SessionContext.Provider value={store}>
+                    <Workspace active={isActive} />
+                  </SessionContext.Provider>
+                ) : (
+                  <ConnectingPane tab={t} />
+                )}
+              </div>
+            )
+          })}
+          {connectVisible ? <ConnectScreen /> : null}
+        </div>
+        {/* The chat sits beside every connection, outside each one's view, and stays as they change. */}
+        {tabs.length ? <ChatPane /> : null}
       </div>
       <SettingsDialog />
       <ConfirmDialog />

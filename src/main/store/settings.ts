@@ -46,7 +46,7 @@ interface StoredSettings {
   ai?: StoredAi | LegacyAi
 }
 
-const DEFAULT_AGENT: AgentSettings = { schemaBudgetTokens: 8000, autoRun: true, sendSampleValues: false }
+const DEFAULT_AGENT: AgentSettings = { schemaBudgetTokens: 8000, autoRun: true, sendSampleValues: false, readResults: true }
 
 /** Provider ids as they were saved earlier map onto the current ones. */
 export function normalizeProviderId(raw: string | undefined): ProviderId {
@@ -211,6 +211,7 @@ export class SettingsStore {
     if (u.agent) {
       if (typeof u.agent.autoRun === 'boolean') ai.agent.autoRun = u.agent.autoRun
       if (typeof u.agent.sendSampleValues === 'boolean') ai.agent.sendSampleValues = u.agent.sendSampleValues
+      if (typeof u.agent.readResults === 'boolean') ai.agent.readResults = u.agent.readResults
       if (typeof u.agent.schemaBudgetTokens === 'number' && u.agent.schemaBudgetTokens >= 1000) ai.agent.schemaBudgetTokens = Math.round(u.agent.schemaBudgetTokens)
     }
     await this.persist({ ...stored, ai })

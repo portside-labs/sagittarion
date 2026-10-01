@@ -46,7 +46,7 @@ interface Draft {
   embeddingModel: string
 }
 
-const DEFAULT_AGENT: AgentSettings = { schemaBudgetTokens: 8000, autoRun: true, sendSampleValues: false }
+const DEFAULT_AGENT: AgentSettings = { schemaBudgetTokens: 8000, autoRun: true, sendSampleValues: false, readResults: true }
 
 function draftFrom(c: AiConnection, model?: string): Draft {
   return { type: c.type, provider: c.provider, baseUrl: c.baseUrl, model: model || c.defaultModel, embeddingModel: c.embeddingModel }
@@ -281,6 +281,7 @@ export function SettingsDialog() {
     draft.embeddingModel.trim() !== active.embeddingModel ||
     agent.autoRun !== settings.agent.autoRun ||
     agent.sendSampleValues !== settings.agent.sendSampleValues ||
+    (agent.readResults !== false) !== (settings.agent.readResults !== false) ||
     agent.schemaBudgetTokens !== settings.agent.schemaBudgetTokens ||
     (Object.keys(DEFAULT_PRIVACY) as (keyof PrivacySettings)[]).some((k) => privacySettings[k] !== (settings.privacy ?? DEFAULT_PRIVACY)[k])
 
@@ -835,6 +836,22 @@ export function SettingsDialog() {
               When on, up to 20 distinct values of short text columns in the tables being queried are included, so words like "paid" can be matched to
               how a status is actually stored. Table and column names and the question itself are always sent; with Local AI Privacy on, sensitive values
               among them are replaced with placeholders first.
+            </span>
+          </div>
+          <div className="field">
+            <label className="checkbox">
+              <input
+                type="checkbox"
+                checked={agent.readResults !== false}
+                onChange={(e) => setAgent({ ...agent, readResults: e.target.checked })}
+                data-testid="read-results"
+              />
+              Let the model read query results in chats across databases
+            </label>
+            <span className="hint">
+              When a chat has more than one database in context, the model can run read-only queries and read up to 50 rows of each result, to follow a
+              record from one database to the next and lay out what happened. With Local AI Privacy on, sensitive values in the results are replaced
+              with placeholders first, the same placeholder for the same value in every database. A chat on one database never sends results.
             </span>
           </div>
 

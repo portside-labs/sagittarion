@@ -18,6 +18,10 @@ sensitive values are masked on your machine before they reach the model.
   OpenRouter or Groq key, or run a model locally with Ollama or LM Studio.
   Generated SQL is read-only and checked with `EXPLAIN` before it runs.
   Instructions teach it your definitions, for every database or just one.
+- **Ask across databases.** The chat stays beside your connections, with
+  conversations in tabs and a history to pick them up again. Add several
+  databases to one and it follows a customer, an order or a request from one
+  to the next, to lay out what happened during an incident.
 - **Connectors.** Plug MCP servers into Ask, as you would in Claude Desktop,
   so a question can draw on your issue tracker, CRM or files. Choose the
   connections each one is on for, and which tools ask before they run.

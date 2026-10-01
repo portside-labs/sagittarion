@@ -1,6 +1,7 @@
 import type {
   AppInfo,
   Catalog,
+  ChatHistoryItem,
   ConnectProgress,
   ConnectionConfig,
   DatabaseInfo,
@@ -15,6 +16,7 @@ import type {
   ReaddirResult,
   RowsRequest,
   RowsResponse,
+  SavedChat,
   SearchResult,
   SessionInfo,
   SshProfile,
@@ -22,7 +24,7 @@ import type {
   TableRef,
   WorkspaceState
 } from './types'
-import type { AiConnectionInput, AiProgressEvent, AiResult, AiSettings, AiSettingsUpdate, AiTurn, AskOptions } from './ai'
+import type { AiConnectionInput, AiProgressEvent, AiResult, AiSettings, AiSettingsUpdate, AiStreamEvent, AiTurn, AskOptions } from './ai'
 import type { ConnectorInfo, ConnectorInput, ToolApprovalDecision, ToolApprovalRequest, ToolPermission } from './connectors'
 import type { Instruction, InstructionInput } from './instructions'
 import type { AiTranscript, SemanticModelStatus } from './privacy'
@@ -144,10 +146,20 @@ export interface Api {
     transcript(requestId: string, opts?: { values?: boolean }): Promise<AiTranscript | null>
     /** Step-by-step progress of running asks, keyed by requestId. */
     onProgress(cb: (e: AiProgressEvent) => void): Unsubscribe
+    /** The answer of a running ask as it is written, for providers that stream. */
+    onStream(cb: (e: AiStreamEvent) => void): Unsubscribe
     /** Answers a connector tool call waiting for approval. */
     approve(approvalId: string, decision: ToolApprovalDecision): Promise<void>
     /** Connector tool calls that need the user's approval before they run. */
     onApproval(cb: (req: ToolApprovalRequest) => void): Unsubscribe
+  }
+  /** Closed conversations, kept to find and continue: the latest 30, none older than 30 days. */
+  chats: {
+    history(): Promise<ChatHistoryItem[]>
+    /** A past conversation, taken out of the history to be a tab again. */
+    take(id: string): Promise<SavedChat | null>
+    archive(chat: SavedChat): Promise<void>
+    forget(id: string): Promise<void>
   }
   /** What the user tells the model about their data: for every database connection, or for chosen ones. */
   instructions: {

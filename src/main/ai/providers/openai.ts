@@ -4,11 +4,15 @@ import {
   classifyHttpError,
   fetchWithTimeout,
   joinUrl,
+  parseToolArgs,
   ProviderError,
   readErrorBody,
+  readEventStream,
+  STREAMING_PROVIDERS,
   type ChatMessage,
   type ChatRequest,
   type ChatResponse,
+  type CompleteOptions,
   type LlmProvider,
   type ProviderConfig,
   type ToolCall
@@ -32,22 +36,13 @@ function mapMessages(req: ChatRequest): unknown[] {
   return out
 }
 
-function parseArgs(raw: unknown): Record<string, unknown> {
-  if (raw && typeof raw === 'object') return raw as Record<string, unknown>
-  if (typeof raw !== 'string') return {}
-  try {
-    const parsed = JSON.parse(raw)
-    return parsed && typeof parsed === 'object' ? parsed : {}
-  } catch {
-    return {}
-  }
-}
-
 export class OpenAiCompatibleProvider implements LlmProvider {
   readonly kind: string
   readonly model: string
   private readonly cfg: ProviderConfig
   private readonly fetchImpl: typeof fetch
+  /** Whether to ask for token usage at the end of a stream; dropped for a server that refuses the option. */
+  private usageInStream = true
 
   constructor(cfg: ProviderConfig) {
     this.cfg = cfg
@@ -66,8 +61,9 @@ export class OpenAiCompatibleProvider implements LlmProvider {
     return h
   }
 
-  async complete(req: OutboundRequest, signal?: AbortSignal): Promise<ChatResponse> {
+  async complete(req: OutboundRequest, signal?: AbortSignal, opts?: CompleteOptions): Promise<ChatResponse> {
     if (!this.model) throw new ProviderError('No model is configured. Pick one in Settings.', 'bad_request')
+    const onText = opts?.onText && STREAMING_PROVIDERS.has(this.kind) ? opts.onText : undefined
     const body: Record<string, unknown> = { model: this.model, messages: mapMessages(req) }
     if (req.tools?.length) {
       body.tools = req.tools.map((t) => ({ type: 'function', function: { name: t.name, description: t.description, parameters: t.parameters } }))
@@ -75,13 +71,37 @@ export class OpenAiCompatibleProvider implements LlmProvider {
         body.tool_choice = typeof req.toolChoice === 'string' ? req.toolChoice : { type: 'function', function: { name: req.toolChoice.name } }
       }
     }
-    const res = await fetchWithTimeout(this.fetchImpl, joinUrl(this.cfg.baseUrl, '/chat/completions'), { method: 'POST', headers: this.headers(), body: JSON.stringify(body) }, this.cfg.timeoutMs ?? 90_000, signal)
+    if (onText) {
+      body.stream = true
+      if (this.usageInStream) body.stream_options = { include_usage: true }
+    }
+    const post = () =>
+      fetchWithTimeout(this.fetchImpl, joinUrl(this.cfg.baseUrl, '/chat/completions'), { method: 'POST', headers: this.headers(), body: JSON.stringify(body) }, this.cfg.timeoutMs ?? 90_000, signal)
+    let res = await post()
+    if (!res.ok && body.stream_options) {
+      const message = await readErrorBody(res)
+      if (!/stream_options|include_usage/i.test(message)) throw classifyHttpError(res.status, message)
+      // A server that does not know the option: stream without the usage at the end.
+      this.usageInStream = false
+      delete body.stream_options
+      res = await post()
+    }
     if (!res.ok) throw classifyHttpError(res.status, await readErrorBody(res))
+    if (onText) {
+      const streamed = await readEventStream(res, signal, onText)
+      return {
+        text: streamed.text,
+        toolCalls: streamed.toolCalls.map((c, i) => ({ id: c.id || `call_${i}`, name: c.name, args: parseToolArgs(c.args) })),
+        usage: { ...streamed.usage },
+        model: streamed.model || this.model,
+        stopReason: streamed.stopReason
+      }
+    }
     const json: any = await res.json()
     const choice = json?.choices?.[0]
     const message = choice?.message ?? {}
     const toolCalls: ToolCall[] = Array.isArray(message.tool_calls)
-      ? message.tool_calls.map((tc: any, i: number) => ({ id: String(tc.id ?? `call_${i}`), name: String(tc.function?.name ?? ''), args: parseArgs(tc.function?.arguments) }))
+      ? message.tool_calls.map((tc: any, i: number) => ({ id: String(tc.id ?? `call_${i}`), name: String(tc.function?.name ?? ''), args: parseToolArgs(tc.function?.arguments) }))
       : []
     const content = typeof message.content === 'string' ? message.content : Array.isArray(message.content) ? message.content.map((p: any) => p?.text ?? '').join('') : ''
     return {

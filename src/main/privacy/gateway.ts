@@ -10,6 +10,16 @@ import { unrestored, type PrivacySession } from './session'
 import type { SqlDialect } from './sql-regions'
 import type { TextRole } from './types'
 
+/**
+ * Streamed text up to where a placeholder may be only half written, as in "Rows for <|PII:EM": that tail waits for the
+ * rest. A "<|" that runs on too long to be one is let through.
+ */
+export function holdBackPartialMarker(text: string): string {
+  const open = text.lastIndexOf('<|')
+  if (open >= 0 && text.indexOf('|>', open) < 0 && text.length - open <= 48) return text.slice(0, open)
+  return text.endsWith('<') ? text.slice(0, -1) : text
+}
+
 export class ModelGateway {
   private sent = 0
 
@@ -46,8 +56,9 @@ export class ModelGateway {
     return this.privacy ? this.privacy.protectRequest(req) : sendUnprotected(req, this.exemption!)
   }
 
-  async send(req: OutboundRequest, signal?: AbortSignal): Promise<ChatResponse> {
-    const res = await this.provider.complete(req, signal)
+  /** `onText`: the answer's text as it is written, for providers that stream, still in placeholders. */
+  async send(req: OutboundRequest, signal?: AbortSignal, onText?: (delta: string) => void): Promise<ChatResponse> {
+    const res = await this.provider.complete(req, signal, onText ? { onText } : undefined)
     this.sent++
     return res
   }
@@ -64,6 +75,12 @@ export class ModelGateway {
 
   restoreText(text: string): Restored {
     return this.privacy ? this.privacy.restoreText(text) : unrestored(text)
+  }
+
+  /** Text still streaming, restored for display. A placeholder not yet complete at its end is held back. */
+  previewText(text: string): string {
+    const shown = holdBackPartialMarker(text)
+    return this.privacy ? this.privacy.previewText(shown) : shown
   }
 
   restoreSql(sql: string, dialect: SqlDialect): Restored {

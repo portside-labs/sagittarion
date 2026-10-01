@@ -1,14 +1,13 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
-import type { QueryTabSnapshot, RowsResult, StatementResult } from '@shared/types'
+import type { RowsResult, StatementResult } from '@shared/types'
 import { tableKey } from '@shared/connections'
 import type { TableRef } from '@shared/types'
 import type { CompletionData, TableEntry } from '@/lib/sql-complete'
 import { codeFontFamily } from '@/lib/theme'
-import { AskPanel, emptyChat, type ChatMessage, type ChatState } from './AskPanel'
 import { PaneHeader, PaneLayout, type DragHandleProps } from './PaneLayout'
 import { defaultLayout, moveLeaf, setRatio, type PaneId } from '@/lib/layout'
-import { useStore, type Tab } from '@/store'
-import { useSession, useSessionStore, type SessionState, type SessionStore } from '@/session-store'
+import { registerQueryTab, useStore, type Tab } from '@/store'
+import { takeRunOnOpen, useSession, useSessionStore, wantsRunOnOpen, type SessionState, type SessionStore } from '@/session-store'
 import { SqlEditor, type SqlEditorHandle } from './SqlEditor'
 import { ResultsView } from './ResultsView'
 import { Splitter } from './Splitter'
@@ -19,18 +18,6 @@ import { errorMessage, formatDuration, formatNumber, modKey } from '@/lib/util'
 const LIMITS = [200, 1000, 5000, 20000]
 /** Results bigger than this are not kept between launches; the query text still is. */
 const SNAPSHOT_RESULT_BYTES = 1_500_000
-
-/** A saved chat, with anything that was still running marked as cut short. */
-function restoreChat(saved: QueryTabSnapshot['chat'] | undefined): ChatState {
-  if (!saved) return emptyChat()
-  const messages = (saved.messages as ChatMessage[]).map((m): ChatMessage => {
-    if (m.role !== 'assistant') return m
-    // What an answer sent is held in memory only, so it cannot be inspected after a relaunch.
-    const { requestId: _gone, ...rest } = m
-    return rest.status === 'working' ? { ...rest, status: 'done', error: rest.error ?? 'The app was closed before this finished.' } : rest
-  })
-  return { messages, input: saved.input ?? '', requestId: null, conversationId: crypto.randomUUID() }
-}
 
 /** Column names of a table, fetching them through the store when they are not cached yet. */
 async function loadColumnsFor(store: SessionStore, ref: TableRef): Promise<string[]> {
@@ -72,8 +59,6 @@ export function QueryTab({ tab, active }: { tab: Extract<Tab, { kind: 'query' }>
   const confirm = useStore((s) => s.confirm)
   const layout = useStore((s) => s.queryLayout)
   const setLayout = useStore((s) => s.setQueryLayout)
-  const chatOpen = useStore((s) => s.chatOpen)
-  const setChatOpen = useStore((s) => s.setChatOpen)
   const ui = useStore((s) => s.ui)
 
   const editorRef = useRef<SqlEditorHandle>(null)
@@ -81,8 +66,6 @@ export function QueryTab({ tab, active }: { tab: Extract<Tab, { kind: 'query' }>
   const [snapshot] = useState(() => store.getState().querySnapshots[tab.id])
   /** Current editor text, so the editor survives being moved to another pane. */
   const sqlRef = useRef(snapshot?.sql ?? tab.initialSql)
-  const [chat, setChatState] = useState<ChatState>(() => restoreChat(snapshot?.chat))
-  const setChat = (update: (c: ChatState) => ChatState) => setChatState(update)
   const [results, setResults] = useState<StatementResult[] | null>(snapshot?.lastRun?.results ?? null)
   const [running, setRunning] = useState(false)
   const [error, setError] = useState<string | null>(snapshot?.lastRun?.error ?? null)
@@ -93,9 +76,9 @@ export function QueryTab({ tab, active }: { tab: Extract<Tab, { kind: 'query' }>
   const [lastRun, setLastRun] = useState<{ ms: number; statements: number; restored?: boolean; dropped?: boolean } | null>(
     snapshot?.lastRun ? { ms: snapshot.lastRun.ms, statements: snapshot.lastRun.statements, restored: true, dropped: Boolean(snapshot.lastRun.resultsDropped) } : null
   )
-  const hidden = useMemo(() => new Set<PaneId>(chatOpen ? [] : ['chat']), [chatOpen])
+  const hidden = useMemo(() => new Set<PaneId>(), [])
 
-  // The snapshot follows the tab: text as it is typed, the row limit, and the chat.
+  // The snapshot follows the tab: text as it is typed and the row limit.
   useEffect(() => {
     if (!snapshot) updateQuerySnapshot(tab.id, { sql: sqlRef.current, limit: maxRows })
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -103,9 +86,6 @@ export function QueryTab({ tab, active }: { tab: Extract<Tab, { kind: 'query' }>
   useEffect(() => {
     updateQuerySnapshot(tab.id, { limit: maxRows })
   }, [maxRows, tab.id, updateQuerySnapshot])
-  useEffect(() => {
-    updateQuerySnapshot(tab.id, { chat: { messages: chat.messages, input: chat.input } })
-  }, [chat, tab.id, updateQuerySnapshot])
 
   useEffect(() => {
     if (active) requestAnimationFrame(() => editorRef.current?.focus())
@@ -180,6 +160,31 @@ export function QueryTab({ tab, active }: { tab: Extract<Tab, { kind: 'query' }>
   const stop = () => {
     void window.api.db.cancel(session.sessionId)
   }
+
+  // The chat beside the connections puts its queries in this editor while the tab is in front.
+  const runRef = useRef(run)
+  runRef.current = run
+  useEffect(
+    () =>
+      registerQueryTab(tab.id, {
+        setSql: (sql) => {
+          sqlRef.current = sql
+          editorRef.current?.setValue(sql)
+        },
+        run: (sql) => void runRef.current(sql)
+      }),
+    [tab.id]
+  )
+
+  // A tab opened to run its query, as from the chat's "Run in" another database, runs it once the editor is up.
+  useEffect(() => {
+    if (!wantsRunOnOpen(tab.id)) return
+    const frame = requestAnimationFrame(() => {
+      if (takeRunOnOpen(tab.id)) void run(tab.initialSql)
+    })
+    return () => cancelAnimationFrame(frame)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
 
   useEffect(() => {
     const handler = (e: Event) => {
@@ -261,21 +266,7 @@ export function QueryTab({ tab, active }: { tab: Extract<Tab, { kind: 'query' }>
         </div>
       )
     }
-    return (
-      <AskPanel
-        sessionId={session.sessionId}
-        chat={chat}
-        setChat={setChat}
-        handle={handle}
-        running={running}
-        onCollapse={() => setChatOpen(false)}
-        onSql={(sql, runIt) => {
-          sqlRef.current = sql
-          editorRef.current?.setValue(sql)
-          if (runIt) void run(sql)
-        }}
-      />
-    )
+    return null
   }
 
   return (
@@ -312,19 +303,10 @@ export function QueryTab({ tab, active }: { tab: Extract<Tab, { kind: 'query' }>
         <button className="btn ghost icon small" onClick={() => setLayout(defaultLayout())} title="Reset the pane layout" data-testid="layout-reset">
           <Icon name="layout" />
         </button>
-        <button className={`btn small ${chatOpen ? 'active' : 'ghost'}`} onClick={() => setChatOpen(!chatOpen)} title={chatOpen ? 'Hide the plain-English chat' : 'Ask in plain English'} data-testid="ask-toggle">
-          <Icon name="chat" /> Ask
-        </button>
       </div>
       {running ? <div className="loading-bar" /> : null}
       <div className="query-body">
         <PaneLayout layout={layout} hidden={hidden} render={renderPane} onRatio={(path, ratio) => setLayout(setRatio(layout, path, ratio))} onMove={(id, target, side) => setLayout(moveLeaf(layout, id, target, side))} />
-        {!chatOpen ? (
-          <button className="ask-strip" onClick={() => setChatOpen(true)} title="Ask in plain English" data-testid="ask-strip">
-            <Icon name="chat" size={14} />
-            <span className="ask-strip-label">Ask</span>
-          </button>
-        ) : null}
       </div>
     </div>
   )

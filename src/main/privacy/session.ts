@@ -57,6 +57,7 @@ export function unrestored(text: string): Restored {
 function toolWhere(name: string): string {
   if (name === 'search_schema' || name === 'describe_table') return 'schema details'
   if (name === 'sample_values') return 'sample values'
+  if (name === 'run_query') return 'query results'
   if (name.startsWith('mcp__')) return "a connector's reply"
   return 'database feedback'
 }
@@ -127,7 +128,7 @@ export class PrivacySession {
   }
 
   /** Database values with their column as context: an email column protects whole values, notes are read as prose. */
-  async protectValues(column: ColumnContext, values: string[]): Promise<string[]> {
+  async protectValues(column: ColumnContext, values: string[], where = 'sample values'): Promise<string[]> {
     const classification = await this.engine.inferColumn(this.engine.classify(column), values, this.signal)
     const out = await this.engine.protectAll(
       values.map((text) => ({ text, ctx: { role: 'value' as const, column, classification } })),
@@ -135,7 +136,7 @@ export class PrivacySession {
       this.policy,
       this.signal
     )
-    out.forEach((p) => this.note(p.replacements, 'sample values'))
+    out.forEach((p) => this.note(p.replacements, where))
     return out.map((p) => p.text)
   }
 
@@ -245,6 +246,11 @@ export class PrivacySession {
 
   restoreText(text: string): Restored {
     return this.count(this.engine.restoreText(text, this.vault, this.policy))
+  }
+
+  /** An answer still being written, restored for display as it streams; not counted, as the finished answer is. */
+  previewText(text: string): string {
+    return this.engine.restoreText(text, this.vault, this.policy).text
   }
 
   restoreSql(sql: string, dialect: SqlDialect): Restored {

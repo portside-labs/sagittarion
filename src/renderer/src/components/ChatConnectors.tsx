@@ -12,7 +12,8 @@ export function ChatConnectorsButton({
   overrides,
   onChange
 }: {
-  connectionId: string | undefined
+  /** The chat's database connection, or all of them in a chat across several. */
+  connectionId: string | (string | undefined)[] | undefined
   overrides: Record<string, boolean> | undefined
   onChange: (next: Record<string, boolean>) => void
 }) {
@@ -89,7 +90,15 @@ export function ChatConnectorsButton({
                     <span className={`connector-dot ${c.status.state}`} />
                     <span className="connectors-menu-text">
                       <span className="connectors-menu-name">{c.name}</span>
-                      <span className="connectors-menu-sub">{c.status.state === 'error' ? 'Could not start' : usual ? connectorStatusText(c) : 'Not on for this connection by default'}</span>
+                      <span className="connectors-menu-sub">
+                        {c.status.state === 'error'
+                          ? 'Could not start'
+                          : usual
+                            ? connectorStatusText(c)
+                            : Array.isArray(connectionId)
+                              ? 'Not on for these databases by default'
+                              : 'Not on for this connection by default'}
+                      </span>
                     </span>
                     <Switch checked={on} onChange={(v) => toggle(c.id, v)} label={on ? `Stop using ${c.name} in this chat` : `Use ${c.name} in this chat`} testId="chat-connector-switch" />
                   </div>

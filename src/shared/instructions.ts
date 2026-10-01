@@ -36,3 +36,23 @@ export function instructionsFor(list: Instruction[], connectionId: string | unde
     .filter((i) => instructionApplies(i, connectionId))
     .sort((a, b) => (a.scope === b.scope ? a.createdAt - b.createdAt : a.scope === 'all' ? -1 : 1))
 }
+
+/**
+ * The instructions for a chat across several databases: the global ones, then each one written for some of them, once,
+ * with the keys of those it is for.
+ */
+export function instructionsAcross(list: Instruction[], dbs: { key: string; connectionId?: string }[]): { name: string; text: string; databases?: string[] }[] {
+  const out: { name: string; text: string; databases?: string[] }[] = instructionsFor(list, undefined).map((i) => ({ name: i.name, text: i.text }))
+  const own = new Map<string, { instruction: Instruction; keys: string[] }>()
+  for (const db of dbs) {
+    for (const i of instructionsFor(list, db.connectionId)) {
+      if (i.scope === 'all') continue
+      const entry = own.get(i.id) ?? { instruction: i, keys: [] }
+      entry.keys.push(db.key)
+      own.set(i.id, entry)
+    }
+  }
+  const ordered = [...own.values()].sort((a, b) => a.instruction.createdAt - b.instruction.createdAt)
+  for (const { instruction, keys } of ordered) out.push({ name: instruction.name, text: instruction.text, databases: keys })
+  return out
+}

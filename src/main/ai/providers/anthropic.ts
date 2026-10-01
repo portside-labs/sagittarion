@@ -3,10 +3,14 @@ import {
   classifyHttpError,
   fetchWithTimeout,
   joinUrl,
+  parseToolArgs,
   ProviderError,
   readErrorBody,
+  readEventStream,
+  STREAMING_PROVIDERS,
   type ChatRequest,
   type ChatResponse,
+  type CompleteOptions,
   type LlmProvider,
   type ProviderConfig,
   type ToolCall
@@ -54,8 +58,9 @@ export class AnthropicProvider implements LlmProvider {
     return { 'content-type': 'application/json', 'anthropic-version': VERSION, 'x-api-key': this.cfg.apiKey ?? '' }
   }
 
-  async complete(req: OutboundRequest, signal?: AbortSignal): Promise<ChatResponse> {
+  async complete(req: OutboundRequest, signal?: AbortSignal, opts?: CompleteOptions): Promise<ChatResponse> {
     if (!this.model) throw new ProviderError('No model is configured. Pick one in Settings.', 'bad_request')
+    const onText = opts?.onText && STREAMING_PROVIDERS.has(this.kind) ? opts.onText : undefined
     const body: Record<string, unknown> = {
       model: this.model,
       // Room for a long answer in words, such as one drawn from a connector's documentation.
@@ -69,8 +74,19 @@ export class AnthropicProvider implements LlmProvider {
       else if (req.toolChoice === 'none') body.tool_choice = { type: 'none' }
       else if (req.toolChoice) body.tool_choice = { type: 'tool', name: req.toolChoice.name }
     }
+    if (onText) body.stream = true
     const res = await fetchWithTimeout(this.fetchImpl, joinUrl(this.cfg.baseUrl, '/v1/messages'), { method: 'POST', headers: this.headers(), body: JSON.stringify(body) }, this.cfg.timeoutMs ?? 90_000, signal)
     if (!res.ok) throw classifyHttpError(res.status, await readErrorBody(res))
+    if (onText) {
+      const streamed = await readEventStream(res, signal, onText)
+      return {
+        text: streamed.text,
+        toolCalls: streamed.toolCalls.map((c, i) => ({ id: c.id || `toolu_${i}`, name: c.name, args: parseToolArgs(c.args) })),
+        usage: { ...streamed.usage },
+        model: streamed.model || this.model,
+        stopReason: streamed.stopReason
+      }
+    }
     const json: any = await res.json()
     const blocks: any[] = Array.isArray(json?.content) ? json.content : []
     const text = blocks

@@ -28,6 +28,8 @@ describe('wire recorder', () => {
     })
     // The adapter still reads the response normally.
     expect(await res.json()).toEqual({ ok: true })
+    // The body is recorded alongside the adapter's read, not before it, so a stream is not held back.
+    await recorder.settled()
     const [x] = recorder.exchanges
     expect(x).toMatchObject({ n: 1, kind: 'chat', method: 'POST', request: body, status: 200, response: '{"ok":true}' })
     expect(x.url).toBe('https://%E2%80%A2%E2%80%A2%E2%80%A2:%E2%80%A2%E2%80%A2%E2%80%A2@api.example.com/v1/chat/completions?api-key=%E2%80%A2%E2%80%A2%E2%80%A2&x=%E2%80%A2%E2%80%A2%E2%80%A2')
@@ -46,6 +48,7 @@ describe('wire recorder', () => {
     const huge = 'x'.repeat(2_500_000)
     const big = new WireRecorder(async () => new Response(huge))
     await big.fetch('https://api.example.com/v1/messages', { method: 'POST', body: '{}' })
+    await big.settled()
     expect(big.exchanges[0].response?.length).toBe(2_000_000)
     expect(big.exchanges[0].truncated).toEqual({ response: 2_500_000 })
   })
@@ -79,6 +82,7 @@ async function recordedAsk() {
     },
     'rows for jack@example.com; my password is hunter2'
   )
+  await provider.settled()
   const stored: StoredTranscript = {
     requestId: 'r1',
     host: 'api.openai.com',

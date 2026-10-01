@@ -4,7 +4,7 @@ import { Icon } from './Icons'
 import { clampRatio, hasVisible, zoneFor, type LayoutNode, type PaneId, type Path, type Side } from '@/lib/layout'
 
 const MIME = 'application/x-sagittarion-pane'
-const PANE_TITLES: Record<PaneId, string> = { editor: 'SQL', chat: 'Ask', results: 'Results' }
+const PANE_TITLES: Record<PaneId, string> = { editor: 'SQL', results: 'Results' }
 
 /** Spread onto the element that starts a drag, usually the pane header. */
 export interface DragHandleProps {

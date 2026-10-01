@@ -287,6 +287,11 @@ export interface AgentSettings {
   autoRun: boolean
   /** Send up to 20 distinct values of short text columns for the tables in context. */
   sendSampleValues: boolean
+  /**
+   * In a chat across several databases, let the model run read-only queries and read their results (protected like
+   * sample values), to trace records from one database to another.
+   */
+  readResults?: boolean
 }
 
 export interface ManagedAccount {
@@ -415,6 +420,8 @@ export interface AiTurn {
   question: string
   /** The query that answered it, when there was one. */
   sql?: string
+  /** The database that query was for, in a chat across several. */
+  database?: string
   /** What the model said instead, e.g. a request for clarification. */
   answer?: string
   /** The same exchange as the model saw it, placeholders in place of protected values; replayed instead of the above. */
@@ -431,9 +438,30 @@ export interface AiUsage {
   model: string
 }
 
+/** A database an answer refers to, in a chat across several. */
+export interface AiDatabaseRef {
+  connectionId: string
+  name: string
+}
+
+/** A query the model ran while looking into a question across databases, as it ran here (real values). */
+export interface AiRanQuery {
+  database: AiDatabaseRef
+  sql: string
+  /** Rows it returned, or undefined when the database rejected it. */
+  rows?: number
+  error?: string
+}
+
 export interface AiQueryResult {
   kind: 'query'
+  /** A short name for the conversation, when its first question asked for one. */
+  title?: string
   sql: string
+  /** Where the query runs, in a chat across several databases; otherwise the chat's own. */
+  database?: AiDatabaseRef
+  /** Queries the model ran on its way to this one. */
+  queries?: AiRanQuery[]
   explanation: string
   tablesUsed: string[]
   assumptions: string[]
@@ -454,6 +482,10 @@ export interface AiClarification {
   privacy?: AiPrivacyReport
   /** The model stopped at its length limit for one reply: the message ends early. */
   cutShort?: boolean
+  /** Queries the model ran to reach this answer, in a chat across several databases. */
+  queries?: AiRanQuery[]
+  /** A short name for the conversation, when its first question asked for one. */
+  title?: string
 }
 
 export interface AiCancelled {
@@ -463,7 +495,7 @@ export interface AiCancelled {
 
 export type AiResult = AiQueryResult | AiClarification | AiCancelled
 
-export type AiStage = 'index' | 'instructions' | 'retrieve' | 'sample' | 'privacy' | 'request' | 'tool' | 'check' | 'repair' | 'done' | 'error' | 'cancelled'
+export type AiStage = 'index' | 'instructions' | 'retrieve' | 'sample' | 'privacy' | 'request' | 'tool' | 'query' | 'check' | 'repair' | 'done' | 'error' | 'cancelled'
 
 /** One step of an ask, streamed to the renderer while the model works. A step is reported twice: running, then done or error. */
 export interface AiProgressEvent {
@@ -479,8 +511,18 @@ export interface AiProgressEvent {
 
 export type AiProgressStep = Omit<AiProgressEvent, 'requestId' | 'seq' | 'ts'>
 
+/** The answer of a running ask as the model writes it, restored: the whole text so far, '' to drop what was shown. */
+export interface AiStreamEvent {
+  requestId: string
+  text: string
+}
+
 /** Choices a chat makes for one ask. */
 export interface AskOptions {
   /** Connectors the chat switched on or off over their usual scope, by id. */
   connectors?: Record<string, boolean>
+  /** Other databases the chat has in context, connected: with any, the model looks across all of them. */
+  databases?: { connectionId: string; sessionId: string }[]
+  /** The conversation's first question: the model also names it, for its tab. */
+  title?: boolean
 }

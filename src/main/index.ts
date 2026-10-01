@@ -33,7 +33,9 @@ import type { HostReply } from './privacy/semantic/host'
 import { SemanticModel } from './privacy/semantic/manager'
 import { ConnectorStore, connectorInfo } from './connectors/store'
 import { InstructionStore } from './store/instructions'
-import { instructionsFor, type InstructionInput } from '@shared/instructions'
+import { ChatHistoryStore } from './store/chat-history'
+import { conversationTitle } from './ai/title'
+import { instructionsAcross, instructionsFor, type InstructionInput } from '@shared/instructions'
 import { ConnectorManager } from './connectors/manager'
 import { connectorsForAsk } from './connectors/ask'
 import { ApprovalBroker } from './connectors/approvals'
@@ -45,12 +47,12 @@ import { ModelStore } from './privacy/semantic/store'
 import type { SemanticSensitiveDataDetector } from './privacy/types'
 import { TranscriptStore, transcriptForViewer } from './privacy/transcripts'
 import { SchemaIndex, type SchemaSource } from './ai/schema-index'
-import { askDatabase } from './ai/nl2sql'
+import { askDatabase, type AgentDatabase } from './ai/nl2sql'
 import { EmbeddingCache } from './ai/embeddings'
 import type { DatabaseDriver } from './db/driver'
 import { toCsv, toJson, toSqlInserts } from '@shared/export'
 import type { OpenOptions, SessionLinkEvent } from '@shared/api'
-import type { AppInfo, ConnectionConfig, ExportRequest, ListObjectsRequest, ObjectRef, PendingChange, RowsRequest, SessionInfo, SshConfig, SshProfile, TableRef, WorkspaceState } from '@shared/types'
+import type { AppInfo, ConnectionConfig, ExportRequest, ListObjectsRequest, ObjectRef, PendingChange, RowsRequest, SavedChat, SessionInfo, SshConfig, SshProfile, TableRef, WorkspaceState } from '@shared/types'
 
 const isMac = process.platform === 'darwin'
 let mainWindow: BrowserWindow | null = null
@@ -75,6 +77,7 @@ const transcripts = new TranscriptStore()
 let semanticModel: SemanticModel
 /** The user's instructions to the model (instructions.json). */
 let instructionStore: InstructionStore
+let chatHistory: ChatHistoryStore
 /** The user's MCP servers (connectors.json) and their running clients. */
 let connectorStore: ConnectorStore
 let connectorManager: ConnectorManager
@@ -125,6 +128,63 @@ function schemaIndexFor(sessionId: string, kind: 'sqlite' | 'postgres'): Promise
     schemaIndexes.set(sessionId, pending)
   }
   return pending
+}
+
+/** A session's schema index, read once and kept; the steps say so while it is read. `name` marks another database in the chat. */
+async function indexWithProgress(sessionId: string, kind: 'sqlite' | 'postgres', onProgress: (step: AiProgressStep) => void, name?: string): Promise<SchemaIndex> {
+  const cached = schemaIndexes.get(sessionId)
+  if (cached) return cached
+  const stepId = name ? `index:${sessionId}` : 'index'
+  const message = name ? `Reading the schema of ${name}` : 'Reading the schema'
+  onProgress({ stepId, stage: 'index', status: 'running', message })
+  try {
+    const index = await schemaIndexFor(sessionId, kind)
+    onProgress({ stepId, stage: 'index', status: 'done', message, detail: `${index.tables.size.toLocaleString('en-US')} tables indexed` })
+    return index
+  } catch (err) {
+    onProgress({ stepId, stage: 'index', status: 'error', message, detail: err instanceof Error ? err.message : String(err) })
+    throw err
+  }
+}
+
+/** An open session as the agent sees a database: read-only queries, safe to run again should the link drop under them. */
+function agentDatabase(sessionId: string, index: SchemaIndex, key: string): AgentDatabase {
+  const conn = manager.get(sessionId)
+  const kind = conn.config.kind
+  return {
+    key,
+    name: conn.config.name || kind,
+    connectionId: conn.config.id || undefined,
+    kind,
+    serverVersion: conn.driver?.info()?.serverVersion ?? kind,
+    index,
+    runQuery: (sql, maxRows) => manager.read(sessionId, (d) => d.query(sql, [], maxRows, { readOnly: true })),
+    distinctValues: (ref, column) => manager.read(sessionId, (d) => distinctValuesFor(d, kind, ref, column)),
+    recentTables: recentTables.get(sessionId)
+  }
+}
+
+/**
+ * The other databases a chat has in context, each connected and its schema read. One that cannot be reached is left
+ * out of this ask, and the steps say why.
+ */
+async function contextDatabases(home: string, wanted: AskOptions['databases'], onProgress: (step: AiProgressStep) => void): Promise<{ sessionId: string; index: SchemaIndex }[]> {
+  const out: { sessionId: string; index: SchemaIndex }[] = []
+  const seen = new Set([home])
+  for (const d of Array.isArray(wanted) ? wanted : []) {
+    if (!d || typeof d.sessionId !== 'string' || seen.has(d.sessionId)) continue
+    seen.add(d.sessionId)
+    let name = 'a database'
+    try {
+      const conn = manager.get(d.sessionId)
+      name = conn.config.name || conn.config.kind
+      await manager.ready(d.sessionId)
+      out.push({ sessionId: d.sessionId, index: await indexWithProgress(d.sessionId, conn.config.kind, onProgress, name) })
+    } catch (err) {
+      onProgress({ stepId: `left-out:${d.sessionId}`, stage: 'index', status: 'error', message: `Left out ${name}`, detail: err instanceof Error ? err.message : String(err) })
+    }
+  }
+  return out
 }
 
 /** The provider behind the active connection, or behind one as typed into Settings, with its key. */
@@ -518,31 +578,28 @@ function registerIpc(): void {
       gateway = await gatewayFor(provider, baseUrl, settings.privacy, sessionId, chatId, controller.signal)
       // A link that dropped while idle is made again before the ask starts on the database.
       await manager.ready(sessionId)
-      let index: SchemaIndex
-      const cached = schemaIndexes.get(sessionId)
-      if (cached) index = await cached
-      else {
-        onProgress({ stepId: 'index', stage: 'index', status: 'running', message: 'Reading the schema' })
-        try {
-          index = await schemaIndexFor(sessionId, kind)
-          onProgress({ stepId: 'index', stage: 'index', status: 'done', message: 'Reading the schema', detail: `${index.tables.size.toLocaleString('en-US')} tables indexed` })
-        } catch (err) {
-          onProgress({ stepId: 'index', stage: 'index', status: 'error', message: 'Reading the schema', detail: err instanceof Error ? err.message : String(err) })
-          throw err
-        }
-      }
+      const index = await indexWithProgress(sessionId, kind, onProgress)
+      // With other databases in context, the model looks across them all; each is known to it by a short key.
+      const others = await contextDatabases(sessionId, opts?.databases, onProgress)
+      const sessions = [{ sessionId, index }, ...others]
+      const databases = others.length ? sessions.map((s, i) => agentDatabase(s.sessionId, s.index, `db${i + 1}`)) : undefined
       // The connectors on for this chat start now; one that cannot start is left out, and the steps say why.
       const connectors = await connectorsForAsk({
         store: connectorStore,
         manager: connectorManager,
-        connectionId: conn.config.id || undefined,
+        connectionId: databases ? databases.map((d) => d.connectionId) : conn.config.id || undefined,
         overrides: opts?.connectors && typeof opts.connectors === 'object' ? opts.connectors : undefined,
         approve: (c, tool, args, signal) => approvals.request(id, c, tool, args, signal),
         onChange: (c) => send('connectors:status', connectorInfo(c, connectorManager.status(c))),
         onProgress,
         signal: controller.signal
       })
-      const instructions = instructionsFor(await instructionStore.list(), conn.config.id || undefined)
+      // A new conversation gets a name for its tab, asked for alongside its first answer.
+      const titling = opts?.title === true ? conversationTitle(gateway, question, controller.signal) : null
+      const allInstructions = await instructionStore.list()
+      const instructions = databases
+        ? instructionsAcross(allInstructions, databases)
+        : instructionsFor(allInstructions, conn.config.id || undefined).map((i) => ({ name: i.name, text: i.text }))
       const result = await askDatabase(
         {
           kind,
@@ -554,18 +611,26 @@ function registerIpc(): void {
           runQuery: (sql, maxRows) => manager.read(sessionId, (d) => d.query(sql, [], maxRows, { readOnly: true })),
           distinctValues: (ref, column) => manager.read(sessionId, (d) => distinctValuesFor(d, kind, ref, column)),
           embeddingCache,
+          ...(databases ? { databases } : {}),
           connectors,
-          instructions: instructions.map((i) => ({ name: i.name, text: i.text })),
+          instructions,
           recentTables: recentTables.get(sessionId),
           onProgress,
+          onStream: (text) => send('ai:stream', { requestId: id, text }),
           signal: controller.signal
         },
         question,
         Array.isArray(history) ? history : []
       )
+      // The answer waits a moment for its name, not long: the tab can keep its first question instead.
+      const title = titling ? await Promise.race([titling, new Promise<null>((resolve) => setTimeout(() => resolve(null), 4000))]) : null
+      if (title && result.kind !== 'cancelled') Object.assign(result, { title })
       if (result.kind === 'query') {
-        const recent = [...new Set([...result.tablesUsed, ...(recentTables.get(sessionId) ?? [])])].slice(0, 12)
-        recentTables.set(sessionId, recent)
+        // The tables used are remembered for the database the query is for.
+        const at = result.database && databases ? databases.findIndex((d) => d.connectionId === result.database!.connectionId) : -1
+        const target = at >= 0 ? sessions[at].sessionId : sessionId
+        const recent = [...new Set([...result.tablesUsed, ...(recentTables.get(target) ?? [])])].slice(0, 12)
+        recentTables.set(target, recent)
       }
       return result
     } catch (err) {
@@ -574,6 +639,8 @@ function registerIpc(): void {
     } finally {
       aiRequests.delete(id)
       if (host) {
+        // A response body may still be landing in the record when the ask ends early.
+        await wire.settled()
         transcripts.put(sessionId, chatId, {
           requestId: id,
           host,
@@ -598,6 +665,16 @@ function registerIpc(): void {
   })
   ipcMain.handle('ai:approve', (_e, approvalId: string, decision: ToolApprovalDecision) => approvals.answer(approvalId, decision))
 
+  ipcMain.handle('chats:history', () => chatHistory.list())
+  // Opened again, a conversation is a tab once more; closed, it comes back here.
+  ipcMain.handle('chats:take', async (_e, id: string) => {
+    if (typeof id !== 'string') return null
+    const chat = await chatHistory.get(id)
+    if (chat) await chatHistory.remove(id)
+    return chat
+  })
+  ipcMain.handle('chats:archive', (_e, chat: SavedChat) => chatHistory.put(chat))
+  ipcMain.handle('chats:forget', (_e, id: string) => (typeof id === 'string' ? chatHistory.remove(id) : undefined))
   ipcMain.handle('instructions:list', () => instructionStore.list())
   ipcMain.handle('instructions:save', (_e, input: InstructionInput) => instructionStore.save(input))
   ipcMain.handle('instructions:setEnabled', (_e, id: string, enabled: boolean) => instructionStore.setEnabled(id, enabled === true))
@@ -656,6 +733,7 @@ if (!app.requestSingleInstanceLock()) {
     sshProfileStore = new SshProfileStore(path.join(userData, 'ssh-profiles.json'), codec)
     connectorStore = new ConnectorStore(path.join(userData, 'connectors.json'), codec)
     instructionStore = new InstructionStore(path.join(userData, 'instructions.json'))
+    chatHistory = new ChatHistoryStore(path.join(userData, 'chat-history.json'))
     connectorManager = new ConnectorManager({ clientInfo: { name: 'Sagittarion', version: app.getVersion() }, path: () => connectorPath() })
     workspaceStore = new WorkspaceStore(path.join(userData, 'workspace.json'))
     embeddingCache = new EmbeddingCache(path.join(userData, 'ai-cache', 'embeddings.json'))

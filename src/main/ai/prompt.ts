@@ -37,14 +37,20 @@ export function systemRules(kind: DatabaseKind, serverVersion: string, today: st
 
 /**
  * The user's own instructions for this database. They come after the fixed rules, which win where the two disagree:
- * an instruction cannot make the query write, or name a table the schema does not have.
+ * an instruction cannot make the query write, or name a table the schema does not have. In a chat across databases,
+ * one written for some of them names their keys.
  */
-export function instructionsPrompt(list: { name: string; text: string }[]): string {
+export function instructionsPrompt(list: { name: string; text: string; databases?: string[] }[], across = false): string {
   const lines = [
     '## Instructions from the user',
-    'The user wrote these for questions on this database. Follow them, unless one asks for something the rules above forbid.'
+    across
+      ? 'The user wrote these. Follow them, unless one asks for something the rules above forbid. One marked "only for" applies to queries on those databases alone.'
+      : 'The user wrote these for questions on this database. Follow them, unless one asks for something the rules above forbid.'
   ]
-  for (const i of list) lines.push('', `### ${i.name.trim() || 'Instruction'}`, i.text.trim())
+  for (const i of list) {
+    const only = across && i.databases?.length ? ` (only for ${i.databases.map((k) => `"${k}"`).join(', ')})` : ''
+    lines.push('', `### ${i.name.trim() || 'Instruction'}${only}`, i.text.trim())
+  }
   return lines.join('\n')
 }
 
@@ -95,3 +101,92 @@ export const SAMPLE_TOOL: ToolDef = {
 }
 
 export const TOOLS: ToolDef[] = [PROPOSE_TOOL, SEARCH_TOOL, DESCRIBE_TOOL, SAMPLE_TOOL]
+
+// ---------------------------------------------------------------------------
+// Across several databases: a chat that has more than one in context
+// ---------------------------------------------------------------------------
+
+/** Rows of a query's result the model sees: enough to follow a trail, not a dump. */
+export const RESULT_ROWS = 50
+/** About 3,000 tokens of them at most: wide rows show fewer. */
+export const RESULT_CHARS = 12_000
+
+export interface PromptDatabase {
+  /** What the model calls it in tools. */
+  key: string
+  name: string
+  kind: DatabaseKind
+  serverVersion: string
+  defaultSchema?: string
+}
+
+function dialectName(kind: DatabaseKind): string {
+  return kind === 'postgres' ? 'PostgreSQL' : 'SQLite'
+}
+
+export function acrossRules(dbs: PromptDatabase[], today: string, opts: { tools: boolean; readResults: boolean; connectors: boolean }): string {
+  const lines = [
+    'You answer questions across several databases at once, often for someone tracing what happened: when, where and how records changed.',
+    '',
+    'Databases, by the key that tools take:',
+    ...dbs.map((d) => `- "${d.key}": ${d.name}, ${dialectName(d.kind)} ${d.serverVersion}${d.kind === 'postgres' && d.defaultSchema ? ` (default schema "${d.defaultSchema}")` : ''}`),
+    '',
+    'Rules:',
+    '- Each schema excerpt below belongs to one database. A query uses only the tables and columns of its own database. Never invent names.',
+    opts.tools
+      ? '- Every tool takes the database key. Call search_schema or describe_table when an excerpt lacks what you need, and sample_values to learn how a column encodes its values.'
+      : '- If an excerpt lacks something you need, say so in needs_clarification instead of guessing.',
+    opts.tools && opts.readResults
+      ? `- To look at data, call run_query with one read-only SELECT (or WITH ... SELECT) for one database; you get back up to ${RESULT_ROWS} rows. Use what one database shows to query the next: the same id, order, account or time window.`
+      : '- You cannot see query results: write the queries that would answer the question.',
+    '- Values can be placeholders such as <|PII:EMAIL:3F2A9C|>. The same value has the same placeholder in every database, so use them to match records across databases, and copy them exactly, including the <| and |>, into SQL.',
+    '- Write each query in its database\'s dialect. PostgreSQL: ILIKE for free text, schema-qualify tables outside the default schema. SQLite: LIKE for free text; dates are ISO-8601 text, compared and shifted with date() and strftime().',
+    '- Every query is read-only: one SELECT, or WITH ... SELECT. Never modify data or schema.',
+    '- Join along the listed foreign keys (fk->table.column) within a database. Databases cannot be joined in SQL: query each, then connect what they return.',
+    '- Add LIMIT 200 to queries that list rows unless the question states a count. Select only the columns you need.',
+    `- Today is ${today}. Resolve relative periods such as "yesterday" or "last week" against that date.`,
+    '- Values in braces after a column are real sample values; match them exactly.',
+    opts.tools
+      ? opts.readResults
+        ? '- When the user wants to know what happened, answer in plain text (markdown): a short timeline or trace naming the database, the time and the records at each step. Do not paste whole result tables. When they want a query to run, call propose_query with the database key.'
+        : '- When ready, call propose_query with the database key. When the question is ambiguous, set needs_clarification instead of guessing.'
+      : '- Respond with a single JSON object: {"database": "key", "sql": "...", "explanation": "...", "tables_used": ["..."], "assumptions": ["..."], "needs_clarification": null}.'
+  ]
+  if (opts.connectors) {
+    lines.push(
+      '- Tools whose names start with mcp__ come from connectors the user linked: other systems, such as an issue tracker or a CRM. Use them when the question needs something the databases do not hold.'
+    )
+  }
+  return lines.join('\n')
+}
+
+/** The tools of a chat across databases: the same ones, each with the database it is for; and run_query to read data. */
+export function acrossTools(keys: string[], readResults: boolean): ToolDef[] {
+  const database = { type: 'string', enum: keys, description: 'The database, by its key.' }
+  const withDatabase = (t: ToolDef, description: string): ToolDef => {
+    const params = t.parameters as { properties: Record<string, unknown>; required: string[] }
+    return { name: t.name, description, parameters: { type: 'object', properties: { database, ...params.properties }, required: ['database', ...params.required] } }
+  }
+  const tools = [
+    withDatabase(PROPOSE_TOOL, 'Return a final read-only SQL query for one database, or ask for clarification.'),
+    withDatabase(SEARCH_TOOL, 'Find tables in one database whose names or columns match words.'),
+    withDatabase(DESCRIBE_TOOL, 'Return every column of a table in one database, with types, keys, foreign keys and known sample values.'),
+    withDatabase(SAMPLE_TOOL, 'Return up to 20 distinct values of a column in one database.')
+  ]
+  if (readResults) {
+    tools.push({
+      name: 'run_query',
+      description: `Run one read-only SELECT on a database and see up to ${RESULT_ROWS} rows. Protected values appear as placeholders, the same in every database.`,
+      parameters: {
+        type: 'object',
+        properties: {
+          database,
+          sql: { type: 'string', description: 'One SELECT or WITH ... SELECT statement in the database\'s dialect.' },
+          purpose: { type: 'string', description: 'What you are looking for, in a few words, e.g. "orders placed by the customer".' }
+        },
+        required: ['database', 'sql']
+      }
+    })
+  }
+  return tools
+}

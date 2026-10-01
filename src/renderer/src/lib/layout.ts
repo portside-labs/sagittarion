@@ -1,7 +1,7 @@
 // The query tab's pane layout: a binary tree of splits whose leaves are the
-// editor, the chat and the results. Pure functions so the tree can be tested.
+// editor and the results. Pure functions so the tree can be tested.
 
-export type PaneId = 'editor' | 'chat' | 'results'
+export type PaneId = 'editor' | 'results'
 export type Side = 'left' | 'right' | 'top' | 'bottom' | 'center'
 export type Path = ('a' | 'b')[]
 
@@ -9,17 +9,27 @@ export type LayoutNode =
   | { type: 'pane'; id: PaneId }
   | { type: 'split'; dir: 'row' | 'column'; /** Share of the first child, 0.1 to 0.9. */ ratio: number; a: LayoutNode; b: LayoutNode }
 
-export const PANE_IDS: PaneId[] = ['editor', 'chat', 'results']
+export const PANE_IDS: PaneId[] = ['editor', 'results']
 
-/** Editor above results on the left, the chat down the whole right side. */
+/** The editor above the results. */
 export function defaultLayout(): LayoutNode {
-  return {
-    type: 'split',
-    dir: 'row',
-    ratio: 0.7,
-    a: { type: 'split', dir: 'column', ratio: 0.5, a: { type: 'pane', id: 'editor' }, b: { type: 'pane', id: 'results' } },
-    b: { type: 'pane', id: 'chat' }
-  }
+  return { type: 'split', dir: 'column', ratio: 0.5, a: { type: 'pane', id: 'editor' }, b: { type: 'pane', id: 'results' } }
+}
+
+/**
+ * A saved tree without one leaf, whatever else it holds: for layouts from when the chat was a pane of the query tab.
+ * Not a layout until isValidLayout says so.
+ */
+export function withoutLeaf(value: unknown, id: string): unknown {
+  const n = value as { type?: unknown; id?: unknown; a?: unknown; b?: unknown } | null
+  if (!n || typeof n !== 'object') return value
+  if (n.type === 'pane') return n.id === id ? null : value
+  if (n.type !== 'split') return value
+  const a = withoutLeaf(n.a, id)
+  const b = withoutLeaf(n.b, id)
+  if (a === null) return b
+  if (b === null) return a
+  return { ...n, a, b }
 }
 
 export function leaves(node: LayoutNode): PaneId[] {

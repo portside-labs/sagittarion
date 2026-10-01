@@ -2078,7 +2078,7 @@ table.struct {
 .toasts {
   position: fixed;
   top: 48px;
-  right: 14px;
+  right: calc(var(--chat-offset, 0px) + 14px);
   display: flex;
   flex-direction: column;
   gap: 8px;
@@ -2958,9 +2958,6 @@ table.struct {
 .ask-strip:hover {
   color: var(--text);
   background: var(--bg-hover);
-}
-.ask-strip svg {
-  color: #e6a23c;
 }
 .ask-strip-label {
   writing-mode: vertical-rl;
@@ -4805,4 +4802,395 @@ html.drag-sorting * {
 }
 .instruction-count.warn {
   color: var(--warn);
+}
+
+/* ---- databases in a chat: its own, and others added to ask across them ---- */
+.chat-databases {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px;
+  padding: 0 2px 6px;
+}
+.chat-db {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  max-width: 180px;
+  height: 22px;
+  padding: 0 4px 0 7px;
+  border-radius: 6px;
+  background: var(--bg-fill-hover);
+  color: var(--text-muted);
+  font-size: 11.5px;
+}
+.chat-db .connector-dot {
+  width: 6px;
+  height: 6px;
+}
+.chat-db-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.chat-db-remove {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+  padding: 0;
+  border: none;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--text-dim);
+  cursor: pointer;
+}
+.chat-db-remove:hover {
+  color: var(--text);
+  background: var(--bg-fill-press);
+}
+.chat-db-add {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  height: 22px;
+  padding: 0 6px;
+  border: none;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-faint);
+  font: inherit;
+  font-size: 11.5px;
+  cursor: pointer;
+}
+.chat-db-add:hover,
+.chat-db-add.open {
+  color: var(--text);
+  background: var(--bg-hover);
+}
+.chat-db-option {
+  width: 100%;
+  border: none;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.chat-db-filter {
+  display: block;
+  width: calc(100% - 8px);
+  box-sizing: border-box;
+  margin: 4px 4px 6px;
+  font-size: 12px;
+}
+.connectors-menu-note {
+  padding: 8px 8px 4px;
+  border-top: 1px solid var(--border);
+  margin-top: 4px;
+  font-size: 11px;
+  line-height: 1.45;
+  color: var(--text-faint);
+}
+/* The database a query is for, above its SQL, in a chat across several. */
+.ask-db-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  margin-bottom: -4px;
+  font-size: 11.5px;
+  color: var(--text-faint);
+}
+.ask-toggles {
+  display: inline-flex;
+  align-items: center;
+  gap: 14px;
+  margin-left: auto;
+}
+.ask-toggles .ask-steps-toggle {
+  margin-left: 0;
+}
+/* The queries the model ran on its way to an answer. */
+.ask-queries {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.ask-query {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+.ask-query-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11.5px;
+  color: var(--text-faint);
+}
+.ask-query-db {
+  color: var(--text-muted);
+}
+.ask-query-rows.warn {
+  color: var(--warn);
+}
+.ask-query-head .ask-action {
+  margin-left: auto;
+  font-size: 11.5px;
+}
+.chat-sql.small {
+  max-height: 140px;
+  padding: 8px 10px;
+}
+
+/* ---- the chat beside the connections: down the right of the window, outside each connection's view ---- */
+.app-main {
+  flex: 1;
+  min-height: 0;
+  min-width: 0;
+  display: flex;
+}
+.chat-pane {
+  flex: 0 0 auto;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  max-width: 62vw;
+  background: var(--bg-panel);
+}
+.chat-pane[hidden] {
+  display: none;
+}
+.chat-pane .ask-panel {
+  flex: 1;
+}
+/* Level with the connection's top bar, and like it a place to drag the window by. */
+.chat-pane-header {
+  display: flex;
+  align-items: stretch;
+  gap: 2px;
+  height: var(--titlebar-h);
+  flex: 0 0 auto;
+  padding: 0;
+  border-bottom: 1px solid var(--border);
+  color: var(--text-faint);
+  user-select: none;
+  -webkit-app-region: drag;
+}
+/* Its conversations as tabs, like the query tabs beside them. */
+.chat-pane-header .chat-tabbar {
+  flex: 1;
+  min-width: 0;
+  height: auto;
+  border-bottom: none;
+  background: transparent;
+  -webkit-app-region: drag;
+}
+.chat-tabbar .tab {
+  -webkit-app-region: no-drag;
+}
+/* Tabs give up width before they scroll, so every conversation's dot stays in sight. */
+.chat-tabbar .tab {
+  flex: 0 1 auto;
+  gap: 6px;
+  min-width: 68px;
+  max-width: 170px;
+  padding: 0 4px 0 10px;
+}
+/* The one in front keeps its name readable; the others give way. */
+.chat-tabbar .tab.active {
+  flex-shrink: 0;
+}
+/* Past conversations and New chat stay at the right end, outside the strip, however many tabs there are. */
+.chat-pane-header .chat-new,
+.chat-pane-header .chat-history-button {
+  width: 34px;
+  -webkit-app-region: no-drag;
+}
+.chat-pane-header .chat-history-button {
+  border-left: 1px solid var(--border);
+  color: var(--text-faint);
+}
+.chat-pane-header .chat-history-button.open {
+  color: var(--text);
+  background: var(--bg-hover);
+}
+/* Past conversations: search, then the latest first. */
+.chat-history {
+  display: flex;
+  flex-direction: column;
+}
+.chat-history-search {
+  margin: 2px 2px 6px;
+  font-size: 12.5px;
+}
+.chat-history-item {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 7px 30px 7px 8px;
+  border-radius: 6px;
+  cursor: pointer;
+}
+.chat-history-item:hover,
+.chat-history-item:focus-visible {
+  background: var(--bg-hover);
+  outline: none;
+}
+.chat-history-title {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 12.5px;
+  color: var(--text);
+}
+.chat-history-meta,
+.chat-history-preview {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 11px;
+  color: var(--text-faint);
+}
+.chat-history-preview {
+  color: var(--text-dim);
+}
+.chat-history-delete {
+  position: absolute;
+  top: 7px;
+  right: 6px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  padding: 0;
+  border: none;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--text-dim);
+  cursor: pointer;
+  opacity: 0;
+}
+.chat-history-item:hover .chat-history-delete,
+.chat-history-item:focus-within .chat-history-delete {
+  opacity: 1;
+}
+.chat-history-delete:hover {
+  color: var(--danger);
+  background: var(--bg-fill-press);
+}
+/*
+ * A conversation's state as a dot. Quiet when nothing waits (a ring) or while the model answers (breathing grey);
+ * it stands out when the user is needed: amber for a tool to allow or a question to answer, pulsing until seen, and
+ * green or red, with a halo, for an answer or a failure not yet seen.
+ */
+.chat-dot {
+  flex: 0 0 auto;
+  width: 7px;
+  height: 7px;
+  margin: 0 1px;
+  border-radius: 50%;
+  box-shadow: inset 0 0 0 1.5px var(--text-dim);
+}
+.chat-dot.working {
+  box-shadow: none;
+  background: var(--text-muted);
+  animation: chat-dot-breathe 1.4s ease-in-out infinite;
+}
+.chat-dot.question {
+  box-shadow: none;
+  background: var(--warn);
+}
+.chat-dot.approval,
+.chat-dot.question.fresh {
+  background: var(--warn);
+  animation: chat-dot-ping 1.6s ease-out infinite;
+}
+.chat-dot.done {
+  background: var(--ok);
+  box-shadow: 0 0 0 3px var(--ok-soft), 0 0 8px color-mix(in srgb, var(--ok) 55%, transparent);
+}
+.chat-dot.error {
+  background: var(--danger);
+  box-shadow: 0 0 0 3px var(--danger-soft), 0 0 8px color-mix(in srgb, var(--danger) 55%, transparent);
+}
+@keyframes chat-dot-breathe {
+  0%,
+  100% {
+    opacity: 0.35;
+  }
+  50% {
+    opacity: 1;
+  }
+}
+@keyframes chat-dot-ping {
+  0% {
+    box-shadow: 0 0 0 0 color-mix(in srgb, var(--warn) 65%, transparent);
+  }
+  70% {
+    box-shadow: 0 0 0 7px color-mix(in srgb, var(--warn) 0%, transparent);
+  }
+  100% {
+    box-shadow: 0 0 0 0 color-mix(in srgb, var(--warn) 0%, transparent);
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .chat-dot.working,
+  .chat-dot.approval,
+  .chat-dot.question.fresh {
+    animation: none;
+  }
+  .chat-dot.approval,
+  .chat-dot.question.fresh {
+    box-shadow: 0 0 0 3px var(--warn-soft);
+  }
+}
+/* A tab whose conversation needs the user reads brighter, like an unread mail. */
+.chat-tab:has(.chat-dot.approval, .chat-dot.question.fresh, .chat-dot.done, .chat-dot.error) {
+  color: var(--text);
+}
+.chat-pane-header .chat-collapse {
+  align-self: center;
+  margin: 0 2px 0 6px;
+  color: var(--text-faint);
+}
+.chat-pane-header button {
+  -webkit-app-region: no-drag;
+}
+/* Folded away: a strip down the right edge of the window. */
+.app-main > .ask-strip {
+  height: 100%;
+  box-sizing: border-box;
+  -webkit-app-region: no-drag;
+}
+.ask-strip .chat-dot {
+  margin: 2px 0;
+}
+/* The connection in front, before the first question settles the chat on it. */
+.chat-db.following {
+  background: transparent;
+  box-shadow: inset 0 0 0 1px var(--border-strong);
+  padding-right: 7px;
+}
+/* The connection in front, when the chat is on others: one click adds it. */
+.chat-db.suggested {
+  gap: 4px;
+  padding: 0 7px 0 6px;
+  border: none;
+  background: transparent;
+  box-shadow: inset 0 0 0 1px var(--border-strong);
+  border-radius: 6px;
+  color: var(--text-faint);
+  font: inherit;
+  font-size: 11.5px;
+  cursor: pointer;
+  opacity: 0.85;
+}
+.chat-db.suggested:hover {
+  color: var(--text);
+  opacity: 1;
+  background: var(--bg-hover);
 }

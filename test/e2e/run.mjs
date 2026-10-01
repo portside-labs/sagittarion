@@ -141,6 +141,13 @@ async function main() {
 
     await page.getByTestId('connect-button').click()
     const front = (testId) => page.locator(`.session-slot:not([hidden]) [data-testid=${testId}]`)
+    // The chat sits beside the connections, outside any one's view.
+    const chatEl = (testId) => page.locator(`[data-testid=chat-pane] [data-testid=${testId}]`)
+    /** Another answer has come, and finished unfolding. */
+    const answered = async (before) => {
+      await page.waitForFunction((n) => document.querySelectorAll('[data-testid=chat-pane] [data-testid=ask-result]').length > n, before, { timeout: 30000 })
+      await page.waitForFunction(() => !document.querySelector('[data-testid=chat-pane] .chat-markdown.writing'), null, { timeout: 15000 })
+    }
     const theme = () => page.evaluate(() => [document.documentElement.dataset.theme, getComputedStyle(document.body).backgroundColor].join(' '))
     const pickTheme = async (id) => {
       await front('open-settings').click()
@@ -415,8 +422,10 @@ async function main() {
     await page.getByTestId('new-query-tab').click()
     const cm = page.locator('.tab-pane:not([hidden]) .query-tab .cm-content')
     await cm.waitFor()
-    // The chat beside the editor: without a configured provider it offers Settings, and it collapses out of the way.
-    await page.getByTestId('ask-panel').waitFor()
+    // The chat sits beside the connection, outside its view: without a configured provider it offers Settings, and it
+    // folds out of the way.
+    await page.getByTestId('chat-pane').waitFor()
+    assert((await page.locator('.session-slot [data-testid=ask-panel]').count()) === 0, 'the chat is not part of the connection view')
     assert((await page.getByTestId('ask-needs-key').count()) === 1, 'chat offers to set up a provider')
     await page.getByTestId('ask-input').fill('how many users are admins')
     await page.getByTestId('ask-button').click()
@@ -433,42 +442,30 @@ async function main() {
     await page.keyboard.press('Escape')
     await page.waitForFunction(() => !document.querySelector('[data-testid=settings-dialog]'))
     await page.getByTestId('ask-collapse').click()
-    await page.waitForFunction(() => !document.querySelector('[data-testid=ask-panel]'))
+    await page.waitForFunction(() => document.querySelector('[data-testid=chat-pane]')?.hidden === true)
     await page.getByTestId('ask-strip').waitFor()
     await shot('06b-ask-collapsed')
     await page.getByTestId('ask-strip').click()
-    await page.getByTestId('ask-panel').waitFor()
-    await page.getByTestId('ask-toggle').click()
-    await page.waitForFunction(() => !document.querySelector('[data-testid=ask-panel]'))
-    await page.getByTestId('ask-toggle').click()
     await page.getByTestId('ask-input').waitFor()
-    // Panes rearrange by dragging their headers: drop the chat on the left edge of the editor.
+    // The query tab's panes rearrange by dragging their headers: drop the results on the right edge of the editor, then reset.
     const boxOf = async (id) => await page.getByTestId(id).boundingBox()
     let [askBox, editorBox] = [await boxOf('ask-panel'), await boxOf('pane-editor')]
-    assert(askBox.x > editorBox.x, 'chat starts to the right of the editor')
-    await page.getByTestId('ask-header').dragTo(page.getByTestId('pane-editor'), { targetPosition: { x: 12, y: 80 } })
-    await page.waitForFunction(() => {
-      const a = document.querySelector('[data-testid=ask-panel]').getBoundingClientRect()
-      const e = document.querySelector('[data-testid=pane-editor]').getBoundingClientRect()
-      return a.x < e.x
-    })
-    await shot('06c-ask-moved')
-    // Drop the results on the top edge of the editor, then reset.
-    await page.getByTestId('results-header').dragTo(page.getByTestId('pane-editor'), { targetPosition: { x: 200, y: 8 } })
+    assert(askBox.x >= editorBox.x + editorBox.width, 'the chat is to the right of the editor')
+    await page.getByTestId('results-header').dragTo(page.getByTestId('pane-editor'), { targetPosition: { x: editorBox.width - 12, y: 80 } })
     await page.waitForFunction(() => {
       const r = document.querySelector('[data-testid=pane-results]').getBoundingClientRect()
       const e = document.querySelector('[data-testid=pane-editor]').getBoundingClientRect()
-      return r.y < e.y
+      return r.x > e.x
     })
+    await shot('06c-panes-moved')
     await page.getByTestId('layout-reset').click()
     await page.waitForFunction(() => {
-      const a = document.querySelector('[data-testid=ask-panel]').getBoundingClientRect()
       const e = document.querySelector('[data-testid=pane-editor]').getBoundingClientRect()
       const r = document.querySelector('[data-testid=pane-results]').getBoundingClientRect()
-      return a.x > e.x && r.y > e.y
+      return r.y > e.y
     })
     ;[askBox, editorBox] = [await boxOf('ask-panel'), await boxOf('pane-editor')]
-    assert(askBox.x > editorBox.x, 'reset puts the chat back to the right')
+    assert(askBox.x >= editorBox.x + editorBox.width, 'the chat stays to the right')
     // Model picker under the chat input: unconfigured models explain what to set up.
     await page.getByTestId('model-button').click()
     await page.getByTestId('model-menu').waitFor()
@@ -686,6 +683,25 @@ async function main() {
         const flag = (r.tools ?? []).some((t) => t.function?.name === 'mcp__crm__flag_account') && !r.messages.some((m) => m.role === 'tool')
         const question = [...r.messages].reverse().find((m) => m.role === 'user')?.content ?? ''
         const email = /<\|PII:EMAIL:[0-9A-F]{6}\|>/.exec(typeof question === 'string' ? question : JSON.stringify(question))?.[0]
+        const toolCall = (name, args) =>
+          res.end(JSON.stringify({ model: 'mock-sql', choices: [{ message: { content: null, tool_calls: [{ id: `t${r.messages.length}`, type: 'function', function: { name, arguments: JSON.stringify(args) } }] } }], usage: { prompt_tokens: 900, completion_tokens: 40 } }))
+        // Asked to name a new conversation for its tab.
+        const system = r.messages.find((m) => m.role === 'system')?.content ?? ''
+        if (/Name the conversation/.test(system)) {
+          const name = /first user/i.test(String(question)) ? 'First User Lookup' : 'User Lookup'
+          return res.end(JSON.stringify({ model: 'mock-sql', choices: [{ message: { content: `"${name}."` }, finish_reason: 'stop' }], usage: { prompt_tokens: 40, completion_tokens: 4 } }))
+        }
+        // A chat across two databases: find the user in the second, follow the email into the first by its placeholder, answer.
+        if (/across both databases/i.test(String(question))) {
+          const results = r.messages.filter((m) => m.role === 'tool')
+          if (!results.length) return toolCall('run_query', { database: 'db2', sql: 'SELECT id, email FROM users WHERE id = 1', purpose: 'the user' })
+          const found = /<\|PII:EMAIL:[0-9A-F]{6}\|>/.exec(results[0].content)?.[0] ?? 'missing'
+          if (results.length === 1) return toolCall('run_query', { database: 'db1', sql: `SELECT id, name FROM users WHERE email = '${found}'`, purpose: 'the same user here' })
+          return res.end(JSON.stringify({ model: 'mock-sql', choices: [{ message: { content: `**Timeline**\n\n1. User 1 is ${found} in both databases.` }, finish_reason: 'stop' }], usage: { prompt_tokens: 900, completion_tokens: 60 } }))
+        }
+        if (/count the users in the other database/i.test(String(question))) {
+          return toolCall('propose_query', { database: 'db2', sql: 'SELECT count(*) AS n FROM users', explanation: 'Counts the users.', tables_used: ['users'] })
+        }
         // A question a connector's documentation would answer: a long reply in markdown, without a query.
         if (/how do i use the client library/i.test(String(question))) {
           return res.end(JSON.stringify({ model: 'mock-sql', choices: [{ message: { content: DOCS_ANSWER }, finish_reason: 'stop' }], usage: { prompt_tokens: 900, completion_tokens: 700 } }))
@@ -716,9 +732,9 @@ async function main() {
       await page.locator('.toast.success', { hasText: 'Settings saved' }).waitFor()
       await page.keyboard.press('Escape')
       await page.waitForFunction(() => !document.querySelector('[data-testid=settings-dialog]'))
-      await front('ask-input').fill('Who is the user with the email radia.1@example.com?')
-      await front('ask-button').click()
-      const protectedLink = front('ask-privacy').last()
+      await chatEl('ask-input').fill('Who is the user with the email radia.1@example.com?')
+      await chatEl('ask-button').click()
+      const protectedLink = chatEl('ask-privacy').last()
       await protectedLink.waitFor({ timeout: 30000 })
       const linkText = (await protectedLink.textContent()).trim()
       assert(/^\d+ protected$/.test(linkText), `the answer says how many values were protected (${linkText})`)
@@ -752,42 +768,42 @@ async function main() {
       await page.keyboard.press('Escape')
       await page.waitForFunction(() => !document.querySelector('[data-testid=settings-dialog]'))
       // The chat's menu has it on for this connection.
-      await front('connectors-button').click()
+      await chatEl('connectors-button').click()
       const chatSwitch = page.locator('[data-testid=chat-connector][data-name=CRM] [data-testid=chat-connector-switch]')
       assert((await chatSwitch.getAttribute('aria-checked')) === 'true', 'the connector is on in a chat on its connection')
       await page.keyboard.press('Escape')
       // A tool that changes things asks first, with what it would be sent: the real email, on this computer only.
-      const answers = await front('ask-result').count()
+      const answers = await chatEl('ask-result').count()
       const before = aiRequests.length
-      await front('ask-input').fill('Flag zed@corp.io for review, then show the first user')
-      await front('ask-button').click()
-      const approval = front('tool-approval')
+      await chatEl('ask-input').fill('Flag zed@corp.io for review, then show the first user')
+      await chatEl('ask-button').click()
+      const approval = chatEl('tool-approval')
       await approval.waitFor({ timeout: 30000 })
       const asking = await approval.textContent()
       assert(asking.includes('Flag an account') && asking.includes('zed@corp.io'), `the approval names the tool and shows the real value it would get (${asking})`)
       await shot('06j-connector-approval')
       await approval.getByTestId('tool-allow-once').click()
-      await page.waitForFunction((n) => document.querySelectorAll('.session-slot:not([hidden]) [data-testid=ask-result]').length > n, answers, { timeout: 30000 })
+      await answered(answers)
       const sent = aiRequests.slice(before)
       assert(sent.length === 2 && sent[1].includes('Flagged <|PII:EMAIL:'), 'the connector\'s reply reached the model with the email protected')
       assert(sent[1].includes('plan Pro'), 'the read-only lookup ran without asking')
       assert(!sent.join('\n').includes('zed@corp.io'), 'the email never reached the model')
       // Switched off for this chat, the model is not offered its tools.
-      await front('connectors-button').click()
+      await chatEl('connectors-button').click()
       await chatSwitch.click()
       await page.keyboard.press('Escape')
       const beforeOff = aiRequests.length
-      await front('ask-input').fill('Show the first user')
-      await front('ask-button').click()
-      await page.waitForFunction((n) => document.querySelectorAll('.session-slot:not([hidden]) [data-testid=ask-result]').length > n, answers + 1, { timeout: 30000 })
+      await chatEl('ask-input').fill('Show the first user')
+      await chatEl('ask-button').click()
+      await answered(answers + 1)
       assert(!aiRequests.slice(beforeOff).join('\n').includes('mcp__crm__'), 'a connector switched off in the chat offers no tools')
       console.log('connectors: added in Settings, scoped to a connection, asked first, protected, and switched off per chat')
       // An answer in words comes whole, as markdown.
-      const shownAnswers = await front('ask-result').count()
-      await front('ask-input').fill('How do I use the client library?')
-      await front('ask-button').click()
-      await page.waitForFunction((n) => document.querySelectorAll('.session-slot:not([hidden]) [data-testid=ask-result]').length > n, shownAnswers, { timeout: 30000 })
-      const docs = front('ask-result').last()
+      const shownAnswers = await chatEl('ask-result').count()
+      await chatEl('ask-input').fill('How do I use the client library?')
+      await chatEl('ask-button').click()
+      await answered(shownAnswers)
+      const docs = chatEl('ask-result').last()
       await docs.locator('.chat-markdown h2', { hasText: 'Using the client' }).waitFor()
       assert((await docs.locator('.chat-markdown ol li').count()) === 2, 'the answer\'s list is a list')
       assert((await docs.locator('.chat-markdown .md-code', { hasText: 'connect()' }).count()) === 1, 'inline code is code')
@@ -822,18 +838,128 @@ async function main() {
       await page.keyboard.press('Escape')
       await page.waitForFunction(() => !document.querySelector('[data-testid=settings-dialog]'))
       const beforeAsk = aiRequests.length
-      const answersNow = await front('ask-result').count()
-      await front('ask-input').fill('What was revenue last month?')
-      await front('ask-button').click()
-      await page.waitForFunction((n) => document.querySelectorAll('.session-slot:not([hidden]) [data-testid=ask-result]').length > n, answersNow, { timeout: 30000 })
+      const answersNow = await chatEl('ask-result').count()
+      await chatEl('ask-input').fill('What was revenue last month?')
+      await chatEl('ask-button').click()
+      await answered(answersNow)
       const sentNow = aiRequests.slice(beforeAsk).join('\n')
       assert(sentNow.includes('GLOBAL-RULE-7Q') && sentNow.includes('FRONT-RULE-3K'), 'the global instruction and this connection\'s reach the model')
       assert(!sentNow.includes('OTHER-RULE-9Z'), 'another connection\'s instruction does not')
-      const ruled = front('ask-result').last()
+      const ruled = chatEl('ask-result').last()
       assert(!(await ruled.textContent()).includes('RULE-'), 'instructions are not shown in the chat')
       await ruled.locator('.ask-steps-toggle').click()
       assert((await ruled.locator('.ask-step', { hasText: 'Following 2 instructions' }).textContent()).includes('Revenue, This database'), 'the steps name the instructions followed')
       console.log('instructions: global and per connection reach the model, named in the steps, never shown in the chat')
+
+      // ------------------------------------------------------------ a chat across databases
+      const otherName = 'E2E local file'
+      const userEmail = sqlite(db, 'SELECT email FROM users WHERE id = 1')
+      await chatEl('chat-db-add').click()
+      await page.locator(`[data-testid=chat-db-option][data-name="${otherName}"]`).click()
+      // It connects in the background: its tab joins the strip, and the chat's stays in front.
+      await chatEl('chat-db').and(page.locator(`[data-name="${otherName}"][data-state=connected]`)).waitFor({ timeout: 30000 })
+      assert((await page.getByTestId('conn-tab').count()) === 2, 'the database added to the chat connected in a tab of its own')
+      assert((await page.locator('[data-testid=conn-tab][aria-selected=true] .conn-tab-name').textContent()).trim() === frontName, 'the chat stays in front')
+      const beforeAcross = aiRequests.length
+      const answersAcross = await chatEl('ask-result').count()
+      await chatEl('ask-input').fill('Trace user 1 across both databases')
+      await chatEl('ask-button').click()
+      await answered(answersAcross)
+      const sentAcross = aiRequests.slice(beforeAcross)
+      assert(sentAcross.length === 3, `two queries, then the answer (${sentAcross.length} requests)`)
+      assert(sentAcross[0].includes(`\\"db1\\": ${frontName}`) && sentAcross[0].includes(`\\"db2\\": ${otherName}`), 'the model is told about both databases')
+      assert(sentAcross[0].includes('Elsewhere (only for \\"db2\\")'), "the other database's instruction comes along, marked as its own")
+      assert(sentAcross[2].includes('the same user here') || sentAcross[2].includes('run_query'), 'the second query went to the model as a tool call')
+      assert(!sentAcross.join('\n').includes(userEmail), 'the email in the query results never reached the model')
+      const traced = chatEl('ask-result').last()
+      assert((await traced.locator('.chat-markdown').textContent()).includes(`${userEmail} in both databases`), 'the answer shows the real email')
+      await traced.getByTestId('ask-queries-toggle').click()
+      const ranOn = await traced.getByTestId('ask-query').evaluateAll((els) => els.map((e) => e.dataset.database))
+      assert(ranOn.join() === `${otherName},${frontName}`, `the queries the model ran are listed with their databases (${ranOn.join()})`)
+      assert((await traced.getByTestId('ask-query').last().textContent()).includes(userEmail), 'a query that ran shows the real value it used')
+      assert((await traced.getByTestId('ask-privacy').count()) === 1, 'the answer says what was protected')
+      await traced.screenshot({ path: path.join(artifacts, '06m-across-databases.png') })
+      // A query for the other database waits there: "Run in" opens a tab on it and runs it.
+      const answersPropose = await chatEl('ask-result').count()
+      await chatEl('ask-input').fill('Count the users in the other database')
+      await chatEl('ask-button').click()
+      await answered(answersPropose)
+      const proposed = chatEl('ask-result').last()
+      assert((await proposed.getByTestId('ask-db-label').textContent()).includes(otherName), 'the answer names the database its query is for')
+      assert((await proposed.getByTestId('ask-auto-ran').count()) === 0, 'a query for another database does not run in this one')
+      await proposed.getByTestId('ask-run-in').click()
+      await page.waitForFunction((n) => document.querySelector('[data-testid=conn-tab][aria-selected=true] .conn-tab-name')?.textContent.trim() === n, otherName)
+      await front('result-grid').waitFor({ timeout: 20000 })
+      // The chat stayed where it was as the connection in front changed.
+      assert((await chatEl('ask-result').count()) === answersPropose + 1, 'the chat keeps its conversation across connections')
+      await shot('06n-chat-beside-another-connection')
+      console.log('across databases: added to the chat, traced by placeholder, listed, and run where they belong')
+      // Back to the chat's connection, without the other database.
+      await page.locator('[data-testid=conn-tab]', { hasText: otherName }).hover()
+      await page.locator('[data-testid=conn-tab]', { hasText: otherName }).getByTestId('conn-tab-close').click()
+      await page.waitForFunction(() => document.querySelectorAll('[data-testid=conn-tab]').length === 1)
+      await chatEl('chat-db').and(page.locator(`[data-name="${otherName}"]`)).getByTestId('chat-db-remove').click()
+      assert((await chatEl('chat-db').count()) === 1, 'the chat is back to its own database')
+
+      // ------------------------------------------------------------ conversations in tabs
+      const chatTab = (n) => chatEl('chat-tab').nth(n)
+      assert((await chatEl('chat-tab').count()) === 1, 'the chat starts with one conversation')
+      const firstAnswers = await chatEl('ask-result').count()
+      await chatEl('chat-tab-new').click()
+      assert((await chatEl('chat-tab').count()) === 2, 'a new conversation opens in a tab of its own')
+      assert((await chatTab(1).getAttribute('aria-selected')) === 'true', 'and comes to the front')
+      assert((await chatEl('ask-result').count()) === 0, 'it starts empty')
+      assert((await chatEl('chat-db').count()) === 1 && (await chatEl('chat-db').getAttribute('data-name')) === frontName, 'it follows the connection in front')
+      await chatEl('ask-input').fill('Show the first user')
+      await chatEl('ask-button').click()
+      await answered(0)
+      await page.waitForFunction(() => document.querySelectorAll('[data-testid=chat-pane] [data-testid=chat-tab]')[1]?.dataset.title === 'First User Lookup')
+      // Asked once, with its first question, protected like any request.
+      const named = aiRequests.filter((b) => b.includes('Name the conversation'))
+      assert(named.length === 2 && !named.join('\n').includes('radia.1@example.com'), 'each conversation is named once, from its first question')
+      // A third, closed again: the one beside it comes to the front.
+      await chatEl('chat-tab-new').click()
+      assert((await chatEl('chat-tab').count()) === 3, 'another conversation opens')
+      await chatTab(2).getByTestId('chat-tab-close').click()
+      assert((await chatEl('chat-tab').count()) === 2, 'a closed conversation goes')
+      assert((await chatTab(1).getAttribute('aria-selected')) === 'true', 'the one beside it comes to the front')
+      // The first conversation is as it was.
+      await chatTab(0).click()
+      assert((await chatEl('ask-result').count()) === firstAnswers, 'the first conversation is as it was')
+      // New chat stays at the right end of the header, and ⌘T in the chat opens one, not a query tab.
+      const [plusBox, paneBox] = [await chatEl('chat-tab-new').boundingBox(), await page.getByTestId('chat-pane').boundingBox()]
+      assert(Math.abs(plusBox.x + plusBox.width - (paneBox.x + paneBox.width)) <= 1, 'New chat sits at the right end of the header')
+      assert((await chatEl('chat-tab-new').getAttribute('title')).startsWith('New chat'), 'and says what it does')
+      const queryTabs = await page.locator('.session-slot:not([hidden]) .tabbar .tab').count()
+      await chatEl('ask-input').click()
+      await page.keyboard.press(`${mod}+t`)
+      await page.waitForFunction(() => document.querySelectorAll('[data-testid=chat-pane] [data-testid=chat-tab]').length === 3)
+      assert((await page.locator('.session-slot:not([hidden]) .tabbar .tab').count()) === queryTabs, '⌘T in the chat opens no query tab')
+      await page.waitForFunction(() => document.activeElement?.dataset.testid === 'ask-input')
+      await chatTab(2).getByTestId('chat-tab-close').click()
+      await chatTab(0).click()
+      assert((await chatEl('ask-result').count()) === firstAnswers, 'the first conversation is in front again')
+      await chatEl('ask-header').screenshot({ path: path.join(artifacts, '06o-chat-tabs.png') })
+      console.log('conversations in tabs: opened, named, closed, switched, and opened with ⌘T')
+
+      // ------------------------------------------------------------ past conversations
+      await chatTab(1).getByTestId('chat-tab-close').click()
+      assert((await chatEl('chat-tab').count()) === 1, 'the conversation closes')
+      await chatEl('chat-history-button').click()
+      const pastItem = page.locator('[data-testid=chat-history-item][data-title="First User Lookup"]')
+      await pastItem.waitFor()
+      await page.getByTestId('chat-history-search').fill('first user')
+      assert((await page.getByTestId('chat-history-item').count()) === 1, 'the history finds it by its words')
+      await page.getByTestId('chat-history-search').fill('no such thing')
+      assert((await page.getByTestId('chat-history-item').count()) === 0, 'and leaves out what does not match')
+      await page.getByTestId('chat-history-search').fill('')
+      await page.getByTestId('chat-history').screenshot({ path: path.join(artifacts, '06p-chat-history.png') })
+      await pastItem.click()
+      await page.waitForFunction(() => document.querySelectorAll('[data-testid=chat-pane] [data-testid=chat-tab]').length === 2)
+      assert((await chatTab(1).getAttribute('data-title')) === 'First User Lookup' && (await chatTab(1).getAttribute('aria-selected')) === 'true', 'it opens again in a tab')
+      assert((await chatEl('ask-result').count()) === 1, 'with its conversation')
+      await chatTab(0).click()
+      console.log('past conversations: kept when closed, found, and continued')
     } finally {
       ai.close()
     }
@@ -980,6 +1106,9 @@ async function main() {
     await page.getByTestId('conn-tab').nth(1).waitFor({ timeout: 15000 })
     assert((await theme()) === 'cobalt rgb(24, 25, 28)', 'the theme comes back after a restart')
     assert((await page.getByTestId('conn-tab').count()) === 2, 'both connection tabs come back')
+    const chatTabs = page.locator('[data-testid=chat-pane] [data-testid=chat-tab]')
+    assert((await chatTabs.count()) === 2 && (await chatTabs.nth(1).getAttribute('data-title')) === 'First User Lookup', 'the conversations come back in their tabs')
+    assert((await chatTabs.nth(0).getAttribute('aria-selected')) === 'true', 'with the one that was in front')
     assert((await page.locator('[data-testid=conn-tab] .conn-tab-name').allTextContents()).join() === 'E2E local file,E2E via profile', 'the tabs come back in the order they were dragged into')
     assert((await connTab('E2E via profile').getAttribute('aria-selected')) === 'true', 'the connection that was in front is in front again')
     await front('tree-table-users').waitFor({ timeout: 30000 })

@@ -1,6 +1,6 @@
 import { contextBridge, ipcRenderer, type IpcRendererEvent } from 'electron'
 import type { Api, ConnectProgressEvent, SessionLinkEvent } from '@shared/api'
-import type { AiProgressEvent } from '@shared/ai'
+import type { AiProgressEvent, AiStreamEvent } from '@shared/ai'
 import type { SemanticModelStatus } from '@shared/privacy'
 import type { ConnectorInfo, ToolApprovalRequest } from '@shared/connectors'
 
@@ -75,8 +75,15 @@ const api: Api = {
     forget: (conversationId, opts) => ipcRenderer.invoke('ai:forget', conversationId, opts ?? {}),
     transcript: (requestId, opts) => ipcRenderer.invoke('ai:transcript', requestId, opts ?? {}),
     onProgress: (cb) => subscribe<AiProgressEvent>('ai:progress', cb),
+    onStream: (cb) => subscribe<AiStreamEvent>('ai:stream', cb),
     approve: (approvalId, decision) => ipcRenderer.invoke('ai:approve', approvalId, decision),
     onApproval: (cb) => subscribe<ToolApprovalRequest>('ai:approval', cb)
+  },
+  chats: {
+    history: () => ipcRenderer.invoke('chats:history'),
+    take: (id) => ipcRenderer.invoke('chats:take', id),
+    archive: (chat) => ipcRenderer.invoke('chats:archive', chat),
+    forget: (id) => ipcRenderer.invoke('chats:forget', id)
   },
   instructions: {
     list: () => ipcRenderer.invoke('instructions:list'),

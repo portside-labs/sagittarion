@@ -1,55 +1,29 @@
+// The chat beside the connections: one conversation for the window, kept while the user moves between connections. It
+// follows the connection in front until the first question, then keeps the databases it has in context, to which more
+// can be added to ask across them.
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties, type ReactNode } from 'react'
 import { createPortal } from 'react-dom'
-import type { AiProgressEvent, AiResult, AiTurn, CatalogModel } from '@shared/ai'
+import type { AiProgressEvent, AiProgressStep, AiRanQuery, AiTurn, AiUsage, CatalogModel } from '@shared/ai'
 import { BYOK_PROVIDERS, LOCAL_PROVIDERS, MODEL_CATALOG, PROVIDERS, activeConnection, connectionReady, modelTitle, prettyModelName, vendorOf } from '@shared/ai'
 import { describeCounts, type AiPrivacyReport } from '@shared/privacy'
 import type { ToolApprovalDecision, ToolApprovalRequest } from '@shared/connectors'
-import { useStore } from '@/store'
-import { useSession } from '@/session-store'
+import { getSessionStore, useStore } from '@/store'
+import { chatStatus, chatTitle, type ChatMessage, type ChatState, type ChatStep } from '@/lib/chat'
 import { SqlCode } from './SqlCode'
 import { Icon } from './Icons'
-import { PaneHeader, type DragHandleProps } from './PaneLayout'
 import { ExchangeInspector } from './ExchangeInspector'
 import { ChatConnectorsButton, ToolApprovalCard } from './ChatConnectors'
-import { ChatMarkdown } from './ChatMarkdown'
-import { errorMessage } from '@/lib/util'
+import { RevealedMarkdown } from './RevealedMarkdown'
+import { revealFrom } from '@/lib/reveal'
+import { ChatDatabases } from './ChatDatabases'
+import { ChatDot } from './ChatDot'
+import { ChatHistoryButton } from './ChatHistory'
+import { errorMessage, isModKey, modKey } from '@/lib/util'
 
-type Step = AiProgressEvent & { endedAt?: number }
+type Step = ChatStep
 
 /** A catalogue model as listed in the menu, tied to a saved connection when one offers it. */
 type MenuModel = CatalogModel & { connectionId?: string; connectionName?: string }
-
-export type ChatMessage =
-  | { id: string; role: 'user'; text: string; ts: number }
-  | {
-      id: string
-      role: 'assistant'
-      question: string
-      ts: number
-      status: 'working' | 'done'
-      steps: Step[]
-      result?: AiResult
-      error?: string
-      stepsOpen?: boolean
-      endedAt?: number
-      /** The ask behind this answer, for "What was sent". Not kept across relaunches: that record lives in memory. */
-      requestId?: string
-    }
-
-/** Conversation state lives in the query tab so the pane can be moved or hidden without losing it. */
-export interface ChatState {
-  messages: ChatMessage[]
-  input: string
-  requestId: string | null
-  /** Scopes Local AI Privacy's placeholders to this chat. New for every chat and after a relaunch; never saved. */
-  conversationId: string
-  /** Connectors this chat switched on or off over their usual scope, by id. */
-  connectors?: Record<string, boolean>
-}
-
-export function emptyChat(): ChatState {
-  return { messages: [], input: '', requestId: null, conversationId: crypto.randomUUID() }
-}
 
 /** "🔒 6 protected", with the kinds in the tooltip; opens what was sent and the values behind it. Nothing when the answer
  * was not protected. */
@@ -73,17 +47,6 @@ function privacyLink(p: AiPrivacyReport | undefined, onOpen?: () => void): React
   )
 }
 
-export interface AskPanelProps {
-  sessionId: string
-  chat: ChatState
-  setChat: (update: (c: ChatState) => ChatState) => void
-  handle: DragHandleProps
-  /** Puts generated SQL in the editor and optionally runs it. */
-  onSql: (sql: string, run: boolean) => void
-  running: boolean
-  onCollapse: () => void
-}
-
 function formatTokens(n: number): string {
   return n >= 10_000 ? `${(n / 1000).toFixed(0)}k` : n >= 1000 ? `${(n / 1000).toFixed(1)}k` : String(n)
 }
@@ -92,18 +55,122 @@ function formatMs(ms: number): string {
   return ms >= 1000 ? `${(ms / 1000).toFixed(1)}s` : `${Math.max(0, Math.round(ms))}ms`
 }
 
+function emptyUsage(): AiUsage {
+  return { inputTokens: 0, outputTokens: 0, cachedInputTokens: 0, requests: 0, toolCalls: 0, provider: '', model: '' }
+}
+
+/** A progress event in the message being worked on: a new step, or the next state of one already there. */
+function withStep(m: ChatMessage, e: AiProgressEvent): ChatMessage {
+  if (m.role !== 'assistant' || m.status !== 'working') return m
+  const i = m.steps.findIndex((s) => s.stepId === e.stepId)
+  const steps = m.steps.slice()
+  // A step that arrives finished (a note such as "Protected more values") took no time of its own.
+  if (i < 0) steps.push(e.status === 'running' ? e : { ...e, endedAt: e.ts })
+  else steps[i] = { ...steps[i], ...e, ts: steps[i].ts, endedAt: e.status === 'running' ? undefined : e.ts }
+  return { ...m, steps }
+}
+
+/** The conversations as tabs, like the query tabs beside them, each named by the question it began with. */
+function ChatTabs({
+  chats,
+  activeChatId,
+  waiting,
+  onSelect,
+  onClose
+}: {
+  chats: ChatState[]
+  activeChatId: string
+  /** A tool in that conversation's ask waits for the user's yes or no. */
+  waiting: (chat: ChatState) => boolean
+  onSelect: (id: string) => void
+  onClose: (id: string) => void
+}) {
+  const stripRef = useRef<HTMLDivElement>(null)
+  // A tab coming to the front, a new one most of all, scrolls into sight.
+  useEffect(() => {
+    stripRef.current?.querySelector('.chat-tab.active')?.scrollIntoView({ block: 'nearest', inline: 'nearest' })
+  }, [activeChatId, chats.length])
+  return (
+    <div className="tabbar chat-tabbar" ref={stripRef} role="tablist" aria-label="Conversations">
+      {chats.map((c) => {
+        const title = chatTitle(c)
+        const first = c.messages.find((m) => m.role === 'user')
+        const busy = Boolean(c.requestId)
+        const status = chatStatus(c, busy && waiting(c))
+        return (
+          <div
+            key={c.id}
+            role="tab"
+            aria-selected={c.id === activeChatId}
+            className={`tab chat-tab ${c.id === activeChatId ? 'active' : ''}`}
+            onClick={() => onSelect(c.id)}
+            onAuxClick={(e) => {
+              if (e.button === 1) onClose(c.id)
+            }}
+            title={first && first.role === 'user' ? first.text : 'A new conversation'}
+            data-testid="chat-tab"
+            data-title={title}
+            data-status={status}
+          >
+            <ChatDot status={status} unread={c.unread} />
+            <span className="tab-title">{title}</span>
+            <button
+              className="tab-close"
+              title={busy ? 'Stop and close this conversation' : 'Close this conversation'}
+              onClick={(e) => {
+                e.stopPropagation()
+                onClose(c.id)
+              }}
+              data-testid="chat-tab-close"
+            >
+              <Icon name="x" size={11} />
+            </button>
+          </div>
+        )
+      })}
+    </div>
+  )
+}
+
 const EXAMPLES = ['top 10 customers by revenue last quarter', 'orders from this month with no invoice', 'how many users signed up per week this year']
 
-/** The plain-English chat pane of a query tab. */
-export function AskPanel({ sessionId, chat, setChat, handle, onSql, running, onCollapse }: AskPanelProps) {
+/** The plain-English chat beside the connections. */
+export function AskPanel({ onCollapse }: { onCollapse: () => void }) {
   const settings = useStore((s) => s.settings)
   const setSettingsOpen = useStore((s) => s.setSettingsOpen)
-  const setStatus = useSession((s) => s.setStatus)
-  const dialect = useSession((s) => s.session?.kind) ?? 'sqlite'
-  /** The saved connection, which decides the connectors on by default. */
-  const connectionId = useSession((s) => s.session?.connectionId)
+  const chats = useStore((s) => s.chats)
+  const activeChatId = useStore((s) => s.activeChatId)
+  const updateChat = useStore((s) => s.updateChat)
+  const updateChats = useStore((s) => s.updateChats)
+  const newChat = useStore((s) => s.newChat)
+  const selectChat = useStore((s) => s.selectChat)
+  const closeChat = useStore((s) => s.closeChat)
+  /** The conversation in front. */
+  const chat = chats.find((c) => c.id === activeChatId) ?? chats[0]
+  const setChat = (update: (c: ChatState) => ChatState) => updateChat(chat.id, update)
+  const connections = useStore((s) => s.connections)
+  const tabs = useStore((s) => s.tabs)
+  const activeConnectionId = useStore((s) => s.activeConnectionId)
+  const showConnect = useStore((s) => s.showConnect)
+  const ensureSession = useStore((s) => s.ensureSession)
+  const openSql = useStore((s) => s.openSql)
+  /** The connection in front, when one is. */
+  const frontId = !showConnect && activeConnectionId && tabs.some((t) => t.connectionId === activeConnectionId) ? activeConnectionId : null
+  /** The databases in context that still exist, in the order added; the first is the chat's own. */
+  const pinned = (chat.databases ?? []).filter((id) => connections.some((c) => c.id === id))
+  /** Until the first question the chat follows the connection in front. */
+  const following = !pinned.length
+  const inContext = following ? (frontId ? [frontId] : []) : pinned
+  const homeId = inContext[0]
+  const nameOf = (id: string | undefined) => connections.find((c) => c.id === id)?.name ?? 'the database'
+  const kindOf = (id: string | undefined) => connections.find((c) => c.id === id)?.kind ?? 'sqlite'
+  const dialect = kindOf(homeId)
+  /** Asks cancelled while the chat was still connecting their databases, before they reached the main process. */
+  const cancelledRef = useRef(new Set<string>())
   /** Connector tool calls waiting for the user, shown in the answer being worked on. */
-  const [approvals, setApprovals] = useState<ToolApprovalRequest[]>([])
+  const approvals = useStore((s) => s.approvals)
+  const addApproval = useStore((s) => s.addApproval)
+  const dropApprovals = useStore((s) => s.dropApprovals)
   const toast = useStore((s) => s.toast)
 
   const listRef = useRef<HTMLDivElement>(null)
@@ -129,42 +196,26 @@ export function AskPanel({ sessionId, chat, setChat, handle, onSql, running, onC
   const lastAssistant = [...messages].reverse().find((m): m is Extract<ChatMessage, { role: 'assistant' }> => m.role === 'assistant')
   const awaitingReply = lastAssistant?.status === 'done' && lastAssistant.result?.kind === 'clarify'
 
-  // Only this chat's: every query tab's chat hears every request.
-  const requestIdRef = useRef(chat.requestId)
-  requestIdRef.current = chat.requestId
+  // The chat's own asks, in any of its tabs: each answer shows the ones for its request.
   useEffect(
     () =>
       window.api.ai.onApproval((req) => {
-        if (req.requestId === requestIdRef.current) setApprovals((list) => [...list, req])
+        if (useStore.getState().chats.some((c) => c.requestId === req.requestId)) addApproval(req)
       }),
     []
   )
 
   const answerApproval = (req: ToolApprovalRequest, decision: ToolApprovalDecision) => {
-    setApprovals((list) => list.filter((a) => a.approvalId !== req.approvalId))
+    dropApprovals((a) => a.approvalId === req.approvalId)
     void window.api.ai.approve(req.approvalId, decision)
   }
 
   // Progress events for the ask in flight update the working message in place.
   useEffect(() => {
     return window.api.ai.onProgress((e) => {
-      setChat((c) => {
-        if (e.requestId !== c.requestId) return c
-        return {
-          ...c,
-          messages: c.messages.map((m) => {
-            if (m.role !== 'assistant' || m.status !== 'working') return m
-            const i = m.steps.findIndex((s) => s.stepId === e.stepId)
-            const steps = m.steps.slice()
-            // A step that arrives finished (a note such as "Protected more values") took no time of its own.
-            if (i < 0) steps.push(e.status === 'running' ? e : { ...e, endedAt: e.ts })
-            else steps[i] = { ...steps[i], ...e, ts: steps[i].ts, endedAt: e.status === 'running' ? undefined : e.ts }
-            return { ...m, steps }
-          })
-        }
-      })
+      updateChats((c) => (e.requestId === c.requestId ? { ...c, messages: c.messages.map((m) => withStep(m, e)) } : c))
     })
-  }, [setChat])
+  }, [updateChats])
 
   // Keep elapsed times moving while a step runs.
   useEffect(() => {
@@ -173,15 +224,31 @@ export function AskPanel({ sessionId, chat, setChat, handle, onSql, running, onC
     return () => clearInterval(t)
   }, [asking])
 
-  // A chat's placeholders stay in memory only while the chat is in use: forget them on reset or when the pane goes.
-  const conversationId = chat.conversationId
-  useEffect(() => () => void window.api.ai.forget(conversationId), [conversationId])
+  // The answer being written, as it streams.
+  useEffect(
+    () =>
+      window.api.ai.onStream((e) =>
+        updateChats((c) =>
+          c.requestId !== e.requestId
+            ? c
+            : { ...c, messages: c.messages.map((m) => (m.role === 'assistant' && m.status === 'working' && m.requestId === e.requestId ? { ...m, draft: e.text } : m)) }
+        )
+      ),
+    [updateChats]
+  )
 
-  // Follow the conversation.
+  // Follow the conversation: to its end when it changes, and as an answer unfolds, unless the user scrolled up to read.
+  const atEnd = useRef(true)
+  const follow = useCallback(() => {
+    const el = listRef.current
+    if (el && atEnd.current) el.scrollTop = el.scrollHeight
+  }, [])
   useEffect(() => {
     const el = listRef.current
     if (el) el.scrollTop = el.scrollHeight
-  }, [messages])
+    atEnd.current = true
+  }, [messages.length, chat.id])
+  useEffect(follow, [messages, follow])
 
   // The box starts as one line and grows with the text up to a limit, then scrolls.
   useLayoutEffect(() => {
@@ -326,7 +393,7 @@ export function AskPanel({ sessionId, chat, setChat, handle, onSql, running, onC
       if (m.role !== 'assistant' || m.status !== 'done' || !m.result) continue
       // The sealed turn is the exchange as the model saw it; the main process replays it instead of raw values.
       const sealed = m.result.kind === 'cancelled' ? undefined : m.result.privacy?.sealed
-      if (m.result.kind === 'query') turns.push({ question: m.question, sql: m.result.sql, ...(sealed ? { sealed } : {}) })
+      if (m.result.kind === 'query') turns.push({ question: m.question, sql: m.result.sql, ...(m.result.database ? { database: m.result.database.name } : {}), ...(sealed ? { sealed } : {}) })
       else if (m.result.kind === 'clarify') turns.push({ question: m.question, answer: m.result.message, ...(sealed ? { sealed } : {}) })
     }
     return turns.slice(-6)
@@ -340,47 +407,155 @@ export function AskPanel({ sessionId, chat, setChat, handle, onSql, running, onC
       setSettingsOpen(true, { tab: 'models' })
       return
     }
+    const ids = inContext
+    if (!ids.length) {
+      toast('info', 'Add a database first', 'The chat answers questions about the databases it has in context: open a connection, or add one with the + above the box.')
+      return
+    }
     const requestId = crypto.randomUUID()
     const assistantId = crypto.randomUUID()
-    setChat((c) => ({
+    // Every change goes to the conversation that asked, whichever tab is in front by then.
+    const chatId = chat.id
+    const toChat = (update: (c: ChatState) => ChatState) => updateChat(chatId, update)
+    // The answer unfolds as it arrives, rather than landing all at once.
+    revealFrom(assistantId)
+    revealFrom(`${assistantId}:explanation`)
+    /** The conversation's first question: the model names it too, for its tab. */
+    const first = !chat.messages.some((m) => m.role === 'user')
+    toChat((c) => ({
       ...c,
       requestId,
       input: '',
+      // The first question settles the chat on the connection in front; it stays there as the user moves on.
+      databases: c.databases?.length ? c.databases : ids,
       messages: [...c.messages, { id: crypto.randomUUID(), role: 'user', text: question, ts: Date.now() }, { id: assistantId, role: 'assistant', question, ts: Date.now(), status: 'working', steps: [], requestId }]
     }))
     const finish = (patch: Partial<Extract<ChatMessage, { role: 'assistant' }>>) => {
-      setApprovals((list) => list.filter((a) => a.requestId !== requestId))
-      setChat((c) => ({
+      dropApprovals((a) => a.requestId === requestId)
+      cancelledRef.current.delete(requestId)
+      // An answer that comes while the user looks elsewhere is new to them until they open its tab.
+      const now = useStore.getState()
+      const seen = now.chatOpen && now.activeChatId === chatId
+      toChat((c) => ({
         ...c,
+        unread: !seen,
         requestId: c.requestId === requestId ? null : c.requestId,
         messages: c.messages.map((m) => (m.id === assistantId && m.role === 'assistant' ? { ...m, ...patch, status: 'done', endedAt: Date.now() } : m))
       }))
     }
+    // A step shown in the answer being worked on, from this side: connecting the databases in context.
+    let seq = 0
+    const note = (step: AiProgressStep) => {
+      const e: AiProgressEvent = { ...step, requestId, seq: --seq, ts: Date.now() }
+      toChat((c) => ({ ...c, messages: c.messages.map((m) => (m.id === assistantId ? withStep(m, e) : m)) }))
+    }
     try {
-      const res = await window.api.ai.ask(sessionId, question, history, requestId, chat.conversationId, { connectors: chat.connectors })
-      finish({ result: res })
+      // Each database in context is connected first; one that cannot be is left out of this question, and the steps say why.
+      const sessions: { connectionId: string; sessionId: string }[] = []
+      for (const id of ids) {
+        const name = nameOf(id)
+        const tab = useStore.getState().tabs.find((t) => t.connectionId === id)
+        if (tab?.status === 'live' && tab.session) {
+          sessions.push({ connectionId: id, sessionId: tab.session.sessionId })
+          continue
+        }
+        const stepId = `connect:${id}`
+        note({ stepId, stage: 'index', status: 'running', message: `Connecting to ${name}` })
+        try {
+          sessions.push({ connectionId: id, sessionId: await ensureSession(id) })
+          note({ stepId, stage: 'index', status: 'done', message: `Connecting to ${name}` })
+        } catch (e) {
+          note({ stepId, stage: 'index', status: 'error', message: `Left out ${name}`, detail: errorMessage(e) })
+        }
+      }
+      if (cancelledRef.current.has(requestId)) {
+        finish({ result: { kind: 'cancelled', usage: emptyUsage() } })
+        return
+      }
+      if (!sessions.length) throw new Error(ids.length === 1 ? `Could not connect to ${nameOf(ids[0])}.` : 'Could not connect to any database in this chat.')
+      const [home, ...others] = sessions
+      const res = await window.api.ai.ask(home.sessionId, question, history, requestId, chat.conversationId, {
+        connectors: chat.connectors,
+        ...(others.length ? { databases: others } : {}),
+        ...(first ? { title: true } : {})
+      })
+      if (res.kind !== 'cancelled' && res.title) toChat((c) => (c.title ? c : { ...c, title: res.title }))
+      const statusOf = (connectionId: string) => getSessionStore(sessions.find((x) => x.connectionId === connectionId)?.sessionId ?? home.sessionId)?.getState().setStatus
       if (res.kind === 'query') {
+        const target = res.database?.connectionId || home.connectionId
+        // Into the editor when the query is for the connection in front; otherwise it waits there for the user.
+        const now = useStore.getState()
+        const inFront = !now.showConnect && now.activeConnectionId === target
+        finish({ result: res, ...(inFront && res.autoRun ? { autoRan: true } : {}) })
         const u = res.usage
-        setStatus(`${u.model} · ${u.requests} request${u.requests === 1 ? '' : 's'} · ${formatTokens(u.inputTokens)} in / ${formatTokens(u.outputTokens)} out${u.cachedInputTokens ? ` (${formatTokens(u.cachedInputTokens)} cached)` : ''}`)
-        onSql(res.sql, res.autoRun)
-      } else if (res.kind === 'cancelled') setStatus('Cancelled')
+        statusOf(target)?.(`${u.model} · ${u.requests} request${u.requests === 1 ? '' : 's'} · ${formatTokens(u.inputTokens)} in / ${formatTokens(u.outputTokens)} out${u.cachedInputTokens ? ` (${formatTokens(u.cachedInputTokens)} cached)` : ''}`)
+        if (inFront) place({ connectionId: target, name: nameOf(target) }, res.sql, res.autoRun)
+      } else {
+        finish({ result: res })
+        if (res.kind === 'cancelled') statusOf(home.connectionId)?.('Cancelled')
+      }
     } catch (e) {
       finish({ error: errorMessage(e) })
     }
   }
 
   const cancel = () => {
-    if (chat.requestId) void window.api.ai.cancel(chat.requestId)
+    if (!chat.requestId) return
+    cancelledRef.current.add(chat.requestId)
+    void window.api.ai.cancel(chat.requestId)
   }
 
-  const clear = () => {
-    if (asking) cancel()
-    // A reset chat forgets its placeholders and what its answers sent.
-    void window.api.ai.forget(chat.conversationId, { transcripts: true })
-    setChat(() => emptyChat())
+  /** Where a query belongs: the database the answer names, or the chat's own. */
+  const targetOf = (db: { connectionId: string; name: string } | undefined): { connectionId: string; name: string } | null =>
+    db?.connectionId ? db : homeId ? { connectionId: homeId, name: nameOf(homeId) } : null
+  const dialectOf = (id: string | undefined) => kindOf(id || homeId)
+
+  /** Puts a query in the editor of its connection, opening and connecting that when needed, and runs it if asked. */
+  const place = (target: { connectionId: string; name: string }, sql: string, run: boolean) => {
+    openSql(target.connectionId, sql, run).catch((e) => toast('error', `Could not open ${target.name}`, errorMessage(e)))
   }
+
+  /** A query the model ran, into the editor of its own database. */
+  const openRan = (q: AiRanQuery) => {
+    const target = targetOf(q.database)
+    if (target) place(target, q.sql, false)
+  }
+
+  /** A new conversation, in front and ready to type in. */
+  const startNewChat = () => {
+    newChat()
+    requestAnimationFrame(() => inputRef.current?.focus())
+  }
+
+  // ⌘T in the chat opens a new conversation, as it opens a query tab in a connection. The chat is in use when focus is
+  // in it, or nothing has focus and the last click was in it.
+  const startNewChatRef = useRef(startNewChat)
+  startNewChatRef.current = startNewChat
+  useEffect(() => {
+    const inChat = (el: EventTarget | null) => el instanceof Element && Boolean(el.closest('.chat-pane'))
+    let clickedInChat = false
+    const onPointer = (e: PointerEvent) => {
+      clickedInChat = inChat(e.target)
+    }
+    const onKey = (e: KeyboardEvent) => {
+      if (!isModKey(e) || e.shiftKey || e.altKey || e.key.toLowerCase() !== 't' || !useStore.getState().chatOpen) return
+      const focused = document.activeElement
+      if (!(inChat(focused) || ((!focused || focused === document.body) && clickedInChat))) return
+      // Before the connection's own shortcut, which would open a query tab.
+      e.preventDefault()
+      e.stopPropagation()
+      startNewChatRef.current()
+    }
+    window.addEventListener('pointerdown', onPointer, true)
+    window.addEventListener('keydown', onKey, true)
+    return () => {
+      window.removeEventListener('pointerdown', onPointer, true)
+      window.removeEventListener('keydown', onKey, true)
+    }
+  }, [])
 
   const toggleSteps = (id: string) => setChat((c) => ({ ...c, messages: c.messages.map((m) => (m.id === id && m.role === 'assistant' ? { ...m, stepsOpen: !m.stepsOpen } : m)) }))
+  const toggleQueries = (id: string) => setChat((c) => ({ ...c, messages: c.messages.map((m) => (m.id === id && m.role === 'assistant' ? { ...m, queriesOpen: !m.queriesOpen } : m)) }))
 
   const stepIcon = (s: Step): ReactNode => {
     if (s.status === 'running') return <span className="spinner tiny" />
@@ -421,6 +596,10 @@ export function AskPanel({ sessionId, chat, setChat, handle, onSql, running, onC
               </span>
             ) : null}
           </div>
+          {/* The answer as the model writes it. */}
+          {m.draft?.trim() ? (
+            <RevealedMarkdown revealKey={m.id} text={m.draft.trimStart()} dialect={dialect} className="chat-text" onGrow={follow} />
+          ) : null}
           {approvals
             .filter((a) => a.requestId === m.requestId)
             .map((a) => (
@@ -451,17 +630,28 @@ export function AskPanel({ sessionId, chat, setChat, handle, onSql, running, onC
     if (m.error) body = <div className="chat-text error">{m.error}</div>
     else if (!m.result || m.result.kind === 'cancelled') body = <div className="chat-text muted">Cancelled.</div>
     else if (m.result.kind === 'clarify') {
-      const message = m.result.message
+      const r = m.result
+      const message = r.message
+      const privacy = privacyLink(r.privacy, inspect)
       body = (
         <>
-          <ChatMarkdown text={message} dialect={dialect} className="chat-text" />
-          {m.result.cutShort ? (
+          <RevealedMarkdown revealKey={m.id} text={message} dialect={dialect} className="chat-text" onGrow={follow} />
+          {r.cutShort ? (
             <div className="ask-note warn" data-testid="ask-cut-short">
               The answer was cut short at the model&apos;s length limit for one reply.
             </div>
           ) : null}
           {/* A question back to the user, rather than an answer in words. */}
           {/\?\s*$/.test(message) ? <div className="chat-hint">Reply below to continue.</div> : null}
+          {/* An answer built from query results: what was protected in them, and the cost. */}
+          {r.queries?.length ? (
+            <div className="ask-meta" data-testid="ask-meta">
+              {privacy ? <span>{privacy}</span> : null}
+              <span title={`${formatTokens(r.usage.inputTokens)} in, ${formatTokens(r.usage.outputTokens)} out · ${prettyModelName(r.usage.model)}`}>
+                {formatTokens(r.usage.inputTokens + r.usage.outputTokens)} tokens
+              </span>
+            </div>
+          ) : null}
         </>
       )
     } else {
@@ -471,10 +661,18 @@ export function AskPanel({ sessionId, chat, setChat, handle, onSql, running, onC
         : 'Read-only: the database refused writes, but the query plan could not be checked'
       const context = r.context.mode === 'all' ? `all ${r.context.totalTables} tables` : `${r.context.tables} of ${r.context.totalTables} tables`
       const privacy = privacyLink(r.privacy, inspect)
+      const target = targetOf(r.database)
+      const autoRan = m.autoRan ?? (r.autoRun && !r.database)
       body = (
         <>
-          <ChatMarkdown text={r.explanation} dialect={dialect} className="chat-text" />
-          <SqlCode sql={r.sql} dialect={dialect} className="chat-sql" title="The query placed in the editor" />
+          <RevealedMarkdown revealKey={`${m.id}:explanation`} text={r.explanation} dialect={dialect} className="chat-text" onGrow={follow} />
+          {/* In a chat across databases, the one the query is for. */}
+          {r.database ? (
+            <div className="ask-db-label" data-testid="ask-db-label">
+              <Icon name="database" size={11} /> {r.database.name}
+            </div>
+          ) : null}
+          <SqlCode sql={r.sql} dialect={dialectOf(r.database?.connectionId)} className="chat-sql" title={target ? `A query for ${target.name}` : undefined} />
           {r.warnings?.map((w) => (
             <div key={w} className="ask-note warn" data-testid="ask-warning">
               {w}
@@ -497,7 +695,7 @@ export function AskPanel({ sessionId, chat, setChat, handle, onSql, running, onC
                   <span>{r.checks.repairs}</span>
                 </span>
               ) : null}
-              {r.autoRun ? (
+              {autoRan ? (
                 <span className="ask-glyph" role="img" title="Ran automatically" aria-label="Ran automatically" data-testid="ask-auto-ran">
                   <Icon name="bolt" size={12} />
                 </span>
@@ -513,22 +711,66 @@ export function AskPanel({ sessionId, chat, setChat, handle, onSql, running, onC
       )
     }
     const run = m.result?.kind === 'query' ? m.result : null
+    const runTarget = run ? targetOf(run.database) : null
+    /** The query's connection is not the one in front: its actions say where it goes. */
+    const runAway = runTarget && runTarget.connectionId !== frontId ? runTarget : null
+    // The queries the model ran to look into the question, across the databases in the chat.
+    const ran = m.result && m.result.kind !== 'cancelled' ? (m.result.queries ?? []) : []
+    const queriesToggle = ran.length ? (
+      <button className={`ask-steps-toggle ${m.queriesOpen ? 'open' : ''}`} onClick={() => toggleQueries(m.id)} title="The queries the model ran to find the answer" data-testid="ask-queries-toggle">
+        {ran.length} {ran.length === 1 ? 'query' : 'queries'} <Icon name="chevron-down" size={11} />
+      </button>
+    ) : null
     return (
       <div className={`chat-msg assistant ${m.result?.kind ?? (m.error ? 'error' : '')}`} key={m.id} data-testid="ask-result">
         {body}
-        {run || stepsToggle ? (
+        {run || stepsToggle || queriesToggle ? (
           <div className="ask-actions">
-            {run ? (
+            {run && runTarget && runAway ? (
               <>
-                <button className="ask-action run" onClick={() => onSql(run.sql, true)} disabled={running} data-testid="ask-run">
-                  <Icon name="play" size={11} /> {run.autoRun ? 'Run again' : 'Run it'}
+                <button className="ask-action run" onClick={() => place(runAway, run.sql, true)} title={`Run it in the editor of ${runAway.name}`} data-testid="ask-run-in">
+                  <Icon name="play" size={11} /> Run in {runAway.name}
                 </button>
-                <button className="ask-action" onClick={() => onSql(run.sql, false)} title="Put this query in the editor without running it">
+                <button className="ask-action" onClick={() => place(runAway, run.sql, false)} title={`Put this query in the editor of ${runAway.name} without running it`} data-testid="ask-open-in">
+                  Open in {runAway.name}
+                </button>
+              </>
+            ) : run && runTarget ? (
+              <>
+                <button className="ask-action run" onClick={() => place(runTarget, run.sql, true)} data-testid="ask-run">
+                  <Icon name="play" size={11} /> {(m.autoRan ?? (run.autoRun && !run.database)) ? 'Run again' : 'Run it'}
+                </button>
+                <button className="ask-action" onClick={() => place(runTarget, run.sql, false)} title="Put this query in the editor without running it">
                   To editor
                 </button>
               </>
             ) : null}
-            {stepsToggle}
+            <span className="ask-toggles">
+              {queriesToggle}
+              {stepsToggle}
+            </span>
+          </div>
+        ) : null}
+        {m.queriesOpen && ran.length ? (
+          <div className="ask-queries" data-testid="ask-queries">
+            {ran.map((q, i) => {
+              const target = targetOf(q.database)
+              const away = target && target.connectionId !== frontId ? target : null
+              return (
+                <div key={i} className="ask-query" data-testid="ask-query" data-database={q.database.name}>
+                  <div className="ask-query-head">
+                    <Icon name="database" size={11} />
+                    <span className="ask-query-db">{q.database.name}</span>
+                    <span className={`ask-query-rows ${q.error ? 'warn' : ''}`}>{q.error ? 'failed' : `${q.rows ?? 0} row${q.rows === 1 ? '' : 's'}`}</span>
+                    <button className="ask-action" onClick={() => openRan(q)} title={away ? `Put this query in the editor of ${away.name}` : 'Put this query in the editor'}>
+                      {away ? `Open in ${away.name}` : 'To editor'}
+                    </button>
+                  </div>
+                  <SqlCode sql={q.sql} dialect={dialectOf(q.database.connectionId)} className="chat-sql small" />
+                  {q.error ? <div className="ask-note warn">{q.error}</div> : null}
+                </div>
+              )
+            })}
           </div>
         ) : null}
         {m.stepsOpen ? (
@@ -543,21 +785,49 @@ export function AskPanel({ sessionId, chat, setChat, handle, onSql, running, onC
 
   return (
     <div className="pane ask-panel" data-testid="ask-panel">
-      <PaneHeader title="Ask" handle={handle} testId="ask-header">
-        <span className="spacer" />
-        {messages.length ? (
-          <button className="btn ghost icon small" onClick={clear} title="Start a new conversation" data-testid="ask-reset">
-            <Icon name="refresh" size={13} />
-          </button>
-        ) : null}
-        <button className="btn ghost icon small" onClick={onCollapse} title="Hide the chat" data-testid="ask-collapse">
-          <Icon name="chevron-right" size={14} />
+      <div className="chat-pane-header" data-testid="ask-header">
+        <button className="btn ghost icon small chat-collapse" onClick={onCollapse} title="Hide the chat" data-testid="ask-collapse">
+          <Icon name="panel" size={14} />
         </button>
-      </PaneHeader>
-      <div className="chat" ref={listRef}>
+        <ChatTabs
+          chats={chats}
+          activeChatId={chat.id}
+          waiting={(c) => approvals.some((a) => a.requestId === c.requestId)}
+          onSelect={(id) => {
+            selectChat(id)
+            requestAnimationFrame(() => inputRef.current?.focus())
+          }}
+          onClose={(id) => closeChat(id)}
+        />
+        {/* Outside the strip of tabs, so they stay in sight however many there are. */}
+        <ChatHistoryButton onOpened={() => requestAnimationFrame(() => inputRef.current?.focus())} />
+        <button className="tab-new chat-new" onClick={() => startNewChat()} title={`New chat (${modKey}T)`} aria-label="New chat" data-testid="chat-tab-new">
+          <Icon name="plus" />
+        </button>
+      </div>
+      <div
+        className="chat"
+        ref={listRef}
+        onScroll={(e) => {
+          const el = e.currentTarget
+          atEnd.current = el.scrollHeight - el.scrollTop - el.clientHeight < 48
+        }}
+      >
         {!messages.length ? (
           <div className="chat-empty">
-            <p>Ask about the data in plain English. The answer is a read-only query that goes into the editor.</p>
+            {inContext.length > 1 ? (
+              <p>
+                Ask across {inContext.length} databases in plain English: the model looks in whichever ones the question needs and can follow a
+                customer, an order or a request from one to the next.
+              </p>
+            ) : inContext.length ? (
+              <p>
+                Ask about the data in {nameOf(homeId)} in plain English. The answer is a read-only query that goes into the editor. Add databases with +
+                to ask across them.
+              </p>
+            ) : (
+              <p>Ask about your data in plain English. Open a connection, or add a database with + below.</p>
+            )}
             {providerReady ? (
               <div className="chat-examples">
                 {EXAMPLES.map((ex) => (
@@ -603,11 +873,25 @@ export function AskPanel({ sessionId, chat, setChat, handle, onSql, running, onC
         </div>
       ) : null}
       <div className="chat-input">
+        <ChatDatabases
+          databases={inContext}
+          following={following}
+          suggestion={!following && frontId && !pinned.includes(frontId) ? frontId : null}
+          onChange={(next) => setChat((c) => ({ ...c, databases: next }))}
+        />
         <textarea
           ref={inputRef}
           className="text"
           rows={1}
-          placeholder={awaitingReply ? 'Reply…' : messages.length ? 'Ask a follow-up, or a new question…' : 'Ask in plain English…'}
+          placeholder={
+            awaitingReply
+              ? 'Reply…'
+              : messages.length
+                ? 'Ask a follow-up, or a new question…'
+                : inContext.length > 1
+                  ? `Ask across ${inContext.length} databases…`
+                  : 'Ask in plain English…'
+          }
           value={input}
           onChange={(e) => {
             const v = e.target.value
@@ -674,7 +958,11 @@ export function AskPanel({ sessionId, chat, setChat, handle, onSql, running, onC
             )
           ) : null}
         </div>
-        <ChatConnectorsButton connectionId={connectionId} overrides={chat.connectors} onChange={(next) => setChat((c) => ({ ...c, connectors: next }))} />
+        <ChatConnectorsButton
+          connectionId={inContext.length > 1 ? inContext : homeId}
+          overrides={chat.connectors}
+          onChange={(next) => setChat((c) => ({ ...c, connectors: next }))}
+        />
       </div>
     </div>
   )

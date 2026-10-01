@@ -85,6 +85,27 @@ only what a question needs:
   `EXPLAIN` first, with errors sent back for up to two repairs, and executes
   under SQLite's `query_only` pragma or a PostgreSQL `READ ONLY` transaction.
 
+The chat is one pane beside every connection (`ChatPane`), its conversations
+in tabs (`chats` in the app store, saved with the workspace). Each has its own
+placeholder scope, forgotten when its tab closes, and asks in several tabs can
+run at once. A closed conversation goes to `chat-history.json`
+(`ChatHistoryStore`: the latest 30, none older than 30 days), and opens again
+from the clock in the chat's header. Answers from hosted providers stream
+(`readEventStream` in `providers/types.ts`; local servers answer whole, as
+their streamed tool calls vary); the renderer reveals any answer at an easing
+pace (`lib/reveal.ts`), so a stream that comes in bursts, or an answer that
+arrives at once, unfolds evenly. The first question of a conversation also
+asks the model for a short name for its tab (`ai/title.ts`). A conversation follows the connection in front until its first
+question, then keeps the databases it has in context; more can be added from
+the bar above the input, and are connected in the background.
+With more than one, an ask gets them all (`AskOptions.databases`): each is
+known to the model by a key (`db1`, `db2`, …), every tool takes the key, the
+schema budget is shared between them, and the model can call `run_query` to
+read up to 50 rows of a read-only `SELECT`, every value protected first, to
+follow a record from one database to the next. A proposed query names its
+database, and the chat opens it in that connection's editor
+(`openSql` in `store.ts`).
+
 **Connectors** (`src/main/connectors/`) are MCP servers whose tools Ask can
 use, like connectors in Claude Desktop. `ConnectorManager` runs each one with
 the official MCP SDK, bundled into the main process: a local command over

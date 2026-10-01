@@ -2,6 +2,7 @@
 // turned into labelled sections for people, with placeholders and search matches marked. Nothing here changes the
 // bytes; the raw view shows them as they are.
 import { PLACEHOLDER_SOURCE } from '@shared/privacy'
+import { isSse, readStream } from '@shared/stream'
 
 export interface WireSection {
   label: string
@@ -107,6 +108,16 @@ export function readableRequest(body: string): WireSection[] {
 /** A response body as sections: what the model said, the tools it called, and what it reported about usage. */
 export function readableResponse(body: string | null): WireSection[] {
   if (body === null) return [{ label: 'response', text: 'No response arrived.' }]
+  // A streamed answer arrives in pieces; read it put together, as one answer.
+  if (isSse(body)) {
+    const streamed = readStream(body)
+    const out: WireSection[] = []
+    if (streamed.error) out.push({ label: 'error', text: streamed.error })
+    if (streamed.text) out.push({ label: 'assistant', text: streamed.text })
+    for (const call of streamed.toolCalls) out.push({ label: `assistant → ${call.name}`, text: prettyArgs(call.args), json: true })
+    out.push({ label: 'details', text: pretty({ model: streamed.model, stop_reason: streamed.stopReason, usage: streamed.usage, streamed: true }), json: true })
+    return out
+  }
   const json = parse(body)
   if (!isObject(json)) return [{ label: 'response', text: body }]
   if (json.error) {

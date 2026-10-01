@@ -15,8 +15,8 @@ const MAX_RESULT_CHARS = 24_000
 export interface ConnectorAskDeps {
   store: ConnectorStore
   manager: ConnectorManager
-  /** The saved database connection the chat is on. */
-  connectionId: string | undefined
+  /** The saved database connections in the chat: its own, and any others it has in context. */
+  connectionId: string | (string | undefined)[] | undefined
   /** The chat's own choices, by connector id. */
   overrides?: Record<string, boolean>
   /** Asks the user whether a tool may run, with the arguments it would get. */

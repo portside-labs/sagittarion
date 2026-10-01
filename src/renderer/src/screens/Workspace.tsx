@@ -33,6 +33,8 @@ export function Workspace({ active }: { active: boolean }) {
     if (!active) return
     const onKey = (e: KeyboardEvent) => {
       if (!isModKey(e)) return
+      // Typing in the chat beside the connection is not working in the connection.
+      if (e.target instanceof Element && e.target.closest('.chat-pane')) return
       const k = e.key.toLowerCase()
       if (k === 't') {
         e.preventDefault()
