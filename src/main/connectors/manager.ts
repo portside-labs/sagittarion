@@ -1,16 +1,19 @@
 // MCP clients for the user's connectors: started when first needed (Settings shows a connector, or an ask uses one),
 // shared by every chat, and stopped after a while unused. A local connector is a child process spoken to over stdio; a
-// remote one is reached over Streamable HTTP, or SSE for servers that predate it.
+// remote one is reached over Streamable HTTP, or SSE for servers that predate it, and may need the user to sign in
+// with OAuth first (oauth.ts).
 import { EventEmitter } from 'node:events'
 import os from 'node:os'
 import { Client } from '@modelcontextprotocol/sdk/client/index.js'
 import { StdioClientTransport, getDefaultEnvironment } from '@modelcontextprotocol/sdk/client/stdio.js'
 import { StreamableHTTPClientTransport, StreamableHTTPError } from '@modelcontextprotocol/sdk/client/streamableHttp.js'
 import { SSEClientTransport } from '@modelcontextprotocol/sdk/client/sse.js'
+import { UnauthorizedError } from '@modelcontextprotocol/sdk/client/auth.js'
 import type { Transport } from '@modelcontextprotocol/sdk/shared/transport.js'
 import { ToolListChangedNotificationSchema, type CallToolResult, type Tool } from '@modelcontextprotocol/sdk/types.js'
 import type { ConnectorStatus, ConnectorTool } from '@shared/connectors'
 import type { Connector } from './store'
+import { ConnectorAuth, listenForCallback, NeedsSignIn, SignInCancelled, type CallbackListener, type OAuthStorage } from './oauth'
 
 export interface ConnectorManagerOptions {
   clientInfo: { name: string; version: string }
@@ -20,6 +23,12 @@ export interface ConnectorManagerOptions {
   idleMs?: number
   connectTimeoutMs?: number
   callTimeoutMs?: number
+  /** Where a remote connector's sign-in is kept. */
+  oauth: (c: Connector) => OAuthStorage
+  /** Opens the sign-in page in the user's browser. */
+  openBrowser: (url: URL) => void | Promise<void>
+  /** How long the user has to sign in. */
+  signInTimeoutMs?: number
 }
 
 interface Live {
@@ -38,7 +47,12 @@ interface Live {
 
 /** Fields that decide what is started; anything else (name, scope, permissions) changes nothing for a running one. */
 function fingerprint(c: Connector): string {
-  return JSON.stringify(c.transport === 'http' ? ['http', c.url, c.headers] : ['stdio', c.command, c.args, c.env])
+  return JSON.stringify(c.transport === 'http' ? ['http', c.url, c.headers, c.oauthClientId, c.oauthClientSecret] : ['stdio', c.command, c.args, c.env])
+}
+
+/** The server wants a sign-in this connector does not have. */
+export function needsSignIn(err: unknown): boolean {
+  return err instanceof NeedsSignIn || err instanceof UnauthorizedError
 }
 
 export function toConnectorTool(t: Tool): ConnectorTool {
@@ -60,9 +74,10 @@ export function connectorError(err: unknown, c: Connector, stderr: string[]): st
   if ((err as NodeJS.ErrnoException)?.code === 'ENOENT' || /\bENOENT\b/.test(raw)) {
     return `Could not find "${c.command}". Install it, or give its full path (run "which ${c.command}" in a terminal).`
   }
+  if (needsSignIn(err)) return `Sign in to ${c.name} to use it.`
   if (err instanceof StreamableHTTPError || /\b40[13]\b/.test(raw)) {
     if (/\b401\b/.test(raw) || (err instanceof StreamableHTTPError && err.code === 401)) {
-      return 'The server refused the connection (401). It may need an API key in a header such as Authorization; sign-in with OAuth is not supported yet.'
+      return 'The server refused the connection (401) and offers no way to sign in. It may need an API key in a header such as Authorization.'
     }
   }
   if (/timed out|timeout/i.test(raw)) return `The server did not answer in time.${tail ? `\n${tail}` : ''}`
@@ -73,10 +88,22 @@ export function connectorError(err: unknown, c: Connector, stderr: string[]): st
 export class ConnectorManager extends EventEmitter {
   private readonly live = new Map<string, Live>()
   private readonly opts: Required<ConnectorManagerOptions>
+  /** Sign-ins waiting for the browser, by connector. */
+  private readonly signIns = new Map<string, CallbackListener>()
 
   constructor(opts: ConnectorManagerOptions) {
     super()
-    this.opts = { idleMs: 10 * 60_000, connectTimeoutMs: 30_000, callTimeoutMs: 120_000, ...opts }
+    this.opts = { idleMs: 10 * 60_000, connectTimeoutMs: 30_000, callTimeoutMs: 120_000, signInTimeoutMs: 5 * 60_000, ...opts }
+  }
+
+  /** A remote connector's OAuth: renewing saved tokens, or, while the user signs in, the whole flow. */
+  private authFor(c: Connector, interactive?: { redirectUrl: string }): ConnectorAuth {
+    return new ConnectorAuth({
+      name: c.name,
+      storage: this.opts.oauth(c),
+      ...(interactive ? { interactive: { redirectUrl: interactive.redirectUrl, open: this.opts.openBrowser } } : {}),
+      ...(c.oauthClientId ? { client: { client_id: c.oauthClientId, ...(c.oauthClientSecret ? { client_secret: c.oauthClientSecret } : {}) } } : {})
+    })
   }
 
   /** How a connector is doing, with the tools it last listed. */
@@ -102,11 +129,18 @@ export class ConnectorManager extends EventEmitter {
     if (c.transport === 'http') {
       const url = new URL(c.url)
       const requestInit: RequestInit = { headers: c.headers }
+      // Saved tokens go with every request and are renewed when they run out; a server that wants a sign-in the
+      // connector does not have stops it with NeedsSignIn.
+      const authProvider = this.authFor(c)
       if (sse) {
         // The event stream is opened with a plain fetch, which needs the headers too.
-        return new SSEClientTransport(url, { requestInit, eventSourceInit: { fetch: (u, init) => fetch(u, { ...init, headers: { ...(init?.headers as Record<string, string>), ...c.headers } }) } })
+        return new SSEClientTransport(url, {
+          requestInit,
+          authProvider,
+          eventSourceInit: { fetch: (u, init) => fetch(u, { ...init, headers: { ...(init?.headers as Record<string, string>), ...c.headers } }) }
+        })
       }
-      return new StreamableHTTPClientTransport(url, { requestInit })
+      return new StreamableHTTPClientTransport(url, { requestInit, authProvider })
     }
     const transport = new StdioClientTransport({
       command: c.command,
@@ -134,7 +168,7 @@ export class ConnectorManager extends EventEmitter {
     try {
       return await this.open(c, l, false)
     } catch (err) {
-      if (c.transport !== 'http' || (err instanceof StreamableHTTPError && err.code === 401)) throw err
+      if (c.transport !== 'http' || needsSignIn(err) || (err instanceof StreamableHTTPError && err.code === 401)) throw err
       return this.open(c, l, true).catch(() => Promise.reject(err))
     }
   }
@@ -166,9 +200,83 @@ export class ConnectorManager extends EventEmitter {
       return client
     } catch (err) {
       await opened?.close().catch(() => {})
+      if (needsSignIn(err)) {
+        this.set(c.id, l, { state: 'signin', error: connectorError(err, c, l.stderr) })
+        throw new NeedsSignIn(c.name)
+      }
       this.set(c.id, l, { state: 'error', error: connectorError(err, c, l.stderr) })
       throw new Error(l.status.error)
     }
+  }
+
+  private entry(c: Connector): Live {
+    let l = this.live.get(c.id)
+    if (!l || l.key !== fingerprint(c)) {
+      l = { key: fingerprint(c), client: null, starting: null, status: { state: 'idle', tools: [] }, tools: l?.tools ?? [], stderr: [], idle: null, calls: 0 }
+      this.live.set(c.id, l)
+    }
+    return l
+  }
+
+  /**
+   * Signs in to a remote connector with OAuth: opens the server's sign-in page in the user's browser and waits for it
+   * to come back here, then starts the connector with the tokens it got. Resolves once it runs, or the server turned
+   * out to need no sign-in.
+   */
+  async signIn(c: Connector): Promise<void> {
+    if (c.transport !== 'http') throw new Error('Only a connector on a remote URL signs in.')
+    this.cancelSignIn(c.id)
+    await this.stop(c.id, true)
+    const l = this.entry(c)
+    const saved = this.opts.oauth(c).load().redirectUrl
+    const listener = await listenForCallback(c.name, saved ? Number(new URL(saved).port) || undefined : undefined, this.opts.signInTimeoutMs)
+    this.signIns.set(c.id, listener)
+    const storage = this.opts.oauth(c)
+    // A registration made to come back to another port is redone for this one; a client the user registered stays.
+    if (saved && saved !== listener.redirectUrl && storage.load().client && !c.oauthClientId) await storage.save({ ...storage.load(), client: undefined })
+    const auth = this.authFor(c, { redirectUrl: listener.redirectUrl })
+    this.set(c.id, l, { state: 'authorizing' })
+    const client = new Client(this.opts.clientInfo, { capabilities: {} })
+    const transport = new StreamableHTTPClientTransport(new URL(c.url), { requestInit: { headers: c.headers }, authProvider: auth })
+    try {
+      try {
+        await client.connect(transport, { timeout: this.opts.connectTimeoutMs })
+      } catch (err) {
+        if (!(err instanceof UnauthorizedError)) throw err
+        // The sign-in page is open in the browser: wait for it to come back.
+        const { code, state } = await listener.result
+        if (auth.expectedState && state !== auth.expectedState) throw new Error('The sign-in that came back is not the one started here. Try again.')
+        await transport.finishAuth(code)
+      }
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err)
+      // Cancelled, or the server still wants a sign-in: it waits for one. Anything else is a failure to show.
+      const waiting = err instanceof SignInCancelled || needsSignIn(err)
+      this.set(c.id, l, { state: waiting ? 'signin' : 'error', error: waiting ? `Sign in to ${c.name} to use it.` : `Could not sign in: ${message}` })
+      if (err instanceof SignInCancelled) return
+      throw new Error(l.status.error)
+    } finally {
+      listener.close()
+      if (this.signIns.get(c.id) === listener) this.signIns.delete(c.id)
+      await client.close().catch(() => {})
+    }
+    await this.refresh(c)
+  }
+
+  /** Stops waiting for a sign-in in the browser. */
+  cancelSignIn(id: string): void {
+    this.signIns.get(id)?.close()
+    this.signIns.delete(id)
+  }
+
+  /** Forgets a connector's tokens; its registration with the server is kept, for signing in again. */
+  async signOut(c: Connector): Promise<void> {
+    this.cancelSignIn(c.id)
+    const storage = this.opts.oauth(c)
+    await storage.save({ ...storage.load(), tokens: undefined })
+    await this.stop(c.id, true)
+    const l = this.live.get(c.id)
+    if (l) this.set(c.id, l, { state: 'signin', error: `Sign in to ${c.name} to use it.` })
   }
 
   private async listTools(client: Client): Promise<Tool[]> {
@@ -191,10 +299,7 @@ export class ConnectorManager extends EventEmitter {
       await this.stop(c.id)
       l = undefined
     }
-    if (!l) {
-      l = { key, client: null, starting: null, status: { state: 'idle', tools: [] }, tools: [], stderr: [], idle: null, calls: 0 }
-      this.live.set(c.id, l)
-    }
+    if (!l) l = this.entry(c)
     if (l.client) {
       this.touch(c.id, l)
       return l.client
@@ -248,6 +353,7 @@ export class ConnectorManager extends EventEmitter {
   }
 
   async dispose(): Promise<void> {
+    for (const id of [...this.signIns.keys()]) this.cancelSignIn(id)
     await Promise.all([...this.live.keys()].map((id) => this.stop(id)))
   }
 }

@@ -5,7 +5,7 @@ import { createPortal } from 'react-dom'
 import { activeInChat, appliesTo, type ToolApprovalDecision, type ToolApprovalRequest } from '@shared/connectors'
 import { useStore } from '@/store'
 import { Icon } from './Icons'
-import { Switch, connectorStatusText } from './ConnectorsSettings'
+import { Switch, connectorStatusText, signInTo } from './ConnectorsSettings'
 
 export function ChatConnectorsButton({
   connectionId,
@@ -18,6 +18,8 @@ export function ChatConnectorsButton({
   onChange: (next: Record<string, boolean>) => void
 }) {
   const connectors = useStore((s) => s.connectors)
+  const putConnector = useStore((s) => s.putConnector)
+  const toast = useStore((s) => s.toast)
   const setSettingsOpen = useStore((s) => s.setSettingsOpen)
   const [open, setOpen] = useState(false)
   const [style, setStyle] = useState<CSSProperties | null>(null)
@@ -93,13 +95,20 @@ export function ChatConnectorsButton({
                       <span className="connectors-menu-sub">
                         {c.status.state === 'error'
                           ? 'Could not start'
-                          : usual
+                          : c.status.state === 'signin' || c.status.state === 'authorizing'
                             ? connectorStatusText(c)
-                            : Array.isArray(connectionId)
-                              ? 'Not on for these databases by default'
-                              : 'Not on for this connection by default'}
+                            : usual
+                              ? connectorStatusText(c)
+                              : Array.isArray(connectionId)
+                                ? 'Not on for these databases by default'
+                                : 'Not on for this connection by default'}
                       </span>
                     </span>
+                    {c.status.state === 'signin' ? (
+                      <button type="button" className="btn small" onClick={() => void signInTo(c, putConnector, toast)} data-testid="chat-connector-sign-in">
+                        Sign in
+                      </button>
+                    ) : null}
                     <Switch checked={on} onChange={(v) => toggle(c.id, v)} label={on ? `Stop using ${c.name} in this chat` : `Use ${c.name} in this chat`} testId="chat-connector-switch" />
                   </div>
                 )

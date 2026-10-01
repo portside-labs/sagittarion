@@ -13,6 +13,7 @@ import ssh2 from 'ssh2'
 const { utils } = ssh2
 import { ensureSampleDb, startMockServer } from '../mock-ssh/server.mjs'
 import { loadFixture } from '../pg-server.mjs'
+import { startOAuthMcpServer } from '../fixtures/oauth-mcp-server.mjs'
 import pg from 'pg'
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..')
@@ -65,7 +66,8 @@ async function main() {
   const launchOptions = {
     args: [path.join(root, 'out', 'main', 'index.js')],
     // On Linux without a keyring (CI) saved passwords would otherwise be dropped, which a desktop keyring prevents.
-    env: { ...process.env, SAGITTARION_USER_DATA: userData, NODE_ENV: 'production', SAGITTARION_TEST_PLAINTEXT_SECRETS: '1' }
+    // A connector's sign-in page is followed by the app itself, as a browser already signed in would.
+    env: { ...process.env, SAGITTARION_USER_DATA: userData, NODE_ENV: 'production', SAGITTARION_TEST_PLAINTEXT_SECRETS: '1', SAGITTARION_TEST_BROWSER: 'fetch' }
   }
   let app = await electron.launch(launchOptions)
   const consoleErrors = []
@@ -765,6 +767,32 @@ async function main() {
       assert((await crmTool('lookup_customer').inputValue()) === 'allow' && (await crmTool('flag_account').inputValue()) === 'ask', 'read-only tools run freely and the rest ask first')
       assert(!fs.readFileSync(path.join(userData, 'connectors.json'), 'utf8').includes('e2e-token-123'), 'the connector\'s secret is not saved in plain text')
       await shot('06i-connectors')
+      // A remote connector that signs in with OAuth: it waits for a sign-in, the browser comes back, and it runs.
+      const oauthServer = await startOAuthMcpServer()
+      try {
+        await page.getByTestId('connector-add').click()
+        await page.getByTestId('connector-name').fill('Remote CRM')
+        await page.getByTestId('connector-type-http').click()
+        await page.getByTestId('connector-url').fill(oauthServer.url)
+        await page.getByTestId('connector-save').click()
+        const remoteCard = page.locator('[data-testid=connector][data-name="Remote CRM"]')
+        await remoteCard.getByTestId('connector-sign-in').waitFor({ timeout: 30000 })
+        assert(oauthServer.stats.registrations === 0, 'nothing is registered before the user asks to sign in')
+        await remoteCard.screenshot({ path: path.join(artifacts, '06i2-connector-sign-in.png') })
+        await remoteCard.getByTestId('connector-sign-in').click()
+        await remoteCard.locator('[data-testid=connector-tool][data-tool=whoami]').waitFor({ timeout: 30000 })
+        assert((await remoteCard.getByTestId('connector-status').textContent()).includes('signed in'), 'it runs, signed in')
+        assert(oauthServer.stats.registrations === 1 && oauthServer.stats.tokens === 1, 'it registered itself and got a token with PKCE')
+        const saved = fs.readFileSync(path.join(userData, 'connectors.json'), 'utf8')
+        assert(!/"(?:at|rt)-1-/.test(saved) && !saved.includes('access_token'), 'its tokens are not saved in plain text')
+        await remoteCard.getByTestId('connector-sign-out').click()
+        await remoteCard.getByTestId('connector-sign-in').waitFor()
+        // Switched off, so the chats below do not wait on it.
+        await remoteCard.getByTestId('connector-enabled').click()
+        console.log('connectors: a remote one signs in with OAuth, runs, and signs out')
+      } finally {
+        await oauthServer.close()
+      }
       await page.keyboard.press('Escape')
       await page.waitForFunction(() => !document.querySelector('[data-testid=settings-dialog]'))
       // The chat's menu has it on for this connection.

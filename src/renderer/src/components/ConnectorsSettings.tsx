@@ -23,6 +23,15 @@ const MASK = '••••••••'
 
 const PERMISSION_LABELS: Record<ToolPermission, string> = { allow: 'Always allow', ask: 'Ask first', never: 'Never' }
 
+/** Signs in to a connector: its sign-in page opens in the browser, and the connector runs once the user is back. */
+export async function signInTo(c: ConnectorInfo, put: (info: ConnectorInfo) => void, toast: (kind: 'error', message: string, detail?: string) => void): Promise<void> {
+  try {
+    put(await window.api.connectors.signIn(c.id))
+  } catch (e) {
+    toast('error', `Could not sign in to ${c.name}`, errorMessage(e))
+  }
+}
+
 /** An on/off switch. */
 export function Switch({ checked, onChange, label, testId, disabled }: { checked: boolean; onChange: (on: boolean) => void; label: string; testId?: string; disabled?: boolean }) {
   return (
@@ -45,6 +54,10 @@ export function connectorStatusText(c: ConnectorInfo): string {
       return tools
     case 'error':
       return 'Could not start'
+    case 'signin':
+      return 'Sign in needed'
+    case 'authorizing':
+      return 'Signing in…'
     default:
       return n ? tools : 'Not started yet'
   }
@@ -57,12 +70,14 @@ interface Draft {
   envText: string
   url: string
   headersText: string
+  oauthClientId: string
+  oauthClientSecret: string
   scope: 'all' | 'selected'
   connectionIds: string[]
 }
 
 function draftFrom(c: ConnectorInfo | null): Draft {
-  if (!c) return { name: '', transport: 'stdio', commandLine: '', envText: '', url: '', headersText: '', scope: 'all', connectionIds: [] }
+  if (!c) return { name: '', transport: 'stdio', commandLine: '', envText: '', url: '', headersText: '', oauthClientId: '', oauthClientSecret: '', scope: 'all', connectionIds: [] }
   const masked = (k: string) => (c.missingSecrets.includes(k) ? '' : MASK)
   return {
     name: c.name,
@@ -71,6 +86,8 @@ function draftFrom(c: ConnectorInfo | null): Draft {
     envText: c.envKeys.map((k) => `${k}=${masked(k)}`).join('\n'),
     url: c.url,
     headersText: c.headerKeys.map((k) => `${k}: ${masked(k)}`).join('\n'),
+    oauthClientId: c.oauthClientId,
+    oauthClientSecret: c.oauthClientSecretSet ? masked('Client secret') : '',
     scope: c.scope,
     connectionIds: c.connectionIds
   }
@@ -95,6 +112,9 @@ function inputFrom(d: Draft, existing: ConnectorInfo | null): ConnectorInput {
     env: d.transport === 'stdio' ? secrets(d.envText, '=') : {},
     url: d.url.trim(),
     headers: d.transport === 'http' ? secrets(d.headersText, ':') : {},
+    oauthClientId: d.transport === 'http' ? d.oauthClientId.trim() : '',
+    // The mask keeps the saved secret; an empty field removes it.
+    oauthClientSecret: d.oauthClientSecret === MASK ? null : d.oauthClientSecret.trim(),
     scope: d.scope,
     connectionIds: d.scope === 'selected' ? d.connectionIds : []
   }
@@ -105,6 +125,7 @@ function ConnectorEditor({ existing, onDone }: { existing: ConnectorInfo | null;
   const [draft, setDraft] = useState<Draft>(() => draftFrom(existing))
   const [error, setError] = useState<string | null>(null)
   const [busy, setBusy] = useState(false)
+  const [ownClient, setOwnClient] = useState(Boolean(existing?.oauthClientId))
   const missing = existing?.missingSecrets ?? []
 
   const save = async () => {
@@ -169,7 +190,7 @@ function ConnectorEditor({ existing, onDone }: { existing: ConnectorInfo | null;
           <div className="field">
             <label>URL</label>
             <input className="text mono" value={draft.url} placeholder="https://mcp.example.com/mcp" spellCheck={false} onChange={(e) => setDraft({ ...draft, url: e.target.value })} data-testid="connector-url" />
-            <span className="hint">Streamable HTTP, or SSE for older servers. Servers that need you to sign in (OAuth) are not supported yet: use one that takes an API key in a header.</span>
+            <span className="hint">Streamable HTTP, or SSE for older servers. A server that wants you to sign in shows a Sign in button once it is added.</span>
           </div>
           <div className="field">
             <label>Headers</label>
@@ -184,6 +205,37 @@ function ConnectorEditor({ existing, onDone }: { existing: ConnectorInfo | null;
             />
             <span className="hint">One per line, Name: value. Values are saved encrypted and never shown again; leave {MASK} to keep one.</span>
           </div>
+          <button type="button" className="disclosure" onClick={() => setOwnClient(!ownClient)} aria-expanded={ownClient} data-testid="connector-oauth-advanced">
+            <Icon name={ownClient ? 'chevron-down' : 'chevron-right'} size={12} /> Sign-in app
+          </button>
+          {ownClient ? (
+            <div className="field">
+              <label>OAuth client</label>
+              <div className="field-pair">
+                <input
+                  className="text mono"
+                  value={draft.oauthClientId}
+                  placeholder="Client ID"
+                  spellCheck={false}
+                  onChange={(e) => setDraft({ ...draft, oauthClientId: e.target.value })}
+                  data-testid="connector-oauth-client-id"
+                />
+                <input
+                  className="text mono"
+                  type="password"
+                  value={draft.oauthClientSecret}
+                  placeholder="Client secret (if it has one)"
+                  spellCheck={false}
+                  onChange={(e) => setDraft({ ...draft, oauthClientSecret: e.target.value })}
+                  data-testid="connector-oauth-client-secret"
+                />
+              </div>
+              <span className="hint">
+                Only for a server that cannot register apps itself. Register one with it whose redirect URL is http://127.0.0.1/callback (any port), and give
+                its ID here. Most servers need nothing here: Sagittarion registers itself when you sign in.
+              </span>
+            </div>
+          ) : null}
         </>
       )}
       {missing.length ? (
@@ -261,6 +313,12 @@ function ConnectorCard({ c, open, onToggle }: { c: ConnectorInfo; open: boolean;
   const [editing, setEditing] = useState(false)
   const [refreshing, setRefreshing] = useState(false)
   const s = c.status
+  const signIn = () => void signInTo(c, putConnector, toast)
+  const signOut = () =>
+    void window.api.connectors
+      .signOut(c.id)
+      .then(putConnector)
+      .catch((e) => toast('error', `Could not sign out of ${c.name}`, errorMessage(e)))
 
   const setEnabled = (on: boolean) =>
     void window.api.connectors
@@ -310,15 +368,30 @@ function ConnectorCard({ c, open, onToggle }: { c: ConnectorInfo; open: boolean;
               {s.state === 'error' ? (
                 <span className="connector-error">{s.error}</span>
               ) : s.state === 'connected' ? (
-                <span>Running{s.server ? ` ${s.server.name} ${s.server.version}` : ''}.</span>
+                <span>
+                  Running{s.server ? ` ${s.server.name} ${s.server.version}` : ''}
+                  {c.signedIn ? ', signed in' : ''}.
+                </span>
               ) : s.state === 'connecting' ? (
                 <span>Starting…</span>
+              ) : s.state === 'signin' ? (
+                <span>The server wants you to sign in. Your browser opens its sign-in page; then come back here.</span>
+              ) : s.state === 'authorizing' ? (
+                <span>Finish signing in in your browser. This updates when you have.</span>
               ) : s.state === 'off' ? (
                 <span>Off: no chat can use it.</span>
               ) : (
                 <span>Starts when a chat uses it.</span>
               )}
-              {c.enabled ? (
+              {c.enabled && s.state === 'signin' ? (
+                <button type="button" className="btn small primary" onClick={signIn} data-testid="connector-sign-in">
+                  <Icon name="key" size={12} /> Sign in
+                </button>
+              ) : c.enabled && s.state === 'authorizing' ? (
+                <button type="button" className="btn small ghost" onClick={() => void window.api.connectors.cancelSignIn(c.id)} data-testid="connector-sign-in-cancel">
+                  Cancel
+                </button>
+              ) : c.enabled ? (
                 <button type="button" className="btn small ghost" onClick={() => void refresh()} disabled={refreshing} data-testid="connector-refresh">
                   {refreshing ? <span className="spinner tiny" /> : <Icon name="refresh" size={12} />} {s.state === 'error' ? 'Try again' : 'Reconnect'}
                 </button>
@@ -339,6 +412,11 @@ function ConnectorCard({ c, open, onToggle }: { c: ConnectorInfo; open: boolean;
               <button type="button" className="btn small ghost danger" onClick={() => void remove()} data-testid="connector-remove">
                 <Icon name="trash" size={12} /> Remove
               </button>
+              {c.signedIn ? (
+                <button type="button" className="btn small ghost" onClick={signOut} title="Forget this connector's sign-in" data-testid="connector-sign-out">
+                  Sign out
+                </button>
+              ) : null}
               <button type="button" className="btn small" onClick={() => setEditing(true)} data-testid="connector-edit">
                 Edit
               </button>

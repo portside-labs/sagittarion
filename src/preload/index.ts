@@ -98,6 +98,9 @@ const api: Api = {
     refresh: (id) => ipcRenderer.invoke('connectors:refresh', id),
     setEnabled: (id, enabled) => ipcRenderer.invoke('connectors:setEnabled', id, enabled),
     setToolPermission: (id, tool, permission) => ipcRenderer.invoke('connectors:setToolPermission', id, tool, permission),
+    signIn: (id) => ipcRenderer.invoke('connectors:signIn', id),
+    cancelSignIn: (id) => ipcRenderer.invoke('connectors:cancelSignIn', id),
+    signOut: (id) => ipcRenderer.invoke('connectors:signOut', id),
     remove: (id) => ipcRenderer.invoke('connectors:remove', id),
     onStatus: (cb) => subscribe<ConnectorInfo>('connectors:status', cb)
   },

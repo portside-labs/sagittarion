@@ -116,6 +116,17 @@ connectors on for its chat as `mcp__<connector>__<tool>`; read-only tools run
 freely, and the rest wait for approval in the chat unless Settings says
 otherwise.
 
+A remote server that answers 401 gets OAuth as MCP specifies it
+(`connectors/oauth.ts`, on the SDK's `auth`): discovery of its authorization
+server, dynamic client registration (or a client ID and secret the user
+registered), and the authorization code flow with PKCE and a resource
+indicator. Signing in is only ever started from Settings or the chat's
+connectors menu: the sign-in page opens in the default browser, which comes
+back to a page served on `127.0.0.1` for the few minutes it may take.
+Otherwise the provider only presents and refreshes saved tokens, and stops with
+"Sign in to …" rather than open a browser in the middle of an ask. Tokens and
+the registration are kept encrypted with the connector.
+
 **Local AI Privacy** (`src/main/privacy/`) sits between Ask and every remote
 provider. [LOCAL_AI_PRIVACY.md](LOCAL_AI_PRIVACY.md) has the design, the
 evaluation and the roadmap.

@@ -129,7 +129,10 @@ prose with every other field, so personal data in a reply is replaced and
 counted before the next request leaves, and verification fails closed on it as
 on anything else. A connector is a system of its own: a remote one receives
 real values over its own connection, outside this boundary, which is why the
-approval card shows exactly what it would get.
+approval card shows exactly what it would get. A connector signed in with
+OAuth keeps its tokens encrypted with its settings (or, on a computer with no
+keyring, in memory until the app quits); they go only to that server and its
+authorization server, never to the model.
 
 ## 3. Integration points
 

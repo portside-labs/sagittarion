@@ -187,6 +187,20 @@ async function contextDatabases(home: string, wanted: AskOptions['databases'], o
   return out
 }
 
+/**
+ * Opens a connector's sign-in page in the user's browser. The tests set SAGITTARION_TEST_BROWSER=fetch to follow it
+ * here instead, as a browser already signed in to the server would.
+ */
+async function openSignInPage(url: URL): Promise<void> {
+  const local = url.hostname === '127.0.0.1' || url.hostname === 'localhost' || url.hostname === '[::1]'
+  if (url.protocol !== 'https:' && !(url.protocol === 'http:' && local)) throw new Error(`The server's sign-in page is not a secure web address (${url.protocol}).`)
+  if (process.env['SAGITTARION_TEST_BROWSER'] === 'fetch') {
+    await fetch(url)
+    return
+  }
+  await shell.openExternal(url.toString())
+}
+
 /** The provider behind the active connection, or behind one as typed into Settings, with its key. */
 async function providerFor(input?: AiConnectionInput, extra: Partial<ProviderConfig> = {}) {
   const { connection, apiKey } = await settingsStore.resolve(input)
@@ -734,7 +748,12 @@ if (!app.requestSingleInstanceLock()) {
     connectorStore = new ConnectorStore(path.join(userData, 'connectors.json'), codec)
     instructionStore = new InstructionStore(path.join(userData, 'instructions.json'))
     chatHistory = new ChatHistoryStore(path.join(userData, 'chat-history.json'))
-    connectorManager = new ConnectorManager({ clientInfo: { name: 'Sagittarion', version: app.getVersion() }, path: () => connectorPath() })
+    connectorManager = new ConnectorManager({
+      clientInfo: { name: 'Sagittarion', version: app.getVersion() },
+      path: () => connectorPath(),
+      oauth: (c) => ({ load: () => connectorStore.oauth(c.id), save: (state) => connectorStore.saveOAuth(c.id, state) }),
+      openBrowser: openSignInPage
+    })
     workspaceStore = new WorkspaceStore(path.join(userData, 'workspace.json'))
     embeddingCache = new EmbeddingCache(path.join(userData, 'ai-cache', 'embeddings.json'))
     semanticModel = new SemanticModel({

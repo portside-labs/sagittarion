@@ -3,6 +3,7 @@ import path from 'node:path'
 import { randomUUID } from 'node:crypto'
 import type { ConnectorInfo, ConnectorInput, ConnectorScope, ConnectorStatus, ConnectorTransport, ToolPermission } from '@shared/connectors'
 import type { SecretCodec } from '../store/connections'
+import type { OAuthState } from './oauth'
 
 /** A connector as saved. Environment variable and header values are secrets: encrypted, or null where they could not be. */
 interface StoredConnector {
@@ -15,6 +16,11 @@ interface StoredConnector {
   env: Record<string, string | null>
   url: string
   headers: Record<string, string | null>
+  /** A client the user registered with the server, for one that cannot register apps itself; its secret encrypted. */
+  oauthClientId: string
+  oauthClientSecret: string | null
+  /** Sign-in (tokens, the app's registration), as encrypted JSON; null when not signed in or not kept. */
+  oauth: string | null
   scope: ConnectorScope
   connectionIds: string[]
   toolPermissions: Record<string, ToolPermission>
@@ -22,9 +28,12 @@ interface StoredConnector {
 }
 
 /** A connector with its secrets in the clear, for the main process alone. */
-export interface Connector extends Omit<StoredConnector, 'env' | 'headers'> {
+export interface Connector extends Omit<StoredConnector, 'env' | 'headers' | 'oauthClientSecret' | 'oauth'> {
   env: Record<string, string>
   headers: Record<string, string>
+  oauthClientSecret: string
+  /** Signed in with OAuth: tokens are to hand. */
+  signedIn: boolean
   /** Keys whose values are not to hand: saved on a computer that could not keep them, before a relaunch. */
   missingSecrets: string[]
 }
@@ -56,6 +65,9 @@ function migrate(raw: any): StoredConnector | null {
     env: record(raw.env),
     url: typeof raw.url === 'string' ? raw.url : '',
     headers: record(raw.headers),
+    oauthClientId: typeof raw.oauthClientId === 'string' ? raw.oauthClientId : '',
+    oauthClientSecret: typeof raw.oauthClientSecret === 'string' ? raw.oauthClientSecret : null,
+    oauth: typeof raw.oauth === 'string' ? raw.oauth : null,
     scope: raw.scope === 'selected' ? 'selected' : 'all',
     connectionIds: strings(raw.connectionIds),
     toolPermissions: permissions,
@@ -71,6 +83,8 @@ export class ConnectorStore {
    * connector works now and asks for them again after a relaunch.
    */
   private readonly unsaved = new Map<string, Record<string, string>>()
+  /** Sign-ins this session could not save (no keyring): they last until the app quits. */
+  private readonly unsavedOAuth = new Map<string, OAuthState>()
 
   constructor(
     private readonly file: string,
@@ -113,7 +127,48 @@ export class ConnectorStore {
     const missing: string[] = []
     const env = this.reveal(s.id, 'env:', s.env, missing)
     const headers = this.reveal(s.id, 'header:', s.headers, missing)
-    return { ...s, args: [...s.args], connectionIds: [...s.connectionIds], toolPermissions: { ...s.toolPermissions }, env, headers, missingSecrets: missing }
+    const secret = this.reveal(s.id, 'oauth:', s.oauthClientSecret === null ? {} : { 'Client secret': s.oauthClientSecret || null }, missing)['Client secret'] ?? ''
+    const { oauth: _sealed, ...rest } = s
+    return {
+      ...rest,
+      args: [...s.args],
+      connectionIds: [...s.connectionIds],
+      toolPermissions: { ...s.toolPermissions },
+      env,
+      headers,
+      oauthClientSecret: secret,
+      signedIn: Boolean(this.openOAuth(s).tokens?.access_token),
+      missingSecrets: missing
+    }
+  }
+
+  private openOAuth(s: StoredConnector): OAuthState {
+    const plain = s.oauth ? this.codec.decrypt(s.oauth) : null
+    if (plain) {
+      try {
+        return JSON.parse(plain) as OAuthState
+      } catch {
+        /* unreadable: as if never signed in */
+      }
+    }
+    return this.unsavedOAuth.get(s.id) ?? {}
+  }
+
+  /** A connector's sign-in, as last saved. */
+  oauth(id: string): OAuthState {
+    const s = this.cache?.find((c) => c.id === id)
+    return s ? this.openOAuth(s) : (this.unsavedOAuth.get(id) ?? {})
+  }
+
+  /** Keeps a connector's sign-in: encrypted with the connector, or for this session where no keyring can. */
+  async saveOAuth(id: string, state: OAuthState): Promise<void> {
+    const empty = !state.client && !state.tokens && !state.discovery
+    const cipher = !empty && this.codec.available ? this.codec.encrypt(JSON.stringify(state)) : null
+    if (cipher || empty) this.unsavedOAuth.delete(id)
+    else this.unsavedOAuth.set(id, state)
+    const list = await this.load()
+    if (!list.some((c) => c.id === id)) return
+    await this.persist(list.map((c) => (c.id === id ? { ...c, oauth: cipher } : c)))
   }
 
   async list(): Promise<Connector[]> {
@@ -147,6 +202,15 @@ export class ConnectorStore {
     return out
   }
 
+  /**
+   * The client secret as saved: encrypted; '' when it is kept for this session only (no keyring); null for none. A
+   * null input keeps the saved one, and '' removes it.
+   */
+  private sealClientSecret(id: string, input: string | null, previous: string | null): string | null {
+    const sealed = this.seal(id, 'oauth:', input === '' ? {} : { 'Client secret': input }, previous === null ? {} : { 'Client secret': previous || null })
+    return 'Client secret' in sealed ? (sealed['Client secret'] ?? '') : null
+  }
+
   async save(input: ConnectorInput): Promise<Connector> {
     const list = await this.load()
     const id = input.id || randomUUID()
@@ -161,10 +225,18 @@ export class ConnectorStore {
       env: input.transport === 'stdio' ? this.seal(id, 'env:', input.env, existing?.env ?? {}) : {},
       url: input.transport === 'http' ? input.url.trim() : '',
       headers: input.transport === 'http' ? this.seal(id, 'header:', input.headers, existing?.headers ?? {}) : {},
+      oauthClientId: input.transport === 'http' ? (input.oauthClientId ?? '').trim() : '',
+      oauthClientSecret: input.transport === 'http' && (input.oauthClientId ?? '').trim() ? this.sealClientSecret(id, input.oauthClientSecret, existing?.oauthClientSecret ?? null) : null,
+      oauth: existing?.oauth ?? null,
       scope: input.scope === 'selected' ? 'selected' : 'all',
       connectionIds: [...new Set(input.connectionIds)],
       toolPermissions: existing?.toolPermissions ?? {},
       createdAt: existing?.createdAt ?? Date.now()
+    }
+    // A sign-in belongs to one server and one client: another address, or another client, starts afresh.
+    if (existing && (existing.url !== stored.url || existing.oauthClientId !== stored.oauthClientId || stored.transport !== 'http')) {
+      stored.oauth = null
+      this.unsavedOAuth.delete(id)
     }
     const next = existing ? list.map((c) => (c.id === id ? stored : c)) : [...list, stored]
     await this.persist(next)
@@ -197,6 +269,7 @@ export class ConnectorStore {
 
   async remove(id: string): Promise<void> {
     this.unsaved.delete(id)
+    this.unsavedOAuth.delete(id)
     await this.persist((await this.load()).filter((c) => c.id !== id))
   }
 }
@@ -216,6 +289,9 @@ export function connectorInfo(c: Connector, status: ConnectorStatus): ConnectorI
     connectionIds: c.connectionIds,
     envKeys: c.transport === 'stdio' ? keys(c.env) : [],
     headerKeys: c.transport === 'http' ? keys(c.headers) : [],
+    oauthClientId: c.oauthClientId,
+    oauthClientSecretSet: Boolean(c.oauthClientSecret) || c.missingSecrets.includes('Client secret'),
+    signedIn: c.signedIn,
     missingSecrets: c.missingSecrets,
     toolPermissions: c.toolPermissions,
     status

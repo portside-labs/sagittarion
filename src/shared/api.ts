@@ -179,6 +179,14 @@ export interface Api {
     refresh(id: string): Promise<ConnectorInfo>
     setEnabled(id: string, enabled: boolean): Promise<ConnectorInfo>
     setToolPermission(id: string, tool: string, permission: ToolPermission): Promise<ConnectorInfo>
+    /**
+     * Signs in to a remote connector with OAuth: its sign-in page opens in the browser, and this resolves once the
+     * connector runs signed in (or the sign-in was cancelled).
+     */
+    signIn(id: string): Promise<ConnectorInfo>
+    cancelSignIn(id: string): Promise<void>
+    /** Forgets its tokens. */
+    signOut(id: string): Promise<ConnectorInfo>
     remove(id: string): Promise<void>
     /** A connector started, stopped, failed, or listed new tools. */
     onStatus(cb: (info: ConnectorInfo) => void): Unsubscribe

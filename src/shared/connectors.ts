@@ -23,12 +23,19 @@ export interface ConnectorInput {
   /** A remote server's address, spoken to over Streamable HTTP (or SSE, for older servers). */
   url: string
   headers: Record<string, string | null>
+  /**
+   * For a remote server that signs in with OAuth but cannot register apps itself: the client ID (and secret, a secret
+   * like the headers) the user registered with it. Empty for the usual case, where Sagittarion registers itself.
+   */
+  oauthClientId: string
+  oauthClientSecret: string | null
   scope: ConnectorScope
   /** The saved database connections it is on for, when scope is "selected". */
   connectionIds: string[]
 }
 
-export type ConnectorState = 'off' | 'idle' | 'connecting' | 'connected' | 'error'
+/** `signin`: the server wants the user to sign in (OAuth); `authorizing`: waiting for them to, in their browser. */
+export type ConnectorState = 'off' | 'idle' | 'connecting' | 'connected' | 'error' | 'signin' | 'authorizing'
 
 export interface ConnectorTool {
   /** The tool's name on its server. */
@@ -49,7 +56,10 @@ export interface ConnectorStatus {
 }
 
 /** A connector as the renderer shows it: its settings without the secret values, and how it is doing. */
-export interface ConnectorInfo extends Omit<ConnectorInput, 'env' | 'headers'> {
+export interface ConnectorInfo extends Omit<ConnectorInput, 'env' | 'headers' | 'oauthClientSecret'> {
+  /** Signed in with OAuth: tokens are saved for it (encrypted), and renewed as they run out. */
+  signedIn: boolean
+  oauthClientSecretSet: boolean
   /** Names of the environment variables and headers set; their values stay in the main process. */
   envKeys: string[]
   headerKeys: string[]
@@ -74,7 +84,7 @@ export interface ToolApprovalRequest {
 export type ToolApprovalDecision = 'once' | 'always' | 'deny'
 
 export function emptyConnector(): ConnectorInput {
-  return { id: '', name: '', enabled: true, transport: 'stdio', command: '', args: [], env: {}, url: '', headers: {}, scope: 'all', connectionIds: [] }
+  return { id: '', name: '', enabled: true, transport: 'stdio', command: '', args: [], env: {}, url: '', headers: {}, oauthClientId: '', oauthClientSecret: null, scope: 'all', connectionIds: [] }
 }
 
 /** Tools that only read run without asking; anything else asks first, as in Claude Desktop. */

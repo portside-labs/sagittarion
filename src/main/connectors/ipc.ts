@@ -30,6 +30,8 @@ export function readConnectorInput(raw: unknown): ConnectorInput {
     env: secrets(r.env),
     url: typeof r.url === 'string' ? r.url.trim() : '',
     headers: secrets(r.headers),
+    oauthClientId: typeof r.oauthClientId === 'string' ? r.oauthClientId.trim() : '',
+    oauthClientSecret: typeof r.oauthClientSecret === 'string' ? r.oauthClientSecret : null,
     scope: r.scope === 'selected' ? 'selected' : base.scope,
     connectionIds: strings(r.connectionIds)
   }
@@ -88,7 +90,19 @@ export function registerConnectorIpc(store: ConnectorStore, manager: ConnectorMa
     if (typeof tool !== 'string' || !PERMISSIONS.includes(permission)) throw new Error('Unknown permission.')
     return info(await store.setToolPermission(id, tool, permission))
   })
+  // Sign-in with OAuth, for a remote server that asks for it: resolves once the connector runs signed in.
+  ipcMain.handle('connectors:signIn', async (_e, id: string) => {
+    const c = await required(id)
+    await manager.signIn(c)
+    return info((await store.get(id)) ?? c)
+  })
+  ipcMain.handle('connectors:cancelSignIn', (_e, id: string) => manager.cancelSignIn(id))
+  ipcMain.handle('connectors:signOut', async (_e, id: string) => {
+    await manager.signOut(await required(id))
+    return info(await required(id))
+  })
   ipcMain.handle('connectors:remove', async (_e, id: string) => {
+    manager.cancelSignIn(id)
     await manager.stop(id)
     await store.remove(id)
   })

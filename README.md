@@ -23,8 +23,9 @@ sensitive values are masked on your machine before they reach the model.
   databases to one and it follows a customer, an order or a request from one
   to the next, to lay out what happened during an incident.
 - **Connectors.** Plug MCP servers into Ask, as you would in Claude Desktop,
-  so a question can draw on your issue tracker, CRM or files. Choose the
-  connections each one is on for, and which tools ask before they run.
+  so a question can draw on your issue tracker, CRM or files. Sign in to remote
+  ones with OAuth in your browser. Choose the connections each one is on for,
+  and which tools ask before they run.
 - **[Local AI Privacy](docs/LOCAL_AI_PRIVACY.md).** Names, emails, card
   numbers and other sensitive values become placeholders before a request
   leaves your computer, and are restored in the answer. You can inspect

@@ -5194,3 +5194,22 @@ html.drag-sorting * {
   opacity: 1;
   background: var(--bg-hover);
 }
+
+/* ---- connectors that sign in with OAuth ---- */
+.connector-dot.signin {
+  background: var(--warn);
+  box-shadow: none;
+}
+.connector-dot.authorizing {
+  background: var(--warn);
+  box-shadow: none;
+  animation: pulse-dot 1s ease-in-out infinite;
+}
+.field-pair {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+}
+.connectors-menu-item .btn.small {
+  flex: 0 0 auto;
+}
