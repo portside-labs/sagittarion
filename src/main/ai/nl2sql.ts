@@ -4,11 +4,11 @@
 // verified before it leaves; the model's answers keep their placeholders in the transcript (that is what it wrote),
 // and are restored only where they are used here: the SQL that runs, and the words shown in the chat.
 import type { DatabaseKind, QueryResponse, TableRef } from '@shared/types'
-import type { AiClarification, AiDatabaseRef, AiProgressStep, AiQueryResult, AiRanQuery, AiResult, AiTurn, AiUsage } from '@shared/ai'
+import type { AiClarification, AiDatabaseRef, AiMemory, AiProgressStep, AiQueryResult, AiRanQuery, AiResult, AiTurn, AiUsage } from '@shared/ai'
 import { cellToPlainText } from '@shared/export'
 import { describeCounts, type SealedText, type SealedTurn, type SensitiveEntityType } from '@shared/privacy'
 import { checkReadOnlySql, explainStatement } from './guard'
-import { acrossRules, acrossTools, instructionsPrompt, isoDate, RESULT_CHARS, RESULT_ROWS, systemRules, TOOLS } from './prompt'
+import { acrossRules, acrossTools, instructionsPrompt, isoDate, RESULT_CHARS, RESULT_ROWS, singleTools, systemRules } from './prompt'
 import { parseJsonObject, ProviderError, throwIfAborted, type ChatMessage, type ChatRequest, type ChatResponse, type ToolCall, type ToolDef } from './providers/types'
 import { estimateTokens, shortComment, tokenize, type RenderView, type SchemaIndex, type Selection } from './schema-index'
 import type { EmbeddingCache } from './embeddings'
@@ -46,6 +46,8 @@ export interface AgentDatabase {
   runQuery: (sql: string, maxRows: number) => Promise<QueryResponse>
   distinctValues: (ref: TableRef, column: string) => Promise<string[] | null>
   recentTables?: string[]
+  /** The user lets the model run read-only queries here and read their results, to work questions out itself. */
+  readResults?: boolean
 }
 
 export interface AskDeps {
@@ -54,7 +56,11 @@ export interface AskDeps {
   index: SchemaIndex
   /** The way to the model: protects and verifies every request when Local AI Privacy applies to the connection. */
   provider: ModelGateway
-  settings: { sendSampleValues: boolean; autoRun: boolean; schemaBudgetTokens: number; embeddingModel?: string; readResults?: boolean }
+  settings: { sendSampleValues: boolean; autoRun: boolean; schemaBudgetTokens: number; embeddingModel?: string }
+  /** For the one database the fields above describe: whether the model may read query results on it. */
+  readResults?: boolean
+  /** Its saved connection, which a fact the model offers to remember is about. */
+  connectionId?: string
   /** Runs SQL under the database's read-only guard. */
   runQuery: (sql: string, maxRows: number) => Promise<QueryResponse>
   /** Distinct values of a column, or null when there are too many to be useful. */
@@ -206,7 +212,20 @@ function tableData(index: SchemaIndex, keys: string[]): SchemaTableData[] {
 /** The databases of an ask: those given, or the one the single-database fields describe. */
 function databasesOf(deps: AskDeps): AgentDatabase[] {
   if (deps.databases?.length) return deps.databases
-  return [{ key: 'main', name: 'this database', kind: deps.kind, serverVersion: deps.serverVersion, index: deps.index, runQuery: deps.runQuery, distinctValues: deps.distinctValues, recentTables: deps.recentTables }]
+  return [
+    {
+      key: 'main',
+      name: 'this database',
+      kind: deps.kind,
+      serverVersion: deps.serverVersion,
+      index: deps.index,
+      runQuery: deps.runQuery,
+      distinctValues: deps.distinctValues,
+      recentTables: deps.recentTables,
+      readResults: deps.readResults,
+      connectionId: deps.connectionId
+    }
+  ]
 }
 
 /** A render view for these tables, or none when nothing is protected. */
@@ -322,13 +341,18 @@ async function run(deps: AskDeps, question: string, history: AiTurn[], usage: Ai
   const privacy = provider.privacy
   const fmt = new Intl.NumberFormat('en-US')
   const dbs = databasesOf(deps)
-  /** More than one database in the chat: the model looks across them all, and may read query results. */
+  /** More than one database in the chat: the model looks across them all. */
   const across = dbs.length > 1
-  const readResults = across && deps.settings.readResults === true
+  /** The databases whose query results the model may read: the user said so for these. */
+  const readableKeys = dbs.filter((d) => d.readResults).map((d) => d.key)
+  /** With any, the model works the question out by looking at data, rather than writing one query for the user. */
+  const investigating = readableKeys.length > 0
   const identifiers = () => dbs.flatMap((d) => d.index.identifiers())
   const refOf = (db: AgentDatabase): AiDatabaseRef => ({ connectionId: db.connectionId ?? '', name: db.name })
   /** The queries the model ran to look into the question, as they ran here. */
   const ranQueries: AiRanQuery[] = []
+  /** Facts the model offered to remember, for the user to keep or not. */
+  const memories: AiMemory[] = []
   // Table and column names are never protected, so the model can still write SQL with them. The list grows as
   // tables are described, so it is refreshed before each protection.
   privacy?.useSchema(identifiers())
@@ -384,6 +408,30 @@ async function run(deps: AskDeps, question: string, history: AiTurn[], usage: Ai
   const schemaBlock = sections.join('\n\n')
   const today = isoDate(deps.now ?? new Date())
 
+  /**
+   * What an earlier answer's query returned when it ran in the editor, on a database whose results the model may read:
+   * the first rows, each value protected with its column as context, as run_query's are.
+   */
+  const editorResult = async (turn: AiTurn): Promise<string> => {
+    const r = turn.result
+    if (!r || !Array.isArray(r.columns) || !Array.isArray(r.rows)) return ''
+    const db = across ? dbs.find((d) => d.name === turn.database) : dbs[0]
+    if (!db?.readResults) return ''
+    const rows = r.rows.slice(0, 20).map((row) => r.columns.map((_, c) => (row[c] == null ? 'NULL' : safeSlice(String(row[c]).replace(/\s*\n\s*/g, ' '), 200))))
+    if (privacy && rows.length) {
+      privacy.useSchema(identifiers())
+      for (let c = 0; c < r.columns.length; c++) {
+        const at = rows.map((row, i) => (row[c] === 'NULL' ? -1 : i)).filter((i) => i >= 0)
+        if (!at.length) continue
+        const safe = await privacy.protectValues({ column: r.columns[c] }, at.map((i) => rows[i][c]), 'query results')
+        at.forEach((i, k) => (rows[i][c] = safe[k]))
+      }
+    }
+    const count = Number(r.rowCount) || rows.length
+    const head = `When it ran in the editor, it returned ${count} row${count === 1 ? '' : 's'}${count > rows.length ? `; the first ${rows.length}` : ''}:`
+    return [head, r.columns.join(' | '), ...rows.map((row) => row.join(' | '))].join('\n')
+  }
+
   let toolsEnabled = true
   const messages: ChatMessage[] = []
   for (const turn of history.slice(-6)) {
@@ -391,12 +439,15 @@ async function run(deps: AskDeps, question: string, history: AiTurn[], usage: Ai
     const sealed = provider.adoptTurn(turn)
     messages.push({ role: 'user', content: sealed?.question.text ?? turn.question })
     const sql = turn.sql ? (sealed?.sql?.text ?? turn.sql) : undefined
-    messages.push({ role: 'assistant', content: sql ? `SQL used${turn.database ? ` on ${turn.database}` : ''}:\n${sql}` : (sealed?.answer?.text ?? turn.answer ?? '(no answer)') })
+    const result = sql ? await editorResult(turn) : ''
+    const said = sql ? `SQL used${turn.database ? ` on ${turn.database}` : ''}:\n${sql}` : (sealed?.answer?.text ?? turn.answer ?? '(no answer)')
+    messages.push({ role: 'assistant', content: result ? `${said}\n\n${result}` : said })
   }
   messages.push({ role: 'user', content: (await provider.seal(question))?.text ?? question })
 
-  // Connectors take steps of their own, and following a trail across databases takes more again.
-  const maxSteps = deps.maxToolSteps ?? (across ? 16 : deps.connectors?.tools.length ? 10 : 6)
+  // Connectors take steps of their own, following a trail across databases takes more, and working a question out
+  // from the data takes the most.
+  const maxSteps = deps.maxToolSteps ?? (investigating ? 25 : across ? 16 : deps.connectors?.tools.length ? 10 : 6)
   const maxRepairs = deps.maxRepairs ?? 2
   let repairs = 0
   let explained = false
@@ -431,9 +482,9 @@ async function run(deps: AskDeps, question: string, history: AiTurn[], usage: Ai
       ? acrossRules(
           dbs.map((d) => ({ key: d.key, name: d.name, kind: d.kind, serverVersion: d.serverVersion, defaultSchema: d.index.defaultSchema })),
           today,
-          { tools: toolsEnabled, readResults, connectors: Boolean(toolsEnabled && connectorTools.length) }
+          { tools: toolsEnabled, readable: toolsEnabled ? readableKeys : [], connectors: Boolean(toolsEnabled && connectorTools.length) }
         )
-      : systemRules(dbs[0].kind, dbs[0].serverVersion, today, dbs[0].index.defaultSchema, toolsEnabled, Boolean(toolsEnabled && connectorTools.length))
+      : systemRules(dbs[0].kind, dbs[0].serverVersion, today, dbs[0].index.defaultSchema, toolsEnabled, Boolean(toolsEnabled && connectorTools.length), investigating)
     const req: ChatRequest = {
       system: [
         { text: rules, structured: true },
@@ -442,7 +493,7 @@ async function run(deps: AskDeps, question: string, history: AiTurn[], usage: Ai
         { text: schemaBlock, cacheable: true, structured: true }
       ],
       messages,
-      tools: toolsEnabled ? [...(across ? acrossTools(dbs.map((d) => d.key), readResults) : TOOLS), ...connectorTools] : undefined,
+      tools: toolsEnabled ? [...(across ? acrossTools(dbs.map((d) => d.key), readableKeys) : singleTools(investigating)), ...connectorTools] : undefined,
       toolChoice: toolsEnabled ? (last ? ('none' as const) : ('auto' as const)) : undefined
     }
     const outbound = await prepare(req)
@@ -491,7 +542,15 @@ async function run(deps: AskDeps, question: string, history: AiTurn[], usage: Ai
     const restored = provider.restoreText(fromModel)
     const message = restored.text || (local ? shownText(local) : '')
     const sealed = await sealTurn(restored.text ? { answer: { text: fromModel, spans: restored.spans } } : {})
-    return { kind: 'clarify', message, usage, privacy: provider.report(sealed), ...(cutShort ? { cutShort } : {}), ...(ranQueries.length ? { queries: ranQueries } : {}) }
+    return {
+      kind: 'clarify',
+      message,
+      usage,
+      privacy: provider.report(sealed),
+      ...(cutShort ? { cutShort } : {}),
+      ...(ranQueries.length ? { queries: ranQueries } : {}),
+      ...(memories.length ? { memories } : {})
+    }
   }
 
   const finish = async (p: Proposal, tokenizedSql: string, restored: Restored, db: AgentDatabase): Promise<AiQueryResult> => {
@@ -518,6 +577,7 @@ async function run(deps: AskDeps, question: string, history: AiTurn[], usage: Ai
       autoRun: deps.settings.autoRun && explained && !warnings.length,
       ...(across ? { database: refOf(db) } : {}),
       ...(ranQueries.length ? { queries: ranQueries } : {}),
+      ...(memories.length ? { memories } : {}),
       ...(warnings.length ? { warnings } : {}),
       privacy: provider.report(sealed)
     }
@@ -601,7 +661,17 @@ async function run(deps: AskDeps, question: string, history: AiTurn[], usage: Ai
   const runTool = async (call: ToolCall): Promise<{ content: string; structured?: boolean }> => {
     usage.toolCalls++
     const args = call.args ?? {}
-    const named = call.name === 'search_schema' || call.name === 'describe_table' || call.name === 'sample_values' || (call.name === 'run_query' && readResults)
+    if (call.name === 'remember') {
+      const fact = shownText(String(args.fact ?? '')).replace(/\s+/g, ' ').trim()
+      if (!fact) return { content: 'Give the fact to remember.' }
+      const key = String(args.database ?? '')
+      const about = across ? (key === 'all' ? [] : dbs.filter((d) => d.key === key)) : dbs.slice(0, 1)
+      const connectionIds = about.flatMap((d) => (d.connectionId ? [d.connectionId] : []))
+      if (!memories.some((m) => m.fact === fact)) memories.push({ fact: safeSlice(fact, 500), connectionIds })
+      progress.note('tool', 'Model offered to remember something', safeSlice(fact, 120))
+      return { content: 'Offered to the user, who decides whether to keep it. Carry on.' }
+    }
+    const named = call.name === 'search_schema' || call.name === 'describe_table' || call.name === 'sample_values' || call.name === 'run_query'
     const target = named ? dbFor(args) : dbs[0]
     if (typeof target === 'string') {
       progress.note('tool', 'Model named a database that is not in the chat', String(args.database ?? ''))
@@ -611,7 +681,11 @@ async function run(deps: AskDeps, question: string, history: AiTurn[], usage: Ai
     const ctx = contextOf(db)
     /** " in Orders" in a chat across databases. */
     const inDb = across ? ` in ${db.name}` : ''
-    if (call.name === 'run_query' && readResults) {
+    if (call.name === 'run_query') {
+      if (!db.readResults) {
+        progress.note('tool', `Model asked to read results on ${db.name}, which the settings do not allow`)
+        return { content: `Results cannot be read on ${across ? `"${db.key}"` : 'this database'}: write the query for the user to run instead.` }
+      }
       const purpose = shownText(String(args.purpose ?? '')).trim()
       const step = progress.start('query', `Queried ${db.name}${purpose ? `: ${safeSlice(purpose, 80)}` : ''}`)
       return readQuery(db, String(args.sql ?? ''), step)
@@ -701,7 +775,7 @@ async function run(deps: AskDeps, question: string, history: AiTurn[], usage: Ai
 
   let lastText = ''
   for (let step = 0; step < maxSteps; step++) {
-    const res = await complete(across && step === maxSteps - 1)
+    const res = await complete((across || investigating) && step === maxSteps - 1)
     lastText = res.text
     let calls = res.toolCalls
     if (!calls.length) {
@@ -709,7 +783,7 @@ async function run(deps: AskDeps, question: string, history: AiTurn[], usage: Ai
       if (parsed && (typeof parsed.sql === 'string' || typeof parsed.needs_clarification === 'string')) {
         calls = [{ id: 'json', name: 'propose_query', args: parsed }]
       } else if (res.text.trim()) {
-        progress.note('done', 'Model answered in words, without a query')
+        progress.note('done', investigating ? 'Answered' : 'Model answered in words, without a query')
         // "max_tokens" (Anthropic) and "length" (OpenAI and the like): the reply stopped at the model's limit.
         return clarify(safeSlice(res.text.trim(), MAX_PROSE_CHARS), undefined, /^(max_tokens|length)$/.test(res.stopReason))
       } else {

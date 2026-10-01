@@ -1,5 +1,5 @@
 import { create } from 'zustand'
-import type { AppInfo, ConnectionConfig, DatabaseKind, GroupStyle, SessionInfo, SshProfile, WorkspaceConnection, WorkspaceState } from '@shared/types'
+import type { AppInfo, ConnectionConfig, DatabaseKind, GroupStyle, SessionInfo, SshProfile, StatementResult, WorkspaceConnection, WorkspaceState } from '@shared/types'
 import type { AiSettings, ProviderId } from '@shared/ai'
 import type { ConnectorInfo, ToolApprovalRequest } from '@shared/connectors'
 import type { Instruction } from '@shared/instructions'
@@ -8,7 +8,7 @@ import { errorMessage } from './lib/util'
 import { defaultLayout, isValidLayout, withoutLeaf, type LayoutNode } from './lib/layout'
 import { chatsFromWorkspace, closeChatTab, emptyChat, restoreChat, saveChat, withoutTabChats, type ChatState } from './lib/chat'
 import { clusterTabs, groupByConnection, nearestTab, settleCollapsed } from './lib/tab-groups'
-import { createSessionStore, snapshotSession, type SessionStore } from './session-store'
+import { afterRunOnOpen, createSessionStore, snapshotSession, type SessionStore } from './session-store'
 import { ACCEPT_KEY_OPTIONS, type KeywordCase } from './lib/sql-complete'
 import { DEFAULT_THEME, isCodeFontId, isSyntaxId, isThemeId, type CodeFontId, type SyntaxId, type ThemeId } from './lib/theme'
 
@@ -150,9 +150,9 @@ interface State {
   dropApprovals(match: (request: ToolApprovalRequest) => boolean): void
   /**
    * Puts SQL in the editor of a connection's query tab in front, or a new query tab, connecting first, and brings the
-   * connection to the front; runs it when asked.
+   * connection to the front; runs it when asked, and resolves with what it returned (null when it did not run).
    */
-  openSql(connectionId: string, sql: string, run: boolean): Promise<void>
+  openSql(connectionId: string, sql: string, run: boolean): Promise<StatementResult[] | null>
   setUiPref(patch: Partial<UiPrefs>): void
   init(): Promise<void>
   loadSettings(): Promise<void>
@@ -233,7 +233,8 @@ function loadChatWidth(): number {
 /** What the chat needs from a query tab to put SQL in its editor. */
 export interface QueryTabHandle {
   setSql(sql: string): void
-  run(sql: string): void
+  /** Runs it; resolves with its results, or null when it did not run. */
+  run(sql: string): Promise<StatementResult[] | null>
 }
 
 /** The query tabs on screen, by tab id, so the chat can reach their editors. */
@@ -413,8 +414,11 @@ export const useStore = create<State>()((set, get, api) => {
       get().activateTab(connectionId)
       if (handle) {
         handle.setSql(sql)
-        if (run) handle.run(sql)
-      } else store.getState().newQueryTab(sql, undefined, run)
+        return run ? handle.run(sql) : null
+      }
+      store.getState().newQueryTab(sql, undefined, run)
+      const opened = store.getState().activeTabId
+      return run && opened ? afterRunOnOpen(opened) : null
     },
 
     setUiPref(patch) {

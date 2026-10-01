@@ -38,16 +38,20 @@ question and the chat history over IPC and gets an `AiResult` back.
 | `sample_values` results | `distinctValuesFor` in `main/index.ts` | yes: up to 20 distinct values |
 | Repair feedback: EXPLAIN errors | `runQuery` in `nl2sql.ts` | yes: errors echo literals, e.g. `invalid input syntax for type integer: "Jack"` |
 | Connector tool results (MCP servers the user connected) | `connectorsForAsk` in `connectors/ask.ts` | yes: whatever the connector returns |
-| `run_query` results, only in a chat with more than one database in context and *Let the model read query results* on | `readQuery` in `nl2sql.ts` | yes: up to 50 rows, about 12,000 characters, each value protected with its column as context |
+| `run_query` results, only on connections where the user lets Ask read results | `readQuery` in `nl2sql.ts` | yes: up to 50 rows, about 12,000 characters, each value protected with its column as context |
+| What an earlier answer's query returned in the editor, in follow-ups, on the same connections only | `editorResult` in `nl2sql.ts` | yes: up to 20 rows, protected the same way |
 | Embedding requests: table descriptions and the question | `queryVector` in `nl2sql.ts` | comments, the question |
 | A name for a new conversation's tab: its first question, sent once more | `conversationTitle` in `ai/title.ts` | typed by the user; protected like the question |
 | Connection test ping | `settings:testProvider` in `main/index.ts` | no (fixed text) |
 
-Query results are never sent from a chat on one database. What comes back is
-SQL (`propose_query`), an explanation, assumptions, a clarification question
-or prose, and tool arguments. The SQL is executed, first under EXPLAIN and
-then (with *Run generated queries automatically*) for real, so restoring
-values into it is security-sensitive (section 7).
+Query results are sent only from connections where the user lets Ask read
+them: none until they choose, in Settings → Models or with the eye on a
+database in the chat. Everywhere else the model writes queries without seeing
+what they return. What comes back is SQL (`propose_query`), an explanation,
+assumptions, a clarification question or prose, and tool arguments. The SQL
+is executed, first under EXPLAIN and then (with *Run generated queries
+automatically*) for real, so restoring values into it is security-sensitive
+(section 7).
 
 Answers from hosted providers stream as they are written. What is sent does
 not change; what comes back is restored for display as it arrives, from the
@@ -61,17 +65,25 @@ closed ones in `chat-history.json` (the latest 30, none older than 30 days),
 both with the real values the chat shows. Neither is ever sent; a conversation
 opened again continues from its sealed turns, as one does after a relaunch.
 
-A chat can have other databases in context, to trace something across them.
-Then, and only while *Let the model read query results* is on (Settings →
-Models), the model may call `run_query`: one read-only SELECT on one database,
-checked like `propose_query` (in its own terms, restored, checked again) and
-run under that database's read-only guard. Up to 50 rows come back. Every
-value goes through `protectValues` with its column as context, as sample
-values do, before the result is added to the conversation; the tool message is
-then protected and verified again with the rest of the request. Because the
-vault is the conversation's, one value has one placeholder in every database
-of the chat, which is what lets the model match a customer in one database to
-the same customer in another without seeing who it is.
+On a connection where the user lets Ask read results, the model may call
+`run_query`, to work a question out itself rather than hand queries back: one
+read-only SELECT, checked like `propose_query` (in its own terms, restored,
+checked again) and run under that database's read-only guard. Up to 50 rows
+come back. Every value goes through `protectValues` with its column as
+context, as sample values do, before the result is added to the conversation;
+the tool message is then protected and verified again with the rest of the
+request. Values that are not personal (ids, dates, counts, statuses) go as
+they are; so does anything detection misses, which is why the choice is per
+connection. A follow-up also carries the first 20 rows an earlier answer's
+query returned in the editor, protected the same way, and only from those
+connections. Because the vault is the conversation's, one value has one
+placeholder in every database of the chat, which is what lets the model match
+a customer in one database to the same customer in another without seeing who
+it is.
+
+The model may offer to remember a fact the user told it, such as an id. It
+becomes an instruction only if the user keeps it, and is then sent as
+instructions are.
 
 There is no logging, telemetry, crash reporting or worker-thread code in the
 app today; section 11 sets the rules for when there is.

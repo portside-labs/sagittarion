@@ -85,6 +85,14 @@ only what a question needs:
   `EXPLAIN` first, with errors sent back for up to two repairs, and executes
   under SQLite's `query_only` pragma or a PostgreSQL `READ ONLY` transaction.
 
+Where the user lets Ask read results (`AgentSettings.readResults`: every
+connection, or chosen ones; none by default), the model works questions out
+instead of writing one query: it has `run_query` (up to 50 rows, protected),
+rules that tell it to look things up before asking and to say what it
+assumed, up to 25 steps with a final answer forced at the last, and sees what
+earlier answers' queries returned in the editor. Everywhere the model can call
+`remember`; the chat offers the fact to keep as an instruction.
+
 The chat is one pane beside every connection (`ChatPane`), its conversations
 in tabs (`chats` in the app store, saved with the workspace). Each has its own
 placeholder scope, forgotten when its tab closes, and asks in several tabs can
@@ -100,9 +108,8 @@ question, then keeps the databases it has in context; more can be added from
 the bar above the input, and are connected in the background.
 With more than one, an ask gets them all (`AskOptions.databases`): each is
 known to the model by a key (`db1`, `db2`, …), every tool takes the key, the
-schema budget is shared between them, and the model can call `run_query` to
-read up to 50 rows of a read-only `SELECT`, every value protected first, to
-follow a record from one database to the next. A proposed query names its
+schema budget is shared between them, and on those whose results it may read
+the model follows a record from one database to the next with `run_query`. A proposed query names its
 database, and the chat opens it in that connection's editor
 (`openSql` in `store.ts`).
 

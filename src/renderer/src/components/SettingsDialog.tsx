@@ -21,6 +21,7 @@ import { Modal } from './Modal'
 import { Icon } from './Icons'
 import { ConnectorsSettings } from './ConnectorsSettings'
 import { InstructionsSettings } from './InstructionsSettings'
+import { ScopePicker } from './ScopePicker'
 import { errorMessage } from '@/lib/util'
 
 /** The sidebar, in alphabetical order so a new section lands in its place. */
@@ -46,7 +47,7 @@ interface Draft {
   embeddingModel: string
 }
 
-const DEFAULT_AGENT: AgentSettings = { schemaBudgetTokens: 8000, autoRun: true, sendSampleValues: false, readResults: true }
+const DEFAULT_AGENT: AgentSettings = { schemaBudgetTokens: 8000, autoRun: true, sendSampleValues: false, readResults: { scope: 'selected', connectionIds: [] } }
 
 function draftFrom(c: AiConnection, model?: string): Draft {
   return { type: c.type, provider: c.provider, baseUrl: c.baseUrl, model: model || c.defaultModel, embeddingModel: c.embeddingModel }
@@ -281,7 +282,7 @@ export function SettingsDialog() {
     draft.embeddingModel.trim() !== active.embeddingModel ||
     agent.autoRun !== settings.agent.autoRun ||
     agent.sendSampleValues !== settings.agent.sendSampleValues ||
-    (agent.readResults !== false) !== (settings.agent.readResults !== false) ||
+    JSON.stringify(agent.readResults) !== JSON.stringify(settings.agent.readResults) ||
     agent.schemaBudgetTokens !== settings.agent.schemaBudgetTokens ||
     (Object.keys(DEFAULT_PRIVACY) as (keyof PrivacySettings)[]).some((k) => privacySettings[k] !== (settings.privacy ?? DEFAULT_PRIVACY)[k])
 
@@ -838,21 +839,21 @@ export function SettingsDialog() {
               among them are replaced with placeholders first.
             </span>
           </div>
-          <div className="field">
-            <label className="checkbox">
-              <input
-                type="checkbox"
-                checked={agent.readResults !== false}
-                onChange={(e) => setAgent({ ...agent, readResults: e.target.checked })}
-                data-testid="read-results"
-              />
-              Let the model read query results in chats across databases
-            </label>
+          <div className="field" data-testid="read-results">
+            <label>Let Ask read query results</label>
             <span className="hint">
-              When a chat has more than one database in context, the model can run read-only queries and read up to 50 rows of each result, to follow a
-              record from one database to the next and lay out what happened. With Local AI Privacy on, sensitive values in the results are replaced
-              with placeholders first, the same placeholder for the same value in every database. A chat on one database never sends results.
+              On these connections Ask works questions out itself: it runs read-only queries, reads up to 50 rows of each result, and answers with what
+              it found, instead of handing queries back for you to run. Those rows go to the model provider. With Local AI Privacy on, names, emails and
+              other personal values in them are replaced with placeholders first; ids, dates, counts and other values go as they are. Elsewhere it
+              writes queries without seeing their results. You can also switch it per connection from the chat.
             </span>
+            <ScopePicker
+              scope={agent.readResults.scope}
+              connectionIds={agent.readResults.connectionIds}
+              onChange={(scope, connectionIds) => setAgent({ ...agent, readResults: { scope, connectionIds } })}
+              testPrefix="read-results"
+              hint={agent.readResults.scope === 'selected' && !agent.readResults.connectionIds.length ? 'None chosen: Ask reads no results anywhere.' : undefined}
+            />
           </div>
 
           <h2 className="section-gap">

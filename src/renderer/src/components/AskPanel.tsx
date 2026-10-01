@@ -4,11 +4,12 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties, type ReactNode } from 'react'
 import { createPortal } from 'react-dom'
 import type { AiProgressEvent, AiProgressStep, AiRanQuery, AiTurn, AiUsage, CatalogModel } from '@shared/ai'
-import { BYOK_PROVIDERS, LOCAL_PROVIDERS, MODEL_CATALOG, PROVIDERS, activeConnection, connectionReady, modelTitle, prettyModelName, vendorOf } from '@shared/ai'
+import { BYOK_PROVIDERS, LOCAL_PROVIDERS, MODEL_CATALOG, PROVIDERS, activeConnection, connectionReady, modelTitle, prettyModelName, readsResults, vendorOf } from '@shared/ai'
 import { describeCounts, type AiPrivacyReport } from '@shared/privacy'
 import type { ToolApprovalDecision, ToolApprovalRequest } from '@shared/connectors'
 import { getSessionStore, useStore } from '@/store'
-import { chatStatus, chatTitle, type ChatMessage, type ChatState, type ChatStep } from '@/lib/chat'
+import { chatStatus, chatTitle, memoryName, turnResult, type ChatMessage, type ChatState, type ChatStep } from '@/lib/chat'
+import { emptyInstruction } from '@shared/instructions'
 import { SqlCode } from './SqlCode'
 import { Icon } from './Icons'
 import { ExchangeInspector } from './ExchangeInspector'
@@ -393,11 +394,16 @@ export function AskPanel({ onCollapse }: { onCollapse: () => void }) {
       if (m.role !== 'assistant' || m.status !== 'done' || !m.result) continue
       // The sealed turn is the exchange as the model saw it; the main process replays it instead of raw values.
       const sealed = m.result.kind === 'cancelled' ? undefined : m.result.privacy?.sealed
-      if (m.result.kind === 'query') turns.push({ question: m.question, sql: m.result.sql, ...(m.result.database ? { database: m.result.database.name } : {}), ...(sealed ? { sealed } : {}) })
+      if (m.result.kind === 'query') {
+        // What the query returned in the editor goes along only where the user lets Ask read results.
+        const on = m.result.database?.connectionId || chat.databases?.[0]
+        const result = m.ranResult && readsResults(settings?.agent.readResults, on) ? { result: m.ranResult } : {}
+        turns.push({ question: m.question, sql: m.result.sql, ...(m.result.database ? { database: m.result.database.name } : {}), ...result, ...(sealed ? { sealed } : {}) })
+      }
       else if (m.result.kind === 'clarify') turns.push({ question: m.question, answer: m.result.message, ...(sealed ? { sealed } : {}) })
     }
     return turns.slice(-6)
-  }, [messages])
+  }, [messages, settings, chat.databases])
 
   const send = async () => {
     const question = input.trim()
@@ -489,7 +495,7 @@ export function AskPanel({ onCollapse }: { onCollapse: () => void }) {
         finish({ result: res, ...(inFront && res.autoRun ? { autoRan: true } : {}) })
         const u = res.usage
         statusOf(target)?.(`${u.model} · ${u.requests} request${u.requests === 1 ? '' : 's'} · ${formatTokens(u.inputTokens)} in / ${formatTokens(u.outputTokens)} out${u.cachedInputTokens ? ` (${formatTokens(u.cachedInputTokens)} cached)` : ''}`)
-        if (inFront) place({ connectionId: target, name: nameOf(target) }, res.sql, res.autoRun)
+        if (inFront) void place({ connectionId: target, name: nameOf(target) }, res.sql, res.autoRun).then((results) => keepResult(chatId, assistantId, results))
       } else {
         finish({ result: res })
         if (res.kind === 'cancelled') statusOf(home.connectionId)?.('Cancelled')
@@ -511,9 +517,41 @@ export function AskPanel({ onCollapse }: { onCollapse: () => void }) {
   const dialectOf = (id: string | undefined) => kindOf(id || homeId)
 
   /** Puts a query in the editor of its connection, opening and connecting that when needed, and runs it if asked. */
-  const place = (target: { connectionId: string; name: string }, sql: string, run: boolean) => {
-    openSql(target.connectionId, sql, run).catch((e) => toast('error', `Could not open ${target.name}`, errorMessage(e)))
+  const place = (target: { connectionId: string; name: string }, sql: string, run: boolean) =>
+    openSql(target.connectionId, sql, run).catch((e) => {
+      toast('error', `Could not open ${target.name}`, errorMessage(e))
+      return null
+    })
+
+  /** What an answer's query returned when it ran, kept with the answer for a follow-up about it. */
+  const keepResult = (chatId: string, messageId: string, results: Awaited<ReturnType<typeof place>>) => {
+    const kept = turnResult(results)
+    if (!kept) return
+    updateChat(chatId, (c) => ({ ...c, messages: c.messages.map((m) => (m.id === messageId && m.role === 'assistant' ? { ...m, ranResult: kept } : m)) }))
   }
+
+  /** Keeps a fact the model offered as an instruction, for the connections it is about. */
+  const putInstruction = useStore((s) => s.putInstruction)
+  const rememberFact = async (messageId: string, index: number, fact: string, connectionIds: string[]) => {
+    try {
+      const saved = await window.api.instructions.save({
+        ...emptyInstruction(),
+        name: memoryName(fact),
+        text: fact,
+        scope: connectionIds.length ? 'selected' : 'all',
+        connectionIds
+      })
+      putInstruction(saved)
+      setMemory(messageId, index, 'saved')
+    } catch (e) {
+      toast('error', 'Could not remember that', errorMessage(e))
+    }
+  }
+  const setMemory = (messageId: string, index: number, state: 'saved' | 'dismissed') =>
+    setChat((c) => ({
+      ...c,
+      messages: c.messages.map((m) => (m.id === messageId && m.role === 'assistant' ? { ...m, memoryState: { ...m.memoryState, [index]: state } } : m))
+    }))
 
   /** A query the model ran, into the editor of its own database. */
   const openRan = (q: AiRanQuery) => {
@@ -728,7 +766,12 @@ export function AskPanel({ onCollapse }: { onCollapse: () => void }) {
           <div className="ask-actions">
             {run && runTarget && runAway ? (
               <>
-                <button className="ask-action run" onClick={() => place(runAway, run.sql, true)} title={`Run it in the editor of ${runAway.name}`} data-testid="ask-run-in">
+                <button
+                  className="ask-action run"
+                  onClick={() => void place(runAway, run.sql, true).then((results) => keepResult(chat.id, m.id, results))}
+                  title={`Run it in the editor of ${runAway.name}`}
+                  data-testid="ask-run-in"
+                >
                   <Icon name="play" size={11} /> Run in {runAway.name}
                 </button>
                 <button className="ask-action" onClick={() => place(runAway, run.sql, false)} title={`Put this query in the editor of ${runAway.name} without running it`} data-testid="ask-open-in">
@@ -737,7 +780,7 @@ export function AskPanel({ onCollapse }: { onCollapse: () => void }) {
               </>
             ) : run && runTarget ? (
               <>
-                <button className="ask-action run" onClick={() => place(runTarget, run.sql, true)} data-testid="ask-run">
+                <button className="ask-action run" onClick={() => void place(runTarget, run.sql, true).then((results) => keepResult(chat.id, m.id, results))} data-testid="ask-run">
                   <Icon name="play" size={11} /> {(m.autoRan ?? (run.autoRun && !run.database)) ? 'Run again' : 'Run it'}
                 </button>
                 <button className="ask-action" onClick={() => place(runTarget, run.sql, false)} title="Put this query in the editor without running it">
@@ -751,6 +794,30 @@ export function AskPanel({ onCollapse }: { onCollapse: () => void }) {
             </span>
           </div>
         ) : null}
+        {/* Facts the model offered to remember, so it need not ask again. */}
+        {(m.result && m.result.kind !== 'cancelled' ? (m.result.memories ?? []) : []).map((mem, i) => {
+          const state = m.memoryState?.[i]
+          if (state === 'dismissed') return null
+          const where = mem.connectionIds.length ? mem.connectionIds.map(nameOf).join(', ') : 'every database'
+          return (
+            <div key={i} className={`ask-memory ${state ?? ''}`} data-testid="ask-memory">
+              <Icon name="note" size={12} />
+              <span className="ask-memory-text">
+                <span className="ask-memory-label">{state === 'saved' ? `Remembered for ${where}` : `Remember for ${where}?`}</span> {mem.fact}
+              </span>
+              {state === 'saved' ? null : (
+                <span className="ask-memory-actions">
+                  <button className="ask-action" onClick={() => void rememberFact(m.id, i, mem.fact, mem.connectionIds)} title="Keep it as an instruction" data-testid="ask-memory-save">
+                    Remember
+                  </button>
+                  <button className="ask-action" onClick={() => setMemory(m.id, i, 'dismissed')} data-testid="ask-memory-dismiss">
+                    Not now
+                  </button>
+                </span>
+              )}
+            </div>
+          )
+        })}
         {m.queriesOpen && ran.length ? (
           <div className="ask-queries" data-testid="ask-queries">
             {ran.map((q, i) => {

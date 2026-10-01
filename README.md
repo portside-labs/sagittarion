@@ -16,7 +16,8 @@ sensitive values are masked on your machine before they reach the model.
 
 - **Ask in plain English.** Bring your own OpenAI, Anthropic, Gemini,
   OpenRouter or Groq key, or run a model locally with Ollama or LM Studio.
-  Generated SQL is read-only and checked with `EXPLAIN` before it runs.
+  Generated SQL is read-only and checked with `EXPLAIN` before it runs. Let
+  it read query results on a connection and it works questions out itself.
   Instructions teach it your definitions, for every database or just one.
 - **Ask across databases.** The chat stays beside your connections, with
   conversations in tabs and a history to pick them up again. Add several

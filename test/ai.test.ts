@@ -304,7 +304,8 @@ describe('ask orchestrator', () => {
     expect(req.system[1].cacheable).toBe(true)
     expect(req.system[1].text).toContain('## Schema (all 7 tables)')
     expect(req.system[1].text).toContain('orders(id int pk, user_id int fk->users.id')
-    expect(req.tools?.map((t) => t.name)).toEqual(['propose_query', 'search_schema', 'describe_table', 'sample_values'])
+    // Without leave to read results there is no run_query; remember is always on offer.
+    expect(req.tools?.map((t) => t.name)).toEqual(['propose_query', 'search_schema', 'describe_table', 'sample_values', 'remember'])
   })
 
   it('feeds EXPLAIN failures back to the model and repairs the query', async () => {

@@ -4,6 +4,7 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties } from 'react'
 import { createPortal } from 'react-dom'
 import { KIND_LABELS } from '@shared/types'
+import { normalizeResultsAccess, readsResults, withResultsFor } from '@shared/ai'
 import { useStore, type OpenTab } from '@/store'
 import { errorMessage } from '@/lib/util'
 import { Icon } from './Icons'
@@ -34,6 +35,21 @@ export function ChatDatabases({
   const tabs = useStore((s) => s.tabs)
   const ensureSession = useStore((s) => s.ensureSession)
   const toast = useStore((s) => s.toast)
+  const settings = useStore((s) => s.settings)
+  const loadSettings = useStore((s) => s.loadSettings)
+  const access = settings?.agent.readResults
+
+  /** Lets Ask read query results on a database, or stops it: the same setting as in Settings → Models. */
+  const toggleResults = async (id: string, name: string) => {
+    if (!settings) return
+    try {
+      const next = withResultsFor(normalizeResultsAccess(access), id, !readsResults(access, id), connections.map((c) => c.id))
+      await window.api.settings.update({ agent: { readResults: next } })
+      await loadSettings()
+    } catch (e) {
+      toast('error', `Could not change what Ask reads on ${name}`, errorMessage(e))
+    }
+  }
   const [open, setOpen] = useState(false)
   const [filter, setFilter] = useState('')
   const [style, setStyle] = useState<CSSProperties | null>(null)
@@ -98,6 +114,26 @@ export function ChatDatabases({
           <span key={cfg.id} className={`chat-db ${following ? 'following' : ''}`} title={title} data-testid="chat-db" data-name={cfg.name} data-state={dot || 'closed'}>
             <span className={`connector-dot ${dot}`} />
             <span className="chat-db-name">{cfg.name}</span>
+            {(() => {
+              const reads = readsResults(access, cfg.id)
+              return (
+                <button
+                  type="button"
+                  className={`chat-db-results ${reads ? 'on' : ''}`}
+                  onClick={() => void toggleResults(cfg.id, cfg.name)}
+                  title={
+                    reads
+                      ? `Ask reads query results on ${cfg.name}, up to 50 rows each, protected by Local AI Privacy, to work questions out itself. Click to stop.`
+                      : `Ask writes queries for ${cfg.name} without seeing their results. Click to let it read them, so it can work questions out itself.`
+                  }
+                  aria-label={reads ? `Stop Ask reading results on ${cfg.name}` : `Let Ask read results on ${cfg.name}`}
+                  aria-pressed={reads}
+                  data-testid="chat-db-results"
+                >
+                  <Icon name={reads ? 'eye' : 'eye-off'} size={11} />
+                </button>
+              )
+            })()}
             {following ? null : (
               <button
                 type="button"

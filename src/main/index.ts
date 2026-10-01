@@ -16,7 +16,7 @@ import { qi, qualify } from './db/pg-values'
 import { cellToPlainText } from '@shared/export'
 import type { AiConnectionInput, AiProgressEvent, AiProgressStep, AiSettingsUpdate, AiTurn, AskOptions } from '@shared/ai'
 import type { ToolApprovalDecision } from '@shared/connectors'
-import { PROVIDERS } from '@shared/ai'
+import { PROVIDERS, readsResults } from '@shared/ai'
 import { classifyEndpoint, privacyApplies, type PrivacySettings } from '@shared/privacy'
 import { createProvider, providerConfigFor } from './ai/providers/factory'
 import { ProviderError, type LlmProvider, type ProviderConfig } from './ai/providers/types'
@@ -147,11 +147,15 @@ async function indexWithProgress(sessionId: string, kind: 'sqlite' | 'postgres',
   }
 }
 
-/** An open session as the agent sees a database: read-only queries, safe to run again should the link drop under them. */
-function agentDatabase(sessionId: string, index: SchemaIndex, key: string): AgentDatabase {
+/**
+ * An open session as the agent sees a database: read-only queries, safe to run again should the link drop under them,
+ * and whether the user lets the model read their results there.
+ */
+function agentDatabase(sessionId: string, index: SchemaIndex, key: string, readResults: boolean): AgentDatabase {
   const conn = manager.get(sessionId)
   const kind = conn.config.kind
   return {
+    readResults,
     key,
     name: conn.config.name || kind,
     connectionId: conn.config.id || undefined,
@@ -458,6 +462,7 @@ function registerIpc(): void {
     await connectionStore.remove(id)
     await connectorStore.forgetConnection(id)
     await instructionStore.forgetConnection(id)
+    await settingsStore.forgetConnection(id)
   })
   ipcMain.handle('connections:setGroup', (_e, ids: string[], group: string | null) => connectionStore.setGroup(ids, group))
   ipcMain.handle('connections:duplicate', (_e, id: string) => connectionStore.duplicate(id))
@@ -596,7 +601,8 @@ function registerIpc(): void {
       // With other databases in context, the model looks across them all; each is known to it by a short key.
       const others = await contextDatabases(sessionId, opts?.databases, onProgress)
       const sessions = [{ sessionId, index }, ...others]
-      const databases = others.length ? sessions.map((s, i) => agentDatabase(s.sessionId, s.index, `db${i + 1}`)) : undefined
+      const reads = (id: string) => readsResults(settings.agent.readResults, manager.get(id).config.id || undefined)
+      const databases = others.length ? sessions.map((s, i) => agentDatabase(s.sessionId, s.index, `db${i + 1}`, reads(s.sessionId))) : undefined
       // The connectors on for this chat start now; one that cannot start is left out, and the steps say why.
       const connectors = await connectorsForAsk({
         store: connectorStore,
@@ -621,6 +627,8 @@ function registerIpc(): void {
           index,
           provider: gateway,
           settings: { ...settings.agent, embeddingModel: connection.embeddingModel },
+          readResults: reads(sessionId),
+          connectionId: conn.config.id || undefined,
           // Read-only, so safe to run again should the link drop under them.
           runQuery: (sql, maxRows) => manager.read(sessionId, (d) => d.query(sql, [], maxRows, { readOnly: true })),
           distinctValues: (ref, column) => manager.read(sessionId, (d) => distinctValuesFor(d, kind, ref, column)),

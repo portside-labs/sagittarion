@@ -7,7 +7,7 @@ import { codeFontFamily } from '@/lib/theme'
 import { PaneHeader, PaneLayout, type DragHandleProps } from './PaneLayout'
 import { defaultLayout, moveLeaf, setRatio, type PaneId } from '@/lib/layout'
 import { registerQueryTab, useStore, type Tab } from '@/store'
-import { takeRunOnOpen, useSession, useSessionStore, wantsRunOnOpen, type SessionState, type SessionStore } from '@/session-store'
+import { ranOnOpen, takeRunOnOpen, useSession, useSessionStore, wantsRunOnOpen, type SessionState, type SessionStore } from '@/session-store'
 import { SqlEditor, type SqlEditorHandle } from './SqlEditor'
 import { ResultsView } from './ResultsView'
 import { Splitter } from './Splitter'
@@ -110,16 +110,17 @@ export function QueryTab({ tab, active }: { tab: Extract<Tab, { kind: 'query' }>
    * Runs the selection when there is one, otherwise the block of lines the cursor is in; blank lines
    * separate blocks, and a trailing semicolon is optional. `all` runs the whole editor.
    */
-  const run = async (sqlOverride?: string, all = false) => {
-    if (running) return
+  /** Runs and shows the statements; resolves with their results, or null when nothing ran or it failed. */
+  const run = async (sqlOverride?: string, all = false): Promise<StatementResult[] | null> => {
+    if (running) return null
     const ed = editorRef.current
-    if (!ed) return
+    if (!ed) return null
     const selected = sqlOverride ? '' : ed.getSelection()
     const text = sqlOverride ?? (all ? ed.getValue() : selected.trim() ? selected : ed.getBlockAtCursor())
-    if (!text.trim()) return
+    if (!text.trim()) return null
     if (resultsDirty.current) {
       const ok = await confirm('Discard staged edits?', 'Edits staged in the results have not been applied to the database.', 'Discard', true)
-      if (!ok) return
+      if (!ok) return null
     }
     setRunning(true)
     setError(null)
@@ -147,11 +148,13 @@ export function QueryTab({ tab, active }: { tab: Extract<Tab, { kind: 'query' }>
             : `Done in ${formatDuration(ms)}`
       )
       if (/\b(create|drop|alter)\b/i.test(text) && !errors) void refreshSchema()
+      return res.results
     } catch (e) {
       setError(errorMessage(e))
       setResults(null)
       setRunKey((k) => k + 1)
       updateQuerySnapshot(tab.id, { sql: sqlRef.current, limit: maxRows, lastRun: { sql: text, at: Date.now(), ms: performance.now() - t0, statements: 0, results: null, error: errorMessage(e) } })
+      return null
     } finally {
       setRunning(false)
     }
@@ -171,7 +174,7 @@ export function QueryTab({ tab, active }: { tab: Extract<Tab, { kind: 'query' }>
           sqlRef.current = sql
           editorRef.current?.setValue(sql)
         },
-        run: (sql) => void runRef.current(sql)
+        run: (sql) => runRef.current(sql)
       }),
     [tab.id]
   )
@@ -180,7 +183,7 @@ export function QueryTab({ tab, active }: { tab: Extract<Tab, { kind: 'query' }>
   useEffect(() => {
     if (!wantsRunOnOpen(tab.id)) return
     const frame = requestAnimationFrame(() => {
-      if (takeRunOnOpen(tab.id)) void run(tab.initialSql)
+      if (takeRunOnOpen(tab.id)) void run(tab.initialSql).then((results) => ranOnOpen(tab.id, results))
     })
     return () => cancelAnimationFrame(frame)
     // eslint-disable-next-line react-hooks/exhaustive-deps

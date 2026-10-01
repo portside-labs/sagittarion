@@ -1,6 +1,8 @@
 // The chat beside the connections: conversations in tabs, kept while the user moves between connections, each with
 // the databases it has in context.
-import type { AiProgressEvent, AiResult } from '@shared/ai'
+import type { AiProgressEvent, AiResult, AiTurnResult } from '@shared/ai'
+import type { StatementResult } from '@shared/types'
+import { cellToPlainText } from '@shared/export'
 import type { SavedChat, WorkspaceState } from '@shared/types'
 
 export type ChatStep = AiProgressEvent & { endedAt?: number }
@@ -23,6 +25,10 @@ export type ChatMessage =
       autoRan?: boolean
       /** The answer as the model writes it, while it streams; not kept. */
       draft?: string
+      /** What the answer's query returned when it ran in the editor: the first rows, for a follow-up about them. */
+      ranResult?: AiTurnResult
+      /** The facts it offered to remember: kept, or let go. */
+      memoryState?: Record<number, 'saved' | 'dismissed'>
       endedAt?: number
       /** The ask behind this answer, for "What was sent". Not kept across relaunches: that record lives in memory. */
       requestId?: string
@@ -214,4 +220,24 @@ export function historyMatches(item: { title: string; preview: string; text: str
   if (!words.length) return true
   const hay = `${item.title}\n${item.preview}\n${item.text}`.toLowerCase()
   return words.every((w) => hay.includes(w))
+}
+
+/** The first rows of what a query returned in the editor, as text, for the model to see in a follow-up. */
+export function turnResult(results: StatementResult[] | null | undefined, max = 20): AiTurnResult | undefined {
+  const rows = results?.find((r) => r.kind === 'rows')
+  if (!rows || rows.kind !== 'rows') return undefined
+  return {
+    columns: rows.columns.map((c) => c.name),
+    rows: rows.rows.slice(0, max).map((r) => r.map((v) => (v === null ? null : cellToPlainText(v).slice(0, 200)))),
+    rowCount: rows.rowCount
+  }
+}
+
+/** A short name for a fact kept as an instruction: its opening words. */
+export function memoryName(fact: string, max = 48): string {
+  const text = fact.replace(/\s+/g, ' ').trim()
+  if (text.length <= max) return text.replace(/[.\s]+$/, '')
+  const cut = text.slice(0, max - 1)
+  const space = cut.lastIndexOf(' ')
+  return `${(space > max / 2 ? cut.slice(0, space) : cut).replace(/[\s,;:.-]+$/, '')}…`
 }

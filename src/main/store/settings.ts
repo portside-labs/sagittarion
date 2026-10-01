@@ -1,7 +1,7 @@
 import { promises as fs } from 'node:fs'
 import path from 'node:path'
 import { randomUUID } from 'node:crypto'
-import { PROVIDERS, type AgentSettings, type AiConnection, type AiConnectionInput, type AiSettings, type AiSettingsUpdate, type ProviderId } from '@shared/ai'
+import { normalizeResultsAccess, PROVIDERS, type AgentSettings, type AiConnection, type AiConnectionInput, type AiSettings, type AiSettingsUpdate, type ProviderId } from '@shared/ai'
 import { normalizePrivacy, type PrivacySettings } from '@shared/privacy'
 import type { CredentialStore } from './credentials'
 
@@ -46,7 +46,7 @@ interface StoredSettings {
   ai?: StoredAi | LegacyAi
 }
 
-const DEFAULT_AGENT: AgentSettings = { schemaBudgetTokens: 8000, autoRun: true, sendSampleValues: false, readResults: true }
+const DEFAULT_AGENT: AgentSettings = { schemaBudgetTokens: 8000, autoRun: true, sendSampleValues: false, readResults: { scope: 'selected', connectionIds: [] } }
 
 /** Provider ids as they were saved earlier map onto the current ones. */
 export function normalizeProviderId(raw: string | undefined): ProviderId {
@@ -138,7 +138,8 @@ export class SettingsStore {
       agent: {
         schemaBudgetTokens: legacy.schemaBudgetTokens ?? DEFAULT_AGENT.schemaBudgetTokens,
         autoRun: legacy.autoRun ?? DEFAULT_AGENT.autoRun,
-        sendSampleValues: Boolean(legacy.sendSampleValues)
+        sendSampleValues: Boolean(legacy.sendSampleValues),
+        readResults: DEFAULT_AGENT.readResults
       }
     }
   }
@@ -161,7 +162,9 @@ export class SettingsStore {
       activeConnectionId: ai.activeConnectionId,
       activeModel: ai.activeModel,
       connections,
-      agent: { ...DEFAULT_AGENT, ...ai.agent },
+      // Reading results was a yes or no for chats across databases before it went per connection; either way it now
+      // starts with none, for the user to choose.
+      agent: { ...DEFAULT_AGENT, ...ai.agent, readResults: normalizeResultsAccess(ai.agent?.readResults) },
       encryptionAvailable: this.credentials.available,
       managedAccount: null,
       privacy: normalizePrivacy(ai.privacy)
@@ -211,11 +214,18 @@ export class SettingsStore {
     if (u.agent) {
       if (typeof u.agent.autoRun === 'boolean') ai.agent.autoRun = u.agent.autoRun
       if (typeof u.agent.sendSampleValues === 'boolean') ai.agent.sendSampleValues = u.agent.sendSampleValues
-      if (typeof u.agent.readResults === 'boolean') ai.agent.readResults = u.agent.readResults
+      if (u.agent.readResults && typeof u.agent.readResults === 'object') ai.agent.readResults = normalizeResultsAccess(u.agent.readResults)
       if (typeof u.agent.schemaBudgetTokens === 'number' && u.agent.schemaBudgetTokens >= 1000) ai.agent.schemaBudgetTokens = Math.round(u.agent.schemaBudgetTokens)
     }
     await this.persist({ ...stored, ai })
     return this.get()
+  }
+
+  /** A database connection was deleted: results are no longer read on it. */
+  async forgetConnection(connectionId: string): Promise<void> {
+    const access = normalizeResultsAccess((await this.ai()).agent?.readResults)
+    if (!access.connectionIds.includes(connectionId)) return
+    await this.update({ agent: { readResults: { ...access, connectionIds: access.connectionIds.filter((id) => id !== connectionId) } } })
   }
 
   /**

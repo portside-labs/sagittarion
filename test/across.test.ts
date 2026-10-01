@@ -67,7 +67,9 @@ interface Fixture {
   ran: { db: string; sql: string; maxRows: number }[]
 }
 
-function fixture(script: Script, opts: { readResults?: boolean; maxToolSteps?: number; results?: Record<string, (sql: string) => QueryResponse> } = {}): Fixture {
+/** `readable`: the databases whose results the user lets the model read; both, unless a test says otherwise. */
+function fixture(script: Script, opts: { readable?: string[]; maxToolSteps?: number; results?: Record<string, (sql: string) => QueryResponse> } = {}): Fixture {
+  const readable = opts.readable ?? ['db1', 'db2']
   const ran: Fixture['ran'] = []
   const steps: AiProgressStep[] = []
   const provider = recordingProvider(script)
@@ -83,7 +85,8 @@ function fixture(script: Script, opts: { readResults?: boolean; maxToolSteps?: n
       ran.push({ db: key, sql, maxRows })
       return opts.results?.[key]?.(sql) ?? rows(sql, [], [])
     },
-    distinctValues: async () => null
+    distinctValues: async () => null,
+    readResults: readable.includes(key)
   })
   const databases = [database('db1', 'Orders', 'c1', 'sqlite', ordersSchema), database('db2', 'Support', 'c2', 'postgres', supportSchema)]
   const deps: AskDeps = {
@@ -94,7 +97,7 @@ function fixture(script: Script, opts: { readResults?: boolean; maxToolSteps?: n
     distinctValues: databases[0].distinctValues,
     databases,
     provider: ModelGateway.protected(provider, session),
-    settings: { sendSampleValues: false, autoRun: true, schemaBudgetTokens: 8000, readResults: opts.readResults ?? true },
+    settings: { sendSampleValues: false, autoRun: true, schemaBudgetTokens: 8000 },
     now: new Date('2026-10-01T12:00:00Z'),
     maxToolSteps: opts.maxToolSteps,
     onProgress: (s) => steps.push(s)
@@ -189,19 +192,26 @@ describe('a chat across databases', () => {
     expect(f.steps).toContainEqual(expect.objectContaining({ message: 'Model asked to describe orders in Orders', status: 'done' }))
   })
 
-  it('reads no results unless the setting allows it', async () => {
+  it('reads no results unless the setting allows it, and only on the databases it names', async () => {
     const f = fixture(
       (req, call) =>
         call === 1
           ? reply({ toolCalls: [{ id: 't1', name: 'run_query', args: { database: 'db1', sql: 'SELECT * FROM orders' } }], stopReason: 'tool_calls' })
           : reply({ text: 'I cannot read results.' }),
-      { readResults: false }
+      { readable: [] }
     )
     await askDatabase(f.deps, 'Show me the orders')
     expect(f.requests[0].tools!.map((t) => t.name)).not.toContain('run_query')
     expect(system(f.requests[0])).toContain('You cannot see query results')
-    expect(lastTool(f.requests[1])!.content).toBe('Unknown tool run_query.')
+    expect(lastTool(f.requests[1])!.content).toBe('Results cannot be read on "db1": write the query for the user to run instead.')
     expect(f.ran).toEqual([])
+
+    // Allowed on Support only: the tool takes that database alone, and the rules say so.
+    const g = fixture(() => reply({ text: 'Done.' }), { readable: ['db2'] })
+    await askDatabase(g.deps, 'What happened?')
+    const run = g.requests[0].tools!.find((t) => t.name === 'run_query')!
+    expect((run.parameters as any).properties.database.enum).toEqual(['db2'])
+    expect(system(g.requests[0])).toContain('You can read results from "db2" only; for the others, write the queries.')
   })
 
   it('asks for an answer with what was found at the last step', async () => {
@@ -251,13 +261,17 @@ describe('instructions across databases', () => {
     expect(prompt).toContain('### Support only (only for "db2")\nDo this.')
   })
 
-  it('offers run_query only with results on, and every tool takes the database', () => {
-    expect(acrossTools(['db1', 'db2'], false).map((t) => [t.name, (t.parameters as any).required[0]])).toEqual([
+  it('offers run_query only where results may be read, and every tool takes the database', () => {
+    expect(acrossTools(['db1', 'db2'], []).map((t) => [t.name, (t.parameters as any).required[0]])).toEqual([
       ['propose_query', 'database'],
       ['search_schema', 'database'],
       ['describe_table', 'database'],
-      ['sample_values', 'database']
+      ['sample_values', 'database'],
+      ['remember', 'database']
     ])
-    expect(acrossTools(['db1', 'db2'], true).map((t) => t.name)).toContain('run_query')
+    expect(acrossTools(['db1', 'db2'], ['db1', 'db2']).map((t) => t.name)).toContain('run_query')
+    // A fact is about one database, or all of them.
+    const remember = acrossTools(['db1', 'db2'], []).find((t) => t.name === 'remember')!
+    expect((remember.parameters as any).properties.database.enum).toEqual(['db1', 'db2', 'all'])
   })
 })

@@ -5213,3 +5213,61 @@ html.drag-sorting * {
 .connectors-menu-item .btn.small {
   flex: 0 0 auto;
 }
+
+/* Whether Ask reads query results on a database in the chat: the eye on its chip. */
+.chat-db-results {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+  padding: 0;
+  border: none;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--text-dim);
+  cursor: pointer;
+}
+.chat-db-results.on {
+  color: var(--ok);
+}
+.chat-db-results:hover {
+  color: var(--text);
+  background: var(--bg-fill-press);
+}
+
+/* A fact the model offers to remember, under its answer. */
+.ask-memory {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 8px 10px;
+  border-radius: 8px;
+  background: var(--bg-fill-hover);
+  font-size: 12px;
+  color: var(--text-muted);
+}
+.ask-memory > svg {
+  flex: 0 0 auto;
+  margin-top: 2px;
+  color: var(--text-faint);
+}
+.ask-memory.saved > svg {
+  color: var(--ok);
+}
+.ask-memory-text {
+  flex: 1;
+  min-width: 0;
+  line-height: 1.45;
+}
+.ask-memory-label {
+  color: var(--text-faint);
+}
+.ask-memory-actions {
+  display: inline-flex;
+  gap: 12px;
+  flex: 0 0 auto;
+}
+.ask-memory-actions .ask-action {
+  font-size: 12px;
+}

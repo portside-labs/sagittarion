@@ -694,6 +694,14 @@ async function main() {
           return res.end(JSON.stringify({ model: 'mock-sql', choices: [{ message: { content: `"${name}."` }, finish_reason: 'stop' }], usage: { prompt_tokens: 40, completion_tokens: 4 } }))
         }
         // A chat across two databases: find the user in the second, follow the email into the first by its placeholder, answer.
+        // One database, results readable: look at the users, offer to remember a fact, then answer.
+        if (/october spawn/i.test(String(question))) {
+          const results = r.messages.filter((m) => m.role === 'tool')
+          if (!results.length) return toolCall('run_query', { sql: 'SELECT id, name, email FROM users ORDER BY id LIMIT 3', purpose: 'the users to check' })
+          if (results.length === 1) return toolCall('remember', { fact: 'The spawn checks run against the users table.' })
+          const rowCount = /^(\d+) rows?/.exec(results[0].content)?.[1] ?? '?'
+          return res.end(JSON.stringify({ model: 'mock-sql', choices: [{ message: { content: `**Ready.** I checked ${rowCount} users; every one has an email.` }, finish_reason: 'stop' }], usage: { prompt_tokens: 900, completion_tokens: 30 } }))
+        }
         if (/across both databases/i.test(String(question))) {
           const results = r.messages.filter((m) => m.role === 'tool')
           if (!results.length) return toolCall('run_query', { database: 'db2', sql: 'SELECT id, email FROM users WHERE id = 1', purpose: 'the user' })
@@ -879,13 +887,40 @@ async function main() {
       assert((await ruled.locator('.ask-step', { hasText: 'Following 2 instructions' }).textContent()).includes('Revenue, This database'), 'the steps name the instructions followed')
       console.log('instructions: global and per connection reach the model, named in the steps, never shown in the chat')
 
+      // ------------------------------------------------------------ working a question out from the data
+      const userEmail = sqlite(db, 'SELECT email FROM users WHERE id = 1')
+      const eye = (name) => chatEl('chat-db').and(page.locator(`[data-name="${name}"]`)).getByTestId('chat-db-results')
+      assert((await eye(frontName).getAttribute('aria-pressed')) === 'false', 'Ask reads no results until it is let')
+      await eye(frontName).click()
+      await page.waitForFunction((n) => document.querySelector(`[data-testid=chat-pane] [data-testid=chat-db][data-name="${n}"] [data-testid=chat-db-results]`)?.getAttribute('aria-pressed') === 'true', frontName)
+      const beforeLook = aiRequests.length
+      const answersLook = await chatEl('ask-result').count()
+      await chatEl('ask-input').fill('Are we ready for the October spawn?')
+      await chatEl('ask-button').click()
+      await answered(answersLook)
+      const sentLook = aiRequests.slice(beforeLook)
+      assert(sentLook.length === 3 && sentLook[0].includes('"run_query"') && sentLook[0].includes('Find things out before you ask'), 'with results readable, the model can run queries and is told to look first')
+      assert(!sentLook.join('\n').includes(userEmail), 'the emails in the results never reached the model')
+      const looked = chatEl('ask-result').last()
+      assert((await looked.locator('.chat-markdown').textContent()).includes('I checked 3 users'), 'it answers with what it found')
+      assert((await looked.getByTestId('ask-queries-toggle').textContent()).includes('1 query'), 'with the query it ran')
+      const memory = looked.getByTestId('ask-memory')
+      assert((await memory.textContent()).includes(`Remember for ${frontName}? The spawn checks run against the users table.`), 'it offers to remember what it learned')
+      await memory.getByTestId('ask-memory-save').click()
+      await page.waitForFunction(() => [...document.querySelectorAll('[data-testid=chat-pane] [data-testid=ask-memory]')].pop()?.classList.contains('saved'))
+      const kept = JSON.parse(fs.readFileSync(path.join(userData, 'instructions.json'), 'utf8')).instructions.find((i) => i.text === 'The spawn checks run against the users table.')
+      assert(kept && kept.name === 'The spawn checks run against the users table' && kept.scope === 'selected' && kept.connectionIds.length === 1, 'kept, it is an instruction for this connection')
+      console.log('one database: Ask reads results where it is let, works the question out, and remembers what it learned')
+
       // ------------------------------------------------------------ a chat across databases
       const otherName = 'E2E local file'
-      const userEmail = sqlite(db, 'SELECT email FROM users WHERE id = 1')
       await chatEl('chat-db-add').click()
       await page.locator(`[data-testid=chat-db-option][data-name="${otherName}"]`).click()
       // It connects in the background: its tab joins the strip, and the chat's stays in front.
       await chatEl('chat-db').and(page.locator(`[data-name="${otherName}"][data-state=connected]`)).waitFor({ timeout: 30000 })
+      // Reading results there too, so the model can follow the trail into it.
+      await eye(otherName).click()
+      await page.waitForFunction((n) => document.querySelector(`[data-testid=chat-pane] [data-testid=chat-db][data-name="${n}"] [data-testid=chat-db-results]`)?.getAttribute('aria-pressed') === 'true', otherName)
       assert((await page.getByTestId('conn-tab').count()) === 2, 'the database added to the chat connected in a tab of its own')
       assert((await page.locator('[data-testid=conn-tab][aria-selected=true] .conn-tab-name').textContent()).trim() === frontName, 'the chat stays in front')
       const beforeAcross = aiRequests.length

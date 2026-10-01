@@ -1,7 +1,7 @@
 import { createContext, useContext } from 'react'
 import { useStore as useZustandStore } from 'zustand'
 import { createStore, type StoreApi } from 'zustand/vanilla'
-import type { Catalog, ObjectKind, ObjectRef, QueryTabSnapshot, SearchResult, SessionInfo, TableRef, WorkspaceConnection } from '@shared/types'
+import type { Catalog, ObjectKind, ObjectRef, QueryTabSnapshot, SearchResult, SessionInfo, StatementResult, TableRef, WorkspaceConnection } from '@shared/types'
 import { sameTable, tableKey, tableLabel } from '@shared/connections'
 import { errorMessage } from './lib/util'
 import { appendNames, emptyNames, groupKey, type GroupState, type NameIndex, type TableState } from './lib/tree'
@@ -89,6 +89,29 @@ export function wantsRunOnOpen(tabId: string): boolean {
 /** The tab ran it: true once, for whoever takes it first. */
 export function takeRunOnOpen(tabId: string): boolean {
   return runOnOpen.delete(tabId)
+}
+
+/** Who waits for what a tab opened to run its query returned. */
+const runWaiters = new Map<string, (results: StatementResult[] | null) => void>()
+
+/** What a tab opened to run its query returns, once it has; null if it never runs. */
+export function afterRunOnOpen(tabId: string, timeoutMs = 5 * 60_000): Promise<StatementResult[] | null> {
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => {
+      runWaiters.delete(tabId)
+      resolve(null)
+    }, timeoutMs)
+    runWaiters.set(tabId, (results) => {
+      clearTimeout(timer)
+      resolve(results)
+    })
+  })
+}
+
+/** The tab's query ran: anyone waiting hears what it returned. */
+export function ranOnOpen(tabId: string, results: StatementResult[] | null): void {
+  runWaiters.get(tabId)?.(results)
+  runWaiters.delete(tabId)
 }
 
 /** Tabs and query snapshots from a previous launch, ready for a fresh session store. */

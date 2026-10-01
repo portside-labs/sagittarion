@@ -288,10 +288,40 @@ export interface AgentSettings {
   /** Send up to 20 distinct values of short text columns for the tables in context. */
   sendSampleValues: boolean
   /**
-   * In a chat across several databases, let the model run read-only queries and read their results (protected like
-   * sample values), to trace records from one database to another.
+   * Where the model may run read-only queries and read their results (up to 50 rows each, protected like sample
+   * values), to work a question out itself rather than hand queries back: every connection, or the ones chosen. None
+   * until the user says.
    */
-  readResults?: boolean
+  readResults: ResultsAccess
+}
+
+export interface ResultsAccess {
+  scope: 'all' | 'selected'
+  /** The saved database connections, when scope is "selected". */
+  connectionIds: string[]
+}
+
+/** As saved, or as sent from the renderer: anything that is not a list of connections reads as none. */
+export function normalizeResultsAccess(raw: unknown): ResultsAccess {
+  const r = raw && typeof raw === 'object' ? (raw as Partial<ResultsAccess>) : {}
+  const ids = Array.isArray(r.connectionIds) ? r.connectionIds.filter((x): x is string => typeof x === 'string' && Boolean(x)) : []
+  return { scope: r.scope === 'all' ? 'all' : 'selected', connectionIds: [...new Set(ids)] }
+}
+
+/** Whether the model may read query results on a database connection. */
+export function readsResults(access: ResultsAccess | undefined, connectionId: string | undefined): boolean {
+  if (!access) return false
+  return access.scope === 'all' || (Boolean(connectionId) && access.connectionIds.includes(connectionId!))
+}
+
+/** The access with one connection allowed or not. Leaving one out of "every connection" lists all the others. */
+export function withResultsFor(access: ResultsAccess, connectionId: string, on: boolean, everyConnection: string[]): ResultsAccess {
+  if (access.scope === 'all') {
+    if (on) return access
+    return { scope: 'selected', connectionIds: everyConnection.filter((id) => id !== connectionId) }
+  }
+  const rest = access.connectionIds.filter((id) => id !== connectionId)
+  return { scope: 'selected', connectionIds: on ? [...rest, connectionId] : rest }
 }
 
 export interface ManagedAccount {
@@ -424,8 +454,25 @@ export interface AiTurn {
   database?: string
   /** What the model said instead, e.g. a request for clarification. */
   answer?: string
+  /** What its query returned when it ran in the editor: the first rows, so a follow-up can be about them. */
+  result?: AiTurnResult
   /** The same exchange as the model saw it, placeholders in place of protected values; replayed instead of the above. */
   sealed?: SealedTurn
+}
+
+export interface AiTurnResult {
+  columns: string[]
+  /** The first rows, each value as text; NULL as null. */
+  rows: (string | null)[][]
+  /** How many rows came back in all. */
+  rowCount: number
+}
+
+/** A fact the model offers to keep as an instruction, so that it need not ask for it again. */
+export interface AiMemory {
+  fact: string
+  /** The saved database connections it is about; none for every connection. */
+  connectionIds: string[]
 }
 
 export interface AiUsage {
@@ -457,6 +504,8 @@ export interface AiQueryResult {
   kind: 'query'
   /** A short name for the conversation, when its first question asked for one. */
   title?: string
+  /** Facts the model offers to remember. */
+  memories?: AiMemory[]
   sql: string
   /** Where the query runs, in a chat across several databases; otherwise the chat's own. */
   database?: AiDatabaseRef
@@ -486,6 +535,8 @@ export interface AiClarification {
   queries?: AiRanQuery[]
   /** A short name for the conversation, when its first question asked for one. */
   title?: string
+  /** Facts the model offers to remember. */
+  memories?: AiMemory[]
 }
 
 export interface AiCancelled {
