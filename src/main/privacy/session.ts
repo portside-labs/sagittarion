@@ -188,6 +188,18 @@ export class PrivacySession {
     out.system.forEach((b) => {
       fields.push({ text: b.text, ctx: { role: b.structured ? 'structured' : 'prose' }, where: b.structured && b.cacheable ? 'the schema' : 'the instructions', origin: 'local', set: (t) => (b.text = t) })
     })
+    // Tool definitions are written by the app and by the user's connectors, not typed by the user. A connector's can
+    // still hold example values (a site's address, an id, an @mention) or real ones (the user's own site or account),
+    // and a value protected elsewhere in the chat can turn up in one. They are protected like everything else, rather
+    // than stopping every request; tool names stay as they are, since the model calls tools by them.
+    if (req.tools) {
+      const tools = structuredClone(req.tools)
+      out.tools = tools
+      for (const t of tools) {
+        if (typeof t.description === 'string') fields.push({ text: t.description, ctx: { role: 'structured' }, where: 'the tool definitions', origin: 'local', set: (x) => (t.description = x) })
+        schemaStrings(t.parameters, (text, set) => fields.push({ text, ctx: { role: 'structured' }, where: 'the tool definitions', origin: 'local', set }))
+      }
+    }
     for (const m of out.messages) {
       if (m.role === 'user') fields.push({ text: m.content, ctx: { role: 'prose' }, where: 'a question or reply', origin: 'local', set: (t) => (m.content = t) })
       else if (m.role === 'tool') {
@@ -337,6 +349,27 @@ function collectStrings(value: unknown, visit: (text: string, set: (t: string) =
       if (typeof v === 'string') visit(v, (t) => (obj[k] = t))
       else collectStrings(v, visit)
     }
+  }
+}
+
+/** JSON Schema keywords whose string values are structure, not words: left as they are. */
+const SCHEMA_KEYWORDS = new Set(['type', 'format', 'pattern', '$schema', '$id', '$ref', 'contentEncoding', 'contentMediaType'])
+
+/**
+ * The words in a tool's input schema (descriptions, titles, examples, defaults, allowed values), each with a way to
+ * replace it. Property names and the list of required ones are structure, and stay.
+ */
+function schemaStrings(schema: unknown, visit: (text: string, set: (t: string) => void) => void): void {
+  if (Array.isArray(schema)) {
+    schema.forEach((v, i) => (typeof v === 'string' ? visit(v, (t) => (schema[i] = t)) : schemaStrings(v, visit)))
+    return
+  }
+  if (!schema || typeof schema !== 'object') return
+  const obj = schema as Record<string, unknown>
+  for (const [k, v] of Object.entries(obj)) {
+    if (k === 'required' || SCHEMA_KEYWORDS.has(k)) continue
+    if (typeof v === 'string') visit(v, (t) => (obj[k] = t))
+    else schemaStrings(v, visit)
   }
 }
 

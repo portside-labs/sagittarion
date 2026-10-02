@@ -38,6 +38,7 @@ question and the chat history over IPC and gets an `AiResult` back.
 | `sample_values` results | `distinctValuesFor` in `main/index.ts` | yes: up to 20 distinct values |
 | Repair feedback: EXPLAIN errors | `runQuery` in `nl2sql.ts` | yes: errors echo literals, e.g. `invalid input syntax for type integer: "Jack"` |
 | Connector tool results (MCP servers the user connected) | `connectorsForAsk` in `connectors/ask.ts` | yes: whatever the connector returns |
+| Tool definitions: the app's tools, and each connector's names, descriptions and input schemas | `TOOLS` in `ai/prompt.ts`, `connectorsForAsk` | a connector's may hold example values or the user's own (a site address, an account); descriptions, examples and allowed values are protected as structured text, names and schema structure are not changed |
 | `run_query` results, only on connections where the user lets Ask read results | `readQuery` in `nl2sql.ts` | yes: up to 50 rows, about 12,000 characters, each value protected with its column as context |
 | What an earlier answer's query returned in the editor, in follow-ups, on the same connections only | `editorResult` in `nl2sql.ts` | yes: up to 20 rows, protected the same way |
 | Embedding requests: table descriptions and the question | `queryVector` in `nl2sql.ts` | comments, the question |
