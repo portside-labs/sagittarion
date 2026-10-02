@@ -1,6 +1,7 @@
 import type {
   AppInfo,
   Catalog,
+  CertificateKind,
   ChatHistoryItem,
   ConnectProgress,
   ConnectionConfig,
@@ -110,6 +111,8 @@ export interface Api {
   }
   dialog: {
     pickPrivateKey(): Promise<string | null>
+    /** Native picker for a Postgres connection's CA certificate, client certificate or client key. */
+    pickCertificate(kind: CertificateKind, current?: string): Promise<string | null>
     /** Native picker for a database file on this computer. */
     pickSqliteFile(current?: string): Promise<string | null>
   }

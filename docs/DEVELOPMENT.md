@@ -55,7 +55,11 @@ uses only Python's standard library.
 Nothing is cached locally; each page of rows is fetched with `LIMIT`/`OFFSET`.
 
 **PostgreSQL** uses `pg`, directly or through a local port forwarded over SSH.
-Rows are addressed by primary key, so tables without one are read-only in the
+SSL follows libpq's `sslmode`: the CA certificate, client certificate and key
+a connection names are read from this computer on every connect, PEM or DER,
+with an encrypted key decrypted in memory (`src/main/db/pg-tls.ts`). As in
+libpq, a CA certificate is checked in every mode but `disable`, and only
+`verify-full` checks the host name. Rows are addressed by primary key, so tables without one are read-only in the
 grid. `bigint`, `numeric`, timestamps, arrays, JSON and UUIDs keep the
 server's text form, so nothing rounds. Query results are read through a
 cursor, so a `SELECT` without a `LIMIT` fetches only what the limit dropdown
@@ -175,6 +179,13 @@ npm run test:docker      # real OpenSSH servers in Docker
   when neither is available. They recreate their own tables, so point `PG_URL`
   at a scratch database. `npm run test:e2e` covers Postgres too when `PG_URL`
   is set.
+- **SSL certificate** tests make a CA, server and client certificates with
+  the `openssl` command line, and check the handshakes against a stand-in
+  server that answers PostgreSQL's SSL request (`test/pg-tls-server.mjs`).
+  `npm run test:e2e` goes through the same from the connection form, with
+  Electron's own TLS. With `DOCKER_TESTS=1` they also run a
+  `postgres:16-alpine` with SSL on and a user that signs in with a client
+  certificate.
 - **Docker** tests run Alpine with ash, bash and fish login shells, plus one
   host without Python. They build from `alpine:3.20`; if that cannot be
   pulled, use an Alpine-flavoured image you already have, e.g.

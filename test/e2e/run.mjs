@@ -13,6 +13,7 @@ import ssh2 from 'ssh2'
 const { utils } = ssh2
 import { ensureSampleDb, startMockServer } from '../mock-ssh/server.mjs'
 import { loadFixture } from '../pg-server.mjs'
+import { makeCertificates, opensslAvailable, PASSPHRASE, STAND_IN_REFUSAL, startStandIn } from '../pg-tls-server.mjs'
 import { startOAuthMcpServer } from '../fixtures/oauth-mcp-server.mjs'
 import pg from 'pg'
 
@@ -603,6 +604,8 @@ async function main() {
     await page.keyboard.press(`${mod}+a`)
     await page.keyboard.type('select * from us')
     await popup.waitFor({ timeout: 5000 })
+    // CodeMirror ignores keys that take a suggestion for a moment after the list opens (its interactionDelay, 75 ms).
+    await page.waitForTimeout(200)
     await page.keyboard.press('Tab')
     await page.waitForFunction(() => document.querySelector('.tab-pane:not([hidden]) .query-tab .cm-content')?.textContent.includes('FROM users'))
     await front('open-settings').click()
@@ -614,6 +617,7 @@ async function main() {
     await page.keyboard.press(`${mod}+a`)
     await page.keyboard.type('select * from ord')
     await popup.waitFor({ timeout: 5000 })
+    await page.waitForTimeout(200)
     await page.keyboard.press('Tab')
     await page.waitForTimeout(200)
     assert(!(await cm.textContent()).includes('orders'), 'Tab no longer accepts once unticked')
@@ -1216,6 +1220,70 @@ async function main() {
     assert((await page.locator('.conn-group[data-group="Acme Corp"].tinted').count()) === 1, 'the group keeps its colour after a restart')
     await shot('07b-profile-after-restart')
     console.log('profile remembered across a restart')
+
+    // ------------------------------------------------------------ PostgreSQL SSL certificates, against stand-in servers
+    // The TLS is Electron's own (BoringSSL, not Node's OpenSSL): the CA check, the decrypted key, the alerts' wording.
+    if (opensslAvailable()) {
+      const certs = makeCertificates()
+      const standIn = await startStandIn(certs)
+      const strict = await startStandIn(certs, { strict: true })
+      /** Runs Test and waits for the form to say what `re` matches. */
+      const testSays = async (re, what) => {
+        await page.getByTestId('test-connection').click()
+        try {
+          await page.waitForFunction((src) => new RegExp(src).test(document.querySelector('[data-testid=connect-error]')?.textContent ?? ''), re.source, { timeout: 30000 })
+        } catch {
+          throw new Error(`${what}: expected ${re}; the form says "${await page.getByTestId('connect-error').textContent().catch(() => '(nothing)')}"`)
+        }
+      }
+      try {
+        await page.getByTestId('new-connection').click()
+        await page.getByTestId('choose-postgres').click()
+        await page.getByTestId('conn-name').fill('E2E SSL')
+        await page.getByTestId('pg-host').fill('127.0.0.1')
+        await page.getByTestId('pg-port').fill(String(standIn.port))
+        await page.getByTestId('pg-database').fill('app')
+        await page.getByTestId('pg-user').fill('certuser')
+        await page.getByTestId('pg-ssl').selectOption('verify-full')
+        assert((await page.getByTestId('pg-ca-path').count()) === 0, 'certificate fields start closed')
+        await page.getByTestId('pg-certs').check()
+        await page.getByTestId('pg-ca-path').fill(certs.file('ca.crt'))
+        assert((await page.getByTestId('pg-key-passphrase').count()) === 0, 'no passphrase without a client key')
+        await page.getByTestId('pg-cert-path').fill(certs.file('client.crt'))
+        await page.getByTestId('pg-key-path').fill(certs.file('client-encrypted.key'))
+        await page.getByTestId('pg-key-passphrase').fill(PASSPHRASE)
+        await shot('08-postgres-certificates')
+        await testSays(new RegExp(STAND_IN_REFUSAL), 'the certificates get it through the handshake')
+        const seen = standIn.handshakes.at(-1)
+        assert(seen?.clientName === 'certuser' && seen.clientTrusted, 'the server was shown the client certificate')
+        await page.getByTestId('pg-key-passphrase').fill('wrong')
+        await testSays(/The passphrase for the client key is wrong\./, 'a wrong passphrase')
+        await page.getByTestId('pg-key-passphrase').fill(PASSPHRASE)
+        await page.getByTestId('pg-ca-path').fill(certs.file('other-ca.crt'))
+        await testSays(/The server's certificate was not signed by the CA certificate other-ca\.crt/, 'another CA')
+        await page.getByTestId('pg-ca-path').fill('/nowhere/root.crt')
+        await testSays(/The CA certificate file was not found: \/nowhere\/root\.crt/, 'a missing file')
+        // A server that wants a client certificate in the handshake, given none.
+        await page.getByTestId('pg-port').fill(String(strict.port))
+        await page.getByTestId('pg-ca-path').fill(certs.file('ca.crt'))
+        await page.getByTestId('pg-cert-path').fill('')
+        await page.getByTestId('pg-key-path').fill('')
+        await testSays(/The server requires a client certificate/, 'no client certificate')
+        await page.getByTestId('pg-key-path').fill(certs.file('client.key'))
+        await testSays(/Choose the client certificate that goes with the client key\./, 'a key without its certificate')
+        await page.getByTestId('pg-certs').uncheck()
+        assert((await page.getByTestId('pg-ca-path').count()) === 0, 'unticking closes the certificate fields')
+        await page.getByTestId('pg-certs').check()
+        assert((await page.getByTestId('pg-ca-path').inputValue()) === '', 'and lets go of the files named there')
+        await page.getByTestId('pg-ssl').selectOption('disable')
+        assert((await page.getByTestId('pg-certs').count()) === 0, 'no certificates with SSL off')
+        console.log('postgres SSL certificates: verified, signed in with a client certificate, and refusals explained')
+      } finally {
+        await standIn.close()
+        await strict.close()
+        certs.cleanup()
+      }
+    }
 
     // ------------------------------------------------------------ PostgreSQL (when a server is available)
     if (process.env.PG_URL) {

@@ -40,8 +40,8 @@ sensitive values are masked on your machine before they reach the model.
 - **Several connections at once.** Group and colour-code them; every tab comes
   back as you left it.
 
-Works with local and remote databases, over SSH when needed. No account, no
-telemetry.
+Works with local and remote databases, over SSH or with SSL certificates when
+needed. No account, no telemetry.
 
 ## Download
 

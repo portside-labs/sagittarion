@@ -37,6 +37,7 @@ import type { DatabaseDriver } from './driver'
 import { encodeParam, pgTypes, qi, qualify } from './pg-values'
 import { isRowReturning, splitStatements } from './sql-split'
 import { decodeCursor, emptyCounts, encodeCursor, familyOf } from './catalog'
+import { certificateError, loadCertificates, sslAttempts, type CertificatePaths } from './pg-tls'
 
 export interface PostgresDriverOptions {
   host: string
@@ -45,6 +46,8 @@ export interface PostgresDriverOptions {
   user: string
   password?: string
   sslMode: SslMode
+  /** Certificate files on this computer: the authority to check the server's certificate by, and the client's own. */
+  certificates?: CertificatePaths
   /** Host name to verify the certificate against when connecting through a tunnel. */
   servername?: string
   readOnly: boolean
@@ -95,19 +98,12 @@ const FK_ACTIONS: Record<string, string> = { a: 'NO ACTION', r: 'RESTRICT', c: '
 
 type Row = any[]
 
-function sslAttempts(mode: SslMode, servername?: string): (false | Record<string, unknown>)[] {
-  const verify = { rejectUnauthorized: true, ...(servername ? { servername } : {}) }
-  const noVerify = { rejectUnauthorized: false, ...(servername ? { servername } : {}) }
-  switch (mode) {
-    case 'disable':
-      return [false]
-    case 'require':
-      return [noVerify]
-    case 'verify-full':
-      return [verify]
-    default:
-      return [noVerify, false]
-  }
+/**
+ * Lets go of a client without waiting for it. After some failures end() never settles: when the server refuses a
+ * client certificate once TLS 1.3 has finished its handshake, the socket is gone but pg still waits to hear it close.
+ */
+function letGo(client: Client): void {
+  client.end().catch(() => undefined)
 }
 
 function isNoSslError(err: any): boolean {
@@ -127,6 +123,9 @@ export function friendlyPgError(err: any, o: PostgresDriverOptions): Error {
   const code = err?.code
   const where = `${o.displayHost}:${o.displayPort}`
   if (code === '28P01') return new Error(`Password authentication failed for user "${o.user}".`)
+  if (isNoSslError(err)) return new Error('The server does not support SSL. Set SSL mode to "prefer" or "disable".')
+  const cert = certificateError(err, { rootCert: o.certificates?.rootCert, host: o.displayHost })
+  if (cert) return cert
   if (code === '28000') return new Error(`Authentication failed for user "${o.user}": ${msg}`)
   if (code === '3D000') return new Error(`Database "${o.database}" does not exist on ${where}.`)
   if (/ECONNREFUSED/.test(msg)) {
@@ -139,10 +138,6 @@ export function friendlyPgError(err: any, o: PostgresDriverOptions): Error {
   if (/ENOTFOUND|EAI_AGAIN/.test(msg)) return new Error(`Host not found: ${o.displayHost}`)
   if (/ETIMEDOUT|timeout/i.test(msg)) return new Error(`Timed out connecting to ${where}.`)
   if (/EHOSTUNREACH|ENETUNREACH/.test(msg)) return new Error(`${o.displayHost} is unreachable.`)
-  if (isNoSslError(err)) return new Error('The server does not support SSL. Set SSL mode to "prefer" or "disable".')
-  if (/self[- ]signed|certificate|CERT_|unable to verify|altnames/i.test(msg)) {
-    return new Error(`Certificate verification failed: ${msg}. Use SSL mode "require" to connect without verifying the certificate.`)
-  }
   if (/no pg_hba.conf entry/i.test(msg)) return new Error(`The server rejected the connection: ${msg}`)
   return new Error(pgErrorMessage(err))
 }
@@ -154,6 +149,8 @@ export class PostgresDriver extends EventEmitter implements DatabaseDriver {
   private client: Client | null = null
   private clientConfig: ClientConfig | null = null
   private txStatus: 'I' | 'T' | 'E' = 'I'
+  /** The server's certificate was checked: who signed it, and with verify-full its host name. */
+  private verified = false
   private dbInfo: DatabaseInfo | null = null
   private readonly typeNames = new Map<number, string>()
   private closed = false
@@ -181,17 +178,19 @@ export class PostgresDriver extends EventEmitter implements DatabaseDriver {
       keepAlive: true,
       types: pgTypes as any
     }
+    const files = o.sslMode === 'disable' ? {} : await loadCertificates(o.certificates ?? {})
     let lastErr: any = null
-    for (const ssl of sslAttempts(o.sslMode, o.servername)) {
-      const client = new Client({ ...base, ssl: ssl as any })
+    for (const ssl of sslAttempts(o.sslMode, files, o.servername)) {
+      const client = new Client({ ...base, ssl })
       try {
         await client.connect()
         this.client = client
-        this.clientConfig = { ...base, ssl: ssl as any }
+        this.clientConfig = { ...base, ssl }
+        this.verified = ssl !== false && ssl.rejectUnauthorized === true
         break
       } catch (err) {
         lastErr = err
-        await client.end().catch(() => undefined)
+        letGo(client)
         if (!(o.sslMode === 'prefer' && ssl !== false && isNoSslError(err))) throw friendlyPgError(err, o)
       }
     }
@@ -251,7 +250,7 @@ export class PostgresDriver extends EventEmitter implements DatabaseDriver {
     let ssl = 'off'
     try {
       const r = await this.q('SELECT ssl FROM pg_stat_ssl WHERE pid = pg_backend_pid()')
-      ssl = r.rows[0]?.[0] ? 'on' : 'off'
+      ssl = r.rows[0]?.[0] ? (this.verified ? 'verified' : 'on') : 'off'
     } catch {
       /* view unavailable */
     }
@@ -875,7 +874,7 @@ export class PostgresDriver extends EventEmitter implements DatabaseDriver {
       await helper.connect()
       await helper.query('SELECT pg_cancel_backend($1)', [pid])
     } finally {
-      await helper.end().catch(() => undefined)
+      letGo(helper)
     }
   }
 

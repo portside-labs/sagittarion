@@ -1,8 +1,8 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
-import type { ConnectionConfig, DatabaseKind, PostgresConfig, SshConfig, SshProfile, SslMode } from '@shared/types'
+import type { CertificateKind, ConnectionConfig, DatabaseKind, PostgresConfig, SshConfig, SshProfile, SslMode } from '@shared/types'
 import { KIND_LABELS } from '@shared/types'
 import { DbLogo } from '@/components/DbLogo'
-import { defaultSsh, describeSsh, describeTarget, newConnection, normalizeConnection, parsePostgresUrl, resolveSshProfile, usesSsh } from '@shared/connections'
+import { defaultSsh, describeSsh, describeTarget, newConnection, normalizeConnection, parsePostgresUrl, resolveSshProfile, usesCertificates, usesSsh } from '@shared/connections'
 import { useStore } from '@/store'
 import { Icon } from '@/components/Icons'
 import { RemoteFileBrowser } from '@/components/RemoteFileBrowser'
@@ -14,6 +14,7 @@ const COLORS = ['#5b93ff', '#3ecf8e', '#e6a23c', '#ff5f57', '#b57bee', '#38bdf8'
 const SSL_MODES: { value: SslMode; label: string; hint: string }[] = [
   { value: 'prefer', label: 'Prefer', hint: 'Encrypt when the server supports it' },
   { value: 'require', label: 'Require', hint: 'Encrypt, do not verify the certificate' },
+  { value: 'verify-ca', label: 'Verify CA', hint: 'Encrypt and verify who signed the certificate' },
   { value: 'verify-full', label: 'Verify full', hint: 'Encrypt and verify the certificate and host name' },
   { value: 'disable', label: 'Disable', hint: 'Plain connection' }
 ]
@@ -135,6 +136,59 @@ function SshFields({
 }
 
 // ---------------------------------------------------------------------------
+// Postgres SSL certificates: the CA's, and the client's own certificate and key
+// ---------------------------------------------------------------------------
+
+type CertificateField = 'sslRootCert' | 'sslCert' | 'sslKey'
+
+function CertificateFields({ pg, onChange, encryption }: { pg: PostgresConfig; onChange: (patch: Partial<PostgresConfig>) => void; encryption: boolean }) {
+  const pick = async (kind: CertificateKind, field: CertificateField) => {
+    const p = await window.api.dialog.pickCertificate(kind, pg[field])
+    if (p) onChange({ [field]: p })
+  }
+  const verifies = pg.sslMode === 'verify-ca' || pg.sslMode === 'verify-full'
+  const saveTitle = encryption ? 'Stored encrypted with your OS keychain' : 'Encrypted storage is not available on this system'
+  const file = (label: string, kind: CertificateKind, field: CertificateField, placeholder: string) => (
+    <div className="field full">
+      <label>{label}</label>
+      <div className="row">
+        <input className="text mono" value={pg[field] ?? ''} placeholder={placeholder} onChange={(e) => onChange({ [field]: e.target.value })} spellCheck={false} data-testid={`pg-${kind}-path`} />
+        <button className="btn" type="button" onClick={() => void pick(kind, field)}>
+          Browse…
+        </button>
+      </div>
+    </div>
+  )
+  return (
+    <div className="form-grid">
+      {file('CA certificate', 'ca', 'sslRootCert', verifies ? 'Publicly trusted authorities when empty' : 'The server’s certificate is not checked when empty')}
+      {file('Client certificate', 'cert', 'sslCert', 'For a server that signs you in with one')}
+      {file('Client key', 'key', 'sslKey', 'The key the client certificate was made with')}
+      {pg.sslKey?.trim() ? (
+        <div className="field full">
+          <label>Key passphrase</label>
+          <div className="row">
+            <input
+              className="text"
+              type="password"
+              value={pg.sslPassphrase ?? ''}
+              placeholder="Leave empty for an unencrypted key"
+              onChange={(e) => onChange({ sslPassphrase: e.target.value })}
+              autoComplete="off"
+              data-testid="pg-key-passphrase"
+            />
+            <label className="checkbox" title={saveTitle}>
+              <input type="checkbox" checked={!!pg.saveSslPassphrase && encryption} disabled={!encryption} onChange={(e) => onChange({ saveSslPassphrase: e.target.checked })} />
+              Save
+            </label>
+          </div>
+        </div>
+      ) : null}
+    </div>
+  )
+}
+
+// ---------------------------------------------------------------------------
 // SSH host: a saved profile, or details typed here (optionally saved as one)
 // ---------------------------------------------------------------------------
 
@@ -251,6 +305,8 @@ export function ConnectScreen() {
   const [browser, setBrowser] = useState<{ sessionId: string } | null>(null)
   const [initialised, setInitialised] = useState(false)
   const [draft, setDraft] = useState<ProfileDraft>({ save: false, name: '' })
+  /** The certificate fields were opened, before any file is named in them. */
+  const [certsShown, setCertsShown] = useState(false)
   /** 'new' while a group name is being typed in the form instead of picked from the list. */
   const [groupMode, setGroupMode] = useState<'new' | null>(null)
   const [collapsedGroups, setCollapsedGroups] = useState<Set<string>>(() => loadCollapsedGroups())
@@ -305,6 +361,7 @@ export function ConnectScreen() {
     setDirty(false)
     setError(null)
     setDraft({ save: false, name: '' })
+    setCertsShown(false)
     setGroupMode(null)
   }
 
@@ -315,7 +372,14 @@ export function ConnectScreen() {
     setDirty(false)
     setError(null)
     setDraft({ save: false, name: '' })
+    setCertsShown(false)
     setGroupMode(null)
+  }
+
+  /** Opens the certificate fields, or closes them and lets go of the files named there. */
+  const showCertificates = (on: boolean) => {
+    setCertsShown(on)
+    if (!on) updatePg({ sslRootCert: undefined, sslCert: undefined, sslKey: undefined, sslPassphrase: undefined })
   }
 
   /** Point the connection at a saved profile, or back at typed details (optionally prefilled from a profile). */
@@ -355,6 +419,10 @@ export function ConnectScreen() {
       if (!portOk(pg.port)) return 'Database port must be between 1 and 65535.'
       if (needTarget && !pg.database.trim()) return 'Database name is required.'
       if (!pg.user.trim()) return 'Database user is required.'
+      if (pg.sslMode !== 'disable') {
+        if (pg.sslCert?.trim() && !pg.sslKey?.trim()) return 'Choose the client key that goes with the client certificate.'
+        if (pg.sslKey?.trim() && !pg.sslCert?.trim()) return 'Choose the client certificate that goes with the client key.'
+      }
     }
     return null
   }
@@ -398,7 +466,7 @@ export function ConnectScreen() {
   const withSecrets = (saved: ConnectionConfig, source: ConnectionConfig): ConnectionConfig => ({
     ...saved,
     ssh: { ...saved.ssh, password: source.ssh.password, passphrase: source.ssh.passphrase },
-    pg: saved.pg ? { ...saved.pg, password: source.pg?.password } : undefined
+    pg: saved.pg ? { ...saved.pg, password: source.pg?.password, sslPassphrase: source.pg?.sslPassphrase } : undefined
   })
 
   /** Stores the typed SSH details as a profile (updating one with the same name) and points the connection at it. */
@@ -647,6 +715,7 @@ export function ConnectScreen() {
   const encryption = appInfo?.encryptionAvailable ?? false
   const disabled = busy !== null
   const pg = form.pg
+  const certsOpen = certsShown || usesCertificates(pg)
   const showChooser = !selectedId && !kindChosen
 
   return (
@@ -952,6 +1021,22 @@ export function ConnectScreen() {
                         </div>
                       </div>
                     </div>
+                    {pg && pg.sslMode !== 'disable' ? (
+                      <div className={`form-section ${certsOpen ? 'tunnel' : ''}`}>
+                        <label className="checkbox">
+                          <input type="checkbox" checked={certsOpen} onChange={(e) => showCertificates(e.target.checked)} data-testid="pg-certs" />
+                          Use SSL certificates
+                        </label>
+                        {certsOpen ? (
+                          <>
+                            <p className="hint" style={{ margin: '8px 0 12px' }}>
+                              Files on this computer, PEM or DER. A CA certificate is checked in every SSL mode, as psql does: the server’s certificate has to be signed by it. A client certificate and key sign you in where the server asks for one.
+                            </p>
+                            <CertificateFields pg={pg} onChange={updatePg} encryption={encryption} />
+                          </>
+                        ) : null}
+                      </div>
+                    ) : null}
                     <div className={`form-section ${pg?.tunnel ? 'tunnel' : ''}`}>
                       <label className="checkbox">
                         <input type="checkbox" checked={!!pg?.tunnel} onChange={(e) => updatePg({ tunnel: e.target.checked })} data-testid="pg-tunnel" />
@@ -986,7 +1071,7 @@ export function ConnectScreen() {
                 </div>
 
                 <div className="form-actions">
-                  <button className="btn" disabled={disabled} onClick={() => void test()}>
+                  <button className="btn" disabled={disabled} onClick={() => void test()} data-testid="test-connection">
                     {busy === 'test' ? <span className="spinner" /> : null} Test
                   </button>
                   <button className="btn" disabled={disabled} onClick={() => void save()}>
@@ -1002,7 +1087,11 @@ export function ConnectScreen() {
                     <span className="spinner" /> {progress}
                   </div>
                 ) : null}
-                {error ? <div className="error-box">{error}</div> : null}
+                {error ? (
+                  <div className="error-box" data-testid="connect-error">
+                    {error}
+                  </div>
+                ) : null}
 
                 <div className="requirements">
                   {form.kind === 'sqlite' && !form.remote ? (

@@ -7,6 +7,7 @@ import agentSource from './agent/sqlite_agent.py?raw'
 import modelHostPath from './privacy/semantic/host?modulePath'
 import { ConnectionManager } from './connections/manager'
 import { humanKeyType, KnownHostsStore } from './ssh/hostkeys'
+import { expandLocalHome } from './ssh/local-session'
 import { ConnectionStore, noopCodec, type SecretCodec } from './store/connections'
 import { SettingsStore } from './store/settings'
 import { CredentialStore } from './store/credentials'
@@ -52,7 +53,7 @@ import { EmbeddingCache } from './ai/embeddings'
 import type { DatabaseDriver } from './db/driver'
 import { toCsv, toJson, toSqlInserts } from '@shared/export'
 import type { OpenOptions, SessionLinkEvent } from '@shared/api'
-import type { AppInfo, ConnectionConfig, ExportRequest, ListObjectsRequest, ObjectRef, PendingChange, RowsRequest, SavedChat, SessionInfo, SshConfig, SshProfile, TableRef, WorkspaceState } from '@shared/types'
+import type { AppInfo, CertificateKind, ConnectionConfig, ExportRequest, ListObjectsRequest, ObjectRef, PendingChange, RowsRequest, SavedChat, SessionInfo, SshConfig, SshProfile, TableRef, WorkspaceState } from '@shared/types'
 
 const isMac = process.platform === 'darwin'
 let mainWindow: BrowserWindow | null = null
@@ -519,6 +520,27 @@ function registerIpc(): void {
     const r = await dialog.showOpenDialog(mainWindow as BrowserWindow, {
       title: 'Choose a private key',
       defaultPath: path.join(os.homedir(), '.ssh'),
+      properties: ['openFile', 'showHiddenFiles', 'treatPackageAsDirectory']
+    })
+    return r.canceled || !r.filePaths[0] ? null : r.filePaths[0]
+  })
+
+  ipcMain.handle('dialog:pickCertificate', async (_e, kind: CertificateKind, current?: string) => {
+    // Where libpq keeps its certificates, when there is such a folder; else where the file chosen before is.
+    const libpqDir = path.join(os.homedir(), '.postgresql')
+    const start = current?.trim()
+      ? path.dirname(expandLocalHome(current.trim()))
+      : await fs.stat(libpqDir).then(
+          (s) => (s.isDirectory() ? libpqDir : os.homedir()),
+          () => os.homedir()
+        )
+    const r = await dialog.showOpenDialog(mainWindow as BrowserWindow, {
+      title: kind === 'ca' ? 'Choose the CA certificate' : kind === 'cert' ? 'Choose the client certificate' : 'Choose the client key',
+      defaultPath: start,
+      filters:
+        kind === 'key'
+          ? [{ name: 'Keys', extensions: ['key', 'pem', 'pk8', 'der'] }, { name: 'All files', extensions: ['*'] }]
+          : [{ name: 'Certificates', extensions: ['crt', 'pem', 'cer', 'der'] }, { name: 'All files', extensions: ['*'] }],
       properties: ['openFile', 'showHiddenFiles', 'treatPackageAsDirectory']
     })
     return r.canceled || !r.filePaths[0] ? null : r.filePaths[0]

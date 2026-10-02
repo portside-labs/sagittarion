@@ -1,11 +1,20 @@
-import type { ConnectionConfig, DatabaseKind, PostgresConfig, SshConfig, SshProfile, TableRef } from './types'
+import type { ConnectionConfig, DatabaseKind, PostgresConfig, SshConfig, SshProfile, SslMode, TableRef } from './types'
 
 export function defaultSsh(): SshConfig {
   return { host: '', port: 22, username: '', auth: 'key', savePassword: true, savePassphrase: true }
 }
 
 export function defaultPostgres(): PostgresConfig {
-  return { host: 'localhost', port: 5432, database: '', user: '', savePassword: true, sslMode: 'prefer', tunnel: false }
+  return { host: 'localhost', port: 5432, database: '', user: '', savePassword: true, sslMode: 'prefer', saveSslPassphrase: true, tunnel: false }
+}
+
+export function isSslMode(v: unknown): v is SslMode {
+  return v === 'prefer' || v === 'require' || v === 'verify-ca' || v === 'verify-full' || v === 'disable'
+}
+
+/** The certificate files a Postgres connection names, if any. */
+export function usesCertificates(pg: PostgresConfig | undefined): boolean {
+  return Boolean(pg?.sslRootCert?.trim() || pg?.sslCert?.trim() || pg?.sslKey?.trim())
 }
 
 export function newConnection(kind: DatabaseKind): ConnectionConfig {
@@ -38,6 +47,14 @@ export function normalizeConnection(cfg: ConnectionConfig): ConnectionConfig {
   if (out.kind === 'postgres') {
     out.pg = { ...defaultPostgres(), ...(cfg.pg ?? {}) }
     out.pg.port = Number(out.pg.port) || 5432
+    if (!isSslMode(out.pg.sslMode)) out.pg.sslMode = 'prefer'
+    for (const k of ['sslRootCert', 'sslCert', 'sslKey'] as const) {
+      const p = out.pg[k]?.trim()
+      if (p) out.pg[k] = p
+      else delete out.pg[k]
+    }
+    // A passphrase is only ever for the client key.
+    if (!out.pg.sslKey) delete out.pg.sslPassphrase
   }
   return out
 }
@@ -72,7 +89,10 @@ export function resolveSshProfile(cfg: ConnectionConfig, profiles: SshProfile[])
   return { ...cfg, ssh: { ...ssh, password: ssh.password || cfg.ssh?.password, passphrase: ssh.passphrase || cfg.ssh?.passphrase } }
 }
 
-/** Parse a libpq-style URL such as postgres://user:pass@host:5432/db?sslmode=require. */
+/**
+ * Parse a libpq-style URL such as postgres://user:pass@host:5432/db?sslmode=require, with its certificate files
+ * (sslrootcert, sslcert, sslkey, sslpassword) when it names them.
+ */
 export function parsePostgresUrl(input: string): Partial<PostgresConfig> | null {
   const text = input.trim()
   if (!/^postgres(ql)?:\/\//i.test(text)) return null
@@ -90,9 +110,18 @@ export function parsePostgresUrl(input: string): Partial<PostgresConfig> | null 
   const db = url.pathname.replace(/^\//, '')
   if (db) out.database = decodeURIComponent(db)
   const ssl = url.searchParams.get('sslmode')
-  if (ssl === 'disable' || ssl === 'require' || ssl === 'verify-full' || ssl === 'prefer') out.sslMode = ssl
-  else if (ssl === 'verify-ca') out.sslMode = 'verify-full'
+  if (isSslMode(ssl)) out.sslMode = ssl
   else if (ssl === 'allow') out.sslMode = 'prefer'
+  const rootCert = url.searchParams.get('sslrootcert')?.trim()
+  // "system" is libpq's word for the authorities this computer trusts, which verify the host name too unless told otherwise.
+  if (rootCert === 'system') out.sslMode = out.sslMode === 'verify-ca' ? 'verify-ca' : 'verify-full'
+  else if (rootCert) out.sslRootCert = rootCert
+  const cert = url.searchParams.get('sslcert')?.trim()
+  if (cert) out.sslCert = cert
+  const key = url.searchParams.get('sslkey')?.trim()
+  if (key) out.sslKey = key
+  const passphrase = url.searchParams.get('sslpassword')
+  if (passphrase) out.sslPassphrase = passphrase
   return out
 }
 

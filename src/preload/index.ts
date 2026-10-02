@@ -55,6 +55,7 @@ const api: Api = {
   },
   dialog: {
     pickPrivateKey: () => ipcRenderer.invoke('dialog:pickPrivateKey'),
+    pickCertificate: (kind, current) => ipcRenderer.invoke('dialog:pickCertificate', kind, current),
     pickSqliteFile: (current) => ipcRenderer.invoke('dialog:pickSqliteFile', current)
   },
   exportData: (req) => ipcRenderer.invoke('export:save', req),

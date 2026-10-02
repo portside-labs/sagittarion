@@ -225,6 +225,7 @@ export class ConnectionManager extends EventEmitter {
         user: pgc.user.trim(),
         password: pgc.password,
         sslMode: pgc.sslMode,
+        certificates: { rootCert: pgc.sslRootCert, cert: pgc.sslCert, key: pgc.sslKey, passphrase: pgc.sslPassphrase },
         servername,
         readOnly: Boolean(config.readOnly),
         displayHost: pgc.host.trim(),

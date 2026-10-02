@@ -24,8 +24,11 @@ export interface SshConfig {
   savePassphrase?: boolean
 }
 
-/** Mirrors libpq's sslmode. `prefer` tries TLS first and falls back to plain if the server has none. */
-export type SslMode = 'prefer' | 'require' | 'verify-full' | 'disable'
+/**
+ * Mirrors libpq's sslmode. `prefer` tries TLS first and falls back to plain if the server has none; `verify-ca` checks
+ * who signed the server's certificate, `verify-full` that and the host name in it.
+ */
+export type SslMode = 'prefer' | 'require' | 'verify-ca' | 'verify-full' | 'disable'
 
 export interface PostgresConfig {
   host: string
@@ -35,9 +38,22 @@ export interface PostgresConfig {
   password?: string
   savePassword?: boolean
   sslMode: SslMode
+  /**
+   * Certificate files on this computer, as libpq's sslrootcert, sslcert and sslkey: the authority that signed the
+   * server's certificate, and the certificate and key the client signs in with. Unused when SSL is off.
+   */
+  sslRootCert?: string
+  sslCert?: string
+  sslKey?: string
+  /** Passphrase of an encrypted client key. Persisted (encrypted) only when saveSslPassphrase is set. */
+  sslPassphrase?: string
+  saveSslPassphrase?: boolean
   /** Reach the server through the SSH host in ConnectionConfig.ssh. */
   tunnel: boolean
 }
+
+/** The certificate files a Postgres connection can name: the CA's, and the client's certificate and key. */
+export type CertificateKind = 'ca' | 'cert' | 'key'
 
 export interface ConnectionConfig {
   id: string
@@ -79,7 +95,7 @@ export interface StoredSshProfile extends Omit<SshProfile, 'password' | 'passphr
 }
 
 type StoredSsh = Omit<SshConfig, 'password' | 'passphrase'> & { encryptedPassword?: string; encryptedPassphrase?: string }
-type StoredPg = Omit<PostgresConfig, 'password'> & { encryptedPassword?: string }
+type StoredPg = Omit<PostgresConfig, 'password' | 'sslPassphrase'> & { encryptedPassword?: string; encryptedSslPassphrase?: string }
 
 /** Persisted shape: never contains plaintext secrets. */
 export interface StoredConnection extends Omit<ConnectionConfig, 'ssh' | 'pg'> {

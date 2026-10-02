@@ -83,8 +83,8 @@ export class ConnectionStore {
       ssh: { ...sshRest, password: this.decrypt(encryptedPassword), passphrase: this.decrypt(encryptedPassphrase) }
     }
     if (pg) {
-      const { encryptedPassword: pgCipher, ...pgRest } = pg
-      cfg.pg = { ...pgRest, password: this.decrypt(pgCipher) }
+      const { encryptedPassword: pgCipher, encryptedSslPassphrase, ...pgRest } = pg
+      cfg.pg = { ...pgRest, password: this.decrypt(pgCipher), sslPassphrase: this.decrypt(encryptedSslPassphrase) }
     }
     return normalizeConnection(cfg)
   }
@@ -126,8 +126,13 @@ export class ConnectionStore {
     stored.ssh.encryptedPassword = keepOrEncrypt(ssh.savePassword, sshPassword, existing?.ssh.encryptedPassword)
     stored.ssh.encryptedPassphrase = keepOrEncrypt(ssh.savePassphrase, passphrase, existing?.ssh.encryptedPassphrase)
     if (cfg.kind === 'postgres' && pg) {
-      const { password: pgPassword, ...pgRest } = pg
-      stored.pg = { ...pgRest, encryptedPassword: keepOrEncrypt(pg.savePassword, pgPassword, existing?.pg?.encryptedPassword) }
+      const { password: pgPassword, sslPassphrase, ...pgRest } = pg
+      stored.pg = {
+        ...pgRest,
+        encryptedPassword: keepOrEncrypt(pg.savePassword, pgPassword, existing?.pg?.encryptedPassword),
+        // Kept while there is a client key for it to open.
+        encryptedSslPassphrase: pg.sslKey ? keepOrEncrypt(pg.saveSslPassphrase, sslPassphrase, existing?.pg?.encryptedSslPassphrase) : undefined
+      }
     } else {
       delete stored.pg
     }
