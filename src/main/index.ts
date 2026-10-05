@@ -15,8 +15,9 @@ import { SshProfileStore } from './store/ssh-profiles'
 import { WorkspaceStore } from './store/workspace'
 import { qi, qualify } from './db/pg-values'
 import { cellToPlainText } from '@shared/export'
-import type { AiConnectionInput, AiProgressEvent, AiProgressStep, AiSettingsUpdate, AiTurn, AskOptions } from '@shared/ai'
+import type { AiConnectionInput, AiProgressEvent, AiProgressStep, AiResult, AiSettingsUpdate, AiTurn, AskOptions } from '@shared/ai'
 import type { ToolApprovalDecision } from '@shared/connectors'
+import type { AiLearned } from '@shared/knowledge'
 import { PROVIDERS, readsResults } from '@shared/ai'
 import { classifyEndpoint, privacyApplies, type PrivacySettings } from '@shared/privacy'
 import { createProvider, providerConfigFor } from './ai/providers/factory'
@@ -35,7 +36,10 @@ import { SemanticModel } from './privacy/semantic/manager'
 import { ConnectorStore, connectorInfo } from './connectors/store'
 import { InstructionStore } from './store/instructions'
 import { ChatHistoryStore } from './store/chat-history'
-import { conversationTitle } from './ai/title'
+import { KnowledgeStore } from './knowledge/store'
+import { KnowledgeBook, runFacts } from './knowledge/book'
+import type { DefinitionReader } from './knowledge/flow'
+import { checkReadOnlySql } from './ai/guard'
 import { instructionsAcross, instructionsFor, type InstructionInput } from '@shared/instructions'
 import { ConnectorManager } from './connectors/manager'
 import { connectorsForAsk } from './connectors/ask'
@@ -53,7 +57,7 @@ import { EmbeddingCache } from './ai/embeddings'
 import type { DatabaseDriver } from './db/driver'
 import { toCsv, toJson, toSqlInserts } from '@shared/export'
 import type { OpenOptions, SessionLinkEvent } from '@shared/api'
-import type { AppInfo, CertificateKind, ConnectionConfig, ExportRequest, ListObjectsRequest, ObjectRef, PendingChange, RowsRequest, SavedChat, SessionInfo, SshConfig, SshProfile, TableRef, WorkspaceState } from '@shared/types'
+import type { AppInfo, CertificateKind, ConnectionConfig, ExportRequest, QueryResponse, ListObjectsRequest, ObjectRef, PendingChange, RowsRequest, SavedChat, SessionInfo, SshConfig, SshProfile, TableRef, WorkspaceState } from '@shared/types'
 
 const isMac = process.platform === 'darwin'
 let mainWindow: BrowserWindow | null = null
@@ -79,6 +83,10 @@ let semanticModel: SemanticModel
 /** The user's instructions to the model (instructions.json). */
 let instructionStore: InstructionStore
 let chatHistory: ChatHistoryStore
+/** What the app learns about the business behind each connection (knowledge/<id>.json). */
+let knowledgeStore: KnowledgeStore
+/** Whether it learns at all: the user can turn it off in Settings. Kept here so editor runs need not read settings. */
+let learning = true
 /** The user's MCP servers (connectors.json) and their running clients. */
 let connectorStore: ConnectorStore
 let connectorManager: ConnectorManager
@@ -149,8 +157,70 @@ async function indexWithProgress(sessionId: string, kind: 'sqlite' | 'postgres',
 }
 
 /**
+ * What is known about the business behind a session's connection, when the app learns and the connection is saved;
+ * undefined for a session that has closed meanwhile.
+ */
+function knowledgeFor(sessionId: string): KnowledgeBook | undefined {
+  let id: string | undefined
+  try {
+    id = manager.get(sessionId).config.id || undefined
+  } catch {
+    return undefined
+  }
+  return learning && id ? new KnowledgeBook(knowledgeStore, id) : undefined
+}
+
+/** How the knowledge reads a session's triggers and definitions, to learn how data moves. */
+function definitionReader(sessionId: string): DefinitionReader {
+  return {
+    triggers: async (ref) => (await manager.read(sessionId, (d) => d.tableDetails(ref))).triggers,
+    definition: async (ref) => (await manager.read(sessionId, (d) => d.definition(ref))).sql
+  }
+}
+
+/** The read statements of a run in the editor, counted for what they teach; errors are left out of what is learned. */
+async function noteEditorRun(sessionId: string, response: QueryResponse): Promise<void> {
+  const book = knowledgeFor(sessionId)
+  if (!book) return
+  // The schema index only when an ask has read it already: an editor run never costs a read of the schema.
+  const index = await schemaIndexes.get(sessionId)?.catch(() => undefined)
+  for (const r of response.results) {
+    if (r.kind === 'exec' || !checkReadOnlySql(r.sql).ok) continue
+    await book.editorRun(r.sql, r.kind === 'rows', index)
+  }
+}
+
+/**
+ * After an answer, how data moves around the tables it used is read from their triggers and definitions, a few at a
+ * time, for later questions: after a moment, so a query the answer runs goes first. The books are made at once, while
+ * every session is open; one closed by the time the reading starts is passed by. Learning never stands in the way of
+ * an answer, or of anything else.
+ */
+function scanAfterAnswer(sessions: { sessionId: string; index: SchemaIndex }[], result: Exclude<AiResult, { kind: 'cancelled' }>): void {
+  try {
+    const scans = sessions.map((s) => ({ ...s, book: knowledgeFor(s.sessionId), keys: new Set<string>() }))
+    const of = (connectionId: string | undefined) => scans.find((s) => s.book && s.book.connectionId === (connectionId ?? ''))
+    if (result.kind === 'query') {
+      const s = (result.database && of(result.database.connectionId)) || scans[0]
+      for (const key of runFacts(result.sql, s.index).tables) s.keys.add(key)
+    }
+    for (const q of result.queries ?? []) {
+      const s = of(q.database.connectionId)
+      if (s && q.rows !== undefined) for (const key of runFacts(q.sql, s.index).tables) s.keys.add(key)
+    }
+    setTimeout(() => {
+      for (const s of scans) {
+        if (s.book && s.keys.size) void s.book.scan(s.index, definitionReader(s.sessionId), [...s.keys]).catch(() => undefined)
+      }
+    }, 1500)
+  } catch {
+    /* best effort */
+  }
+}
+
+/**
  * An open session as the agent sees a database: read-only queries, safe to run again should the link drop under them,
- * and whether the user lets the model read their results there.
+ * whether the user lets the model read their results there, and what is known about its business.
  */
 function agentDatabase(sessionId: string, index: SchemaIndex, key: string, readResults: boolean): AgentDatabase {
   const conn = manager.get(sessionId)
@@ -165,7 +235,8 @@ function agentDatabase(sessionId: string, index: SchemaIndex, key: string, readR
     index,
     runQuery: (sql, maxRows) => manager.read(sessionId, (d) => d.query(sql, [], maxRows, { readOnly: true })),
     distinctValues: (ref, column) => manager.read(sessionId, (d) => distinctValuesFor(d, kind, ref, column)),
-    recentTables: recentTables.get(sessionId)
+    recentTables: recentTables.get(sessionId),
+    knowledge: knowledgeFor(sessionId)
   }
 }
 
@@ -463,6 +534,7 @@ function registerIpc(): void {
     await connectionStore.remove(id)
     await connectorStore.forgetConnection(id)
     await instructionStore.forgetConnection(id)
+    await knowledgeStore.forgetConnection(id)
     await settingsStore.forgetConnection(id)
   })
   ipcMain.handle('connections:setGroup', (_e, ids: string[], group: string | null) => connectionStore.setGroup(ids, group))
@@ -495,9 +567,12 @@ function registerIpc(): void {
   ipcMain.handle('db:tableDetails', (_e, sessionId: string, ref: TableRef) => manager.read(sessionId, (d) => d.tableDetails(ref)))
   ipcMain.handle('db:rows', (_e, sessionId: string, req: RowsRequest) => manager.read(sessionId, (d) => d.rows(req)))
   ipcMain.handle('db:count', (_e, sessionId: string, ref: TableRef, where?: string) => manager.read(sessionId, (d) => d.count(ref, where)))
-  ipcMain.handle('db:query', async (_e, sessionId: string, sql: string, params: unknown[], maxRows: number) =>
-    (await manager.driver(sessionId)).query(sql, params, maxRows)
-  )
+  ipcMain.handle('db:query', async (_e, sessionId: string, sql: string, params: unknown[], maxRows: number) => {
+    const response = await (await manager.driver(sessionId)).query(sql, params, maxRows)
+    // What the user runs teaches the knowledge how the team queries: after the answer, never holding it up.
+    if (learning) void noteEditorRun(sessionId, response).catch(() => undefined)
+    return response
+  })
   ipcMain.handle('db:cancel', (_e, sessionId: string) => manager.cancel(sessionId))
   ipcMain.handle('db:apply', async (_e, sessionId: string, changes: PendingChange[]) => (await manager.driver(sessionId)).apply(changes))
 
@@ -560,7 +635,9 @@ function registerIpc(): void {
   ipcMain.handle('settings:update', async (_e, u: AiSettingsUpdate) => {
     // Semantic detection is only offered once the model is installed; a request to switch it on without one is ignored.
     if (u.privacy?.semanticDetection && !(await semanticModel.detector())) u = { ...u, privacy: { ...u.privacy, semanticDetection: false } }
-    return settingsStore.update(u)
+    const updated = await settingsStore.update(u)
+    learning = updated.agent.learn
+    return updated
   })
   ipcMain.handle('privacy:model-status', () => semanticModel.status())
   ipcMain.handle('privacy:model-install', () => semanticModel.install())
@@ -636,8 +713,6 @@ function registerIpc(): void {
         onProgress,
         signal: controller.signal
       })
-      // A new conversation gets a name for its tab, asked for alongside its first answer.
-      const titling = opts?.title === true ? conversationTitle(gateway, question, controller.signal) : null
       const allInstructions = await instructionStore.list()
       const instructions = databases
         ? instructionsAcross(allInstructions, databases)
@@ -656,6 +731,9 @@ function registerIpc(): void {
           distinctValues: (ref, column) => manager.read(sessionId, (d) => distinctValuesFor(d, kind, ref, column)),
           embeddingCache,
           ...(databases ? { databases } : {}),
+          knowledge: knowledgeFor(sessionId),
+          // A new conversation is named by the model in its first answer, not in a request of its own.
+          title: opts?.title === true,
           connectors,
           instructions,
           recentTables: recentTables.get(sessionId),
@@ -666,9 +744,7 @@ function registerIpc(): void {
         question,
         Array.isArray(history) ? history : []
       )
-      // The answer waits a moment for its name, not long: the tab can keep its first question instead.
-      const title = titling ? await Promise.race([titling, new Promise<null>((resolve) => setTimeout(() => resolve(null), 4000))]) : null
-      if (title && result.kind !== 'cancelled') Object.assign(result, { title })
+      if (learning && result.kind !== 'cancelled') scanAfterAnswer(sessions, result)
       if (result.kind === 'query') {
         // The tables used are remembered for the database the query is for.
         const at = result.database && databases ? databases.findIndex((d) => d.connectionId === result.database!.connectionId) : -1
@@ -719,6 +795,12 @@ function registerIpc(): void {
   })
   ipcMain.handle('chats:archive', (_e, chat: SavedChat) => chatHistory.put(chat))
   ipcMain.handle('chats:forget', (_e, id: string) => (typeof id === 'string' ? chatHistory.remove(id) : undefined))
+  // Something learned while answering, undone from the answer that shows it; or everything learned, from Settings.
+  ipcMain.handle('knowledge:forget', (_e, item: AiLearned) => {
+    if (!item || typeof item.connectionId !== 'string' || typeof item.id !== 'string' || !['term', 'rule', 'domain', 'query'].includes(item.kind)) return false
+    return new KnowledgeBook(knowledgeStore, item.connectionId).forget({ kind: item.kind, id: item.id, corrected: item.corrected === true })
+  })
+  ipcMain.handle('knowledge:forgetAll', () => knowledgeStore.forgetAll())
   ipcMain.handle('instructions:list', () => instructionStore.list())
   ipcMain.handle('instructions:save', (_e, input: InstructionInput) => instructionStore.save(input))
   ipcMain.handle('instructions:setEnabled', (_e, id: string, enabled: boolean) => instructionStore.setEnabled(id, enabled === true))
@@ -778,6 +860,8 @@ if (!app.requestSingleInstanceLock()) {
     connectorStore = new ConnectorStore(path.join(userData, 'connectors.json'), codec)
     instructionStore = new InstructionStore(path.join(userData, 'instructions.json'))
     chatHistory = new ChatHistoryStore(path.join(userData, 'chat-history.json'))
+    knowledgeStore = new KnowledgeStore(path.join(userData, 'knowledge'))
+    void settingsStore.get().then((s) => (learning = s.agent.learn !== false)).catch(() => undefined)
     connectorManager = new ConnectorManager({
       clientInfo: { name: 'Sagittarion', version: app.getVersion() },
       path: () => connectorPath(),
@@ -811,6 +895,7 @@ if (!app.requestSingleInstanceLock()) {
   })
 
   app.on('before-quit', () => {
+    knowledgeStore?.flushSync()
     void manager?.closeAll()
     semanticModel?.dispose()
     void connectorManager?.dispose()

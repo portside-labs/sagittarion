@@ -12,7 +12,7 @@ export const RESULT_CHARS = 12_000
 
 /**
  * Finding things out before asking, for every chat: the model looks names and dates up, asks only when it cannot find
- * out, says what it assumed, and offers to remember what the user tells it.
+ * out, and says what it assumed.
  */
 function lookFirst(opts: { readResults: boolean; connectors: boolean }): string[] {
   const where = [opts.readResults ? 'the data (run_query)' : 'the schema and its sample values', opts.connectors ? "the user's connected tools (the mcp__ tools)" : '']
@@ -20,12 +20,47 @@ function lookFirst(opts: { readResults: boolean; connectors: boolean }): string[
     .join(' and ')
   return [
     `- Find things out before you ask: look up names, ids and codes in ${where}, and resolve dates such as "October" or "last week" against today.`,
-    '- Ask only when you cannot find out, or when two answers are equally likely; then say what you found and which you would use. Otherwise make the reasonable choice and say briefly what you assumed.',
-    '- When the user tells you a stable fact you would otherwise have to ask again, such as an id, a naming rule or a schedule, call remember with it.'
+    '- Ask only when you cannot find out, or when two answers are equally likely; then say what you found and which you would use. Otherwise make the reasonable choice and say briefly what you assumed.'
   ]
 }
 
-export function systemRules(kind: DatabaseKind, serverVersion: string, today: string, defaultSchema?: string, tools = true, connectors = false, readResults = false): string {
+/**
+ * Business knowledge: the model reads the question in the business's terms, relies on what is known as far as its
+ * source allows, and keeps what it learns without asking, in replies it sends anyway.
+ */
+function knowledgeLines(opts: { readResults: boolean }): string[] {
+  return [
+    '- People ask in their business\'s words. Read the question against "What this team means" first, when there is one: a term there means what it says here, and a runbook query that fits is where the answer starts.',
+    opts.readResults
+      ? '- When a runbook query answers the question, run it with run_saved_query instead of writing a new one; adapt its SQL when the question differs.'
+      : '- When a runbook query answers the question, use its SQL with the values filled in instead of writing a new one; adapt it when the question differs.',
+    '- What the user told you is settled; what was checked in the data is reliable; what is unchecked is a working guess, to check in the data only when the answer turns on it. Never ask the user to confirm something you know or can look up: say in a few words what you took their words to mean, so they can correct you.',
+    '- Keep what you learn, without asking: call learn for what a business word means here, a rule the user tells you, a correction, or which tables make up a part of the business; call save_query for a query that answers a business question likely to come again. Call them in the same reply as your answer or your other tool calls, never on their own. Keep what helps with later questions, not one-off details.'
+  ]
+}
+
+/** Requests cost the user money: the model is told how many it has, and how to need fewer. */
+function budgetLine(maxRequests: number): string {
+  return `- You have at most ${maxRequests} requests to the model for this question, this one included. Use few: call tools that do not depend on each other together, in one reply; get what you need in as few queries as possible (join and aggregate in SQL instead of querying step by step); and answer as soon as you can.`
+}
+
+export interface RuleOptions {
+  /** Business knowledge is kept for this database: the learn and save_query tools are on. */
+  learning?: boolean
+  /** The most requests the ask may make. */
+  maxRequests?: number
+}
+
+export function systemRules(
+  kind: DatabaseKind,
+  serverVersion: string,
+  today: string,
+  defaultSchema?: string,
+  tools = true,
+  connectors = false,
+  readResults = false,
+  extra: RuleOptions = {}
+): string {
   const dialect = kind === 'postgres' ? 'PostgreSQL' : 'SQLite'
   const investigating = tools && readResults
   const lines = [
@@ -49,7 +84,9 @@ export function systemRules(kind: DatabaseKind, serverVersion: string, today: st
     '- Add LIMIT 200 to queries that list rows unless the question states a count. Aggregates and counts need no LIMIT.',
     `- Today is ${today}. Resolve relative periods such as "last month" against that date.`,
     '- Values in braces after a column are real sample values; match them exactly.',
-    ...(tools ? lookFirst({ readResults: investigating, connectors }) : [])
+    ...(tools ? lookFirst({ readResults: investigating, connectors }) : []),
+    ...(tools && extra.learning ? knowledgeLines({ readResults: investigating }) : []),
+    ...(tools && extra.maxRequests ? [budgetLine(extra.maxRequests)] : [])
   ]
   if (investigating) {
     lines.push(
@@ -105,7 +142,8 @@ export const PROPOSE_TOOL: ToolDef = {
       explanation: { type: 'string', description: 'One or two sentences on what the query returns and how.' },
       tables_used: { type: 'array', items: { type: 'string' }, description: 'Tables referenced by the query.' },
       assumptions: { type: 'array', items: { type: 'string' }, description: 'Guesses the user should check, e.g. which column means "revenue".' },
-      needs_clarification: { type: ['string', 'null'], description: 'A question for the user when the request cannot be answered confidently.' }
+      needs_clarification: { type: ['string', 'null'], description: 'A question for the user when the request cannot be answered confidently.' },
+      title: { type: 'string', description: 'Only when asked to name the conversation: its name.' }
     },
     required: ['sql', 'explanation', 'tables_used']
   }
@@ -153,20 +191,86 @@ export const RUN_QUERY_TOOL: ToolDef = {
   parameters: { type: 'object', properties: { sql: QUERY_SQL, purpose: QUERY_PURPOSE }, required: ['sql'] }
 }
 
-const REMEMBER_DESCRIPTION =
-  "Offer to remember a fact about the user's data for next time, so it need not be asked again: an id the user gave for something they named, a naming rule, a schedule. The user decides whether to keep it; carry on either way."
-const REMEMBER_FACT = { type: 'string', description: 'The fact, in one sentence, as it should be remembered.' }
+// Learning: kept at once, without a yes from the user, and needing no reply, so they ride along with replies the model
+// sends anyway rather than costing requests of their own.
+const LEARN_PROPERTIES = {
+  kind: {
+    type: 'string',
+    enum: ['term', 'rule', 'domain'],
+    description: 'term: a word or phrase the business uses. rule: a convention the team follows. domain: a part of the business and the tables that hold it.'
+  },
+  name: { type: 'string', description: 'term: the word or phrase as the business says it. rule: a short title. domain: its name, after the names of any domains above it, joined by " › ".' },
+  meaning: { type: 'string', description: 'What it means here, in a sentence or two.' },
+  sql: { type: 'string', description: 'term: the SQL condition or expression that picks it out, with table names rather than aliases. Leave out when there is none.' },
+  tables: { type: 'array', items: { type: 'string' }, description: 'The tables it involves; for a domain, the tables in it.' },
+  aliases: { type: 'array', items: { type: 'string' }, description: 'Other ways the business says it.' },
+  source: { type: 'string', enum: ['user', 'data', 'inferred'], description: 'user: the user said so. data: you checked it in the data. inferred: your reading of names, unchecked.' }
+}
+const LEARN_DESCRIPTION =
+  'Keep something you learned about this business for later questions, without asking the user: what a word means here, a rule the team follows, or a part of the business and its tables. Call it again with a correction when the user corrects you. It needs no reply: call it in the same reply as your answer or your other tool calls.'
 
-export const REMEMBER_TOOL: ToolDef = {
-  name: 'remember',
-  description: REMEMBER_DESCRIPTION,
-  parameters: { type: 'object', properties: { fact: REMEMBER_FACT }, required: ['fact'] }
+export const LEARN_TOOL: ToolDef = {
+  name: 'learn',
+  description: LEARN_DESCRIPTION,
+  parameters: { type: 'object', properties: LEARN_PROPERTIES, required: ['kind', 'name', 'meaning', 'source'] }
 }
 
-/** The tools of a chat on one database; run_query where the user lets the model read results. */
-export function singleTools(readResults: boolean): ToolDef[] {
-  return [...TOOLS, ...(readResults ? [RUN_QUERY_TOOL] : []), REMEMBER_TOOL]
+const SAVE_PROPERTIES = {
+  name: { type: 'string', description: 'A short name for what it answers, in business terms.' },
+  purpose: { type: 'string', description: 'The business question it answers.' },
+  sql: { type: 'string', description: 'One read-only SELECT or WITH ... SELECT, with a :name parameter for each value that changes between questions.' },
+  params: {
+    type: 'array',
+    description: 'Its parameters.',
+    items: {
+      type: 'object',
+      properties: { name: { type: 'string' }, description: { type: 'string' }, example: { type: 'string', description: 'Its value in this question.' } },
+      required: ['name']
+    }
+  },
+  domain: { type: 'string', description: 'The domain it belongs to, when known.' }
 }
+const SAVE_DESCRIPTION =
+  "Keep a query that answers a business question in this database's runbook, so the same kind of question is answered with it next time. Make the values that change between questions (names, ids, dates) :name parameters. It needs no reply: call it in the same reply as your answer."
+
+export const SAVE_QUERY_TOOL: ToolDef = {
+  name: 'save_query',
+  description: SAVE_DESCRIPTION,
+  parameters: { type: 'object', properties: SAVE_PROPERTIES, required: ['name', 'purpose', 'sql'] }
+}
+
+const RUN_SAVED_PROPERTIES = {
+  id: { type: 'string', description: 'The runbook id, such as q3.' },
+  values: {
+    type: 'array',
+    description: 'A value for each parameter.',
+    items: { type: 'object', properties: { name: { type: 'string' }, value: { type: 'string' } }, required: ['name', 'value'] }
+  }
+}
+
+export const RUN_SAVED_TOOL: ToolDef = {
+  name: 'run_saved_query',
+  description: `Run a query from the runbook with a value for each of its parameters, and see up to ${RESULT_ROWS} rows of its result.`,
+  parameters: { type: 'object', properties: RUN_SAVED_PROPERTIES, required: ['id'] }
+}
+
+/** Tools that change nothing the model waits on: answered here, and never worth a request of their own. */
+export const KEEPING_TOOLS = new Set(['learn', 'save_query'])
+
+/**
+ * The tools of a chat on one database: run_query where the user lets the model read results; learn and save_query
+ * where business knowledge is kept, with run_saved_query where results can be read too.
+ */
+export function singleTools(readResults: boolean, learning = false): ToolDef[] {
+  return [...TOOLS, ...(readResults ? [RUN_QUERY_TOOL] : []), ...(learning ? [LEARN_TOOL, SAVE_QUERY_TOOL, ...(readResults ? [RUN_SAVED_TOOL] : [])] : [])]
+}
+
+/** Asked of the first question of a conversation, so its name comes with the answer rather than in a request of its own. */
+export const TITLE_REQUEST =
+  '\n\n(This question starts a new conversation. Name it for a small tab too: two to four words in Title Case, naming the subject. Give the name in propose_query\'s title, or, in a reply in words, alone on its first line as "Title: …".)'
+
+/** Said with the last request of an ask, so the model answers with what it has instead of looking further. */
+export const LAST_REQUEST = '(That was the last lookup this question can have: answer now, with what you found.)'
 
 // ---------------------------------------------------------------------------
 // Across several databases: a chat that has more than one in context
@@ -186,7 +290,7 @@ function dialectName(kind: DatabaseKind): string {
 }
 
 /** `readable`: the keys of the databases whose results the model may read. */
-export function acrossRules(dbs: PromptDatabase[], today: string, opts: { tools: boolean; readable: string[]; connectors: boolean }): string {
+export function acrossRules(dbs: PromptDatabase[], today: string, opts: { tools: boolean; readable: string[]; connectors: boolean } & RuleOptions): string {
   const reading = opts.tools && opts.readable.length > 0
   const some = reading && opts.readable.length < dbs.length
   const lines = [
@@ -211,6 +315,8 @@ export function acrossRules(dbs: PromptDatabase[], today: string, opts: { tools:
     `- Today is ${today}. Resolve relative periods such as "yesterday" or "last week" against that date.`,
     '- Values in braces after a column are real sample values; match them exactly.',
     ...(opts.tools ? lookFirst({ readResults: reading, connectors: opts.connectors }) : []),
+    ...(opts.tools && opts.learning ? knowledgeLines({ readResults: reading }) : []),
+    ...(opts.tools && opts.maxRequests ? [budgetLine(opts.maxRequests)] : []),
     opts.tools
       ? reading
         ? '- When the user asks what happened, how things stand or whether something is ready, work through it and answer in plain text (markdown): for a trace, a short timeline naming the database, the time and the records at each step. Do not paste whole result tables, or hand back queries for the user to run instead. When they want a query to run, call propose_query with the database key.'
@@ -227,9 +333,10 @@ export function acrossRules(dbs: PromptDatabase[], today: string, opts: { tools:
 
 /**
  * The tools of a chat across databases: the same ones, each with the database it is for; run_query to read data on
- * those in `readable`; and remember, for one database or all.
+ * those in `readable`; and, where business knowledge is kept, learn and save_query for one database, with
+ * run_saved_query on those whose results can be read.
  */
-export function acrossTools(keys: string[], readable: string[]): ToolDef[] {
+export function acrossTools(keys: string[], readable: string[], learning = false): ToolDef[] {
   const database = { type: 'string', enum: keys, description: 'The database, by its key.' }
   const withDatabase = (t: ToolDef, description: string): ToolDef => {
     const params = t.parameters as { properties: Record<string, unknown>; required: string[] }
@@ -252,14 +359,16 @@ export function acrossTools(keys: string[], readable: string[]): ToolDef[] {
       }
     })
   }
-  tools.push({
-    name: 'remember',
-    description: REMEMBER_DESCRIPTION,
-    parameters: {
-      type: 'object',
-      properties: { database: { type: 'string', enum: [...keys, 'all'], description: 'The database the fact is about, by its key, or "all".' }, fact: REMEMBER_FACT },
-      required: ['database', 'fact']
+  if (learning) {
+    tools.push(
+      withDatabase(LEARN_TOOL, LEARN_DESCRIPTION.replace('about this business', 'about the business behind one database')),
+      withDatabase(SAVE_QUERY_TOOL, SAVE_DESCRIPTION.replace("this database's runbook", "one database's runbook"))
+    )
+    if (readable.length) {
+      const run = withDatabase(RUN_SAVED_TOOL, `Run a query from one database's runbook with a value for each of its parameters, and see up to ${RESULT_ROWS} rows.`)
+      ;(run.parameters as any).properties.database = { ...database, enum: readable }
+      tools.push(run)
     }
-  })
+  }
   return tools
 }

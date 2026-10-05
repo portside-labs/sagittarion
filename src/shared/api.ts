@@ -28,6 +28,7 @@ import type {
 import type { AiConnectionInput, AiProgressEvent, AiResult, AiSettings, AiSettingsUpdate, AiStreamEvent, AiTurn, AskOptions } from './ai'
 import type { ConnectorInfo, ConnectorInput, ToolApprovalDecision, ToolApprovalRequest, ToolPermission } from './connectors'
 import type { Instruction, InstructionInput } from './instructions'
+import type { AiLearned } from './knowledge'
 import type { AiTranscript, SemanticModelStatus } from './privacy'
 
 export interface OpenOptions {
@@ -170,6 +171,13 @@ export interface Api {
     save(input: InstructionInput): Promise<Instruction>
     setEnabled(id: string, enabled: boolean): Promise<Instruction>
     remove(id: string): Promise<void>
+  }
+  /** What Ask learns about the business behind each connection, kept on this computer. */
+  knowledge: {
+    /** Undoes something learned while answering: a correction goes back to what was known before. */
+    forget(item: AiLearned): Promise<boolean>
+    /** Forgets everything learned, for every connection. */
+    forgetAll(): Promise<void>
   }
   /** MCP servers whose tools the chat can use, like Claude Desktop's connectors. */
   connectors: {

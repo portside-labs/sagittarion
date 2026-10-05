@@ -1,6 +1,7 @@
 // The chat beside the connections: conversations in tabs, kept while the user moves between connections, each with
 // the databases it has in context.
 import type { AiProgressEvent, AiResult, AiTurnResult } from '@shared/ai'
+import type { AiLearned } from '@shared/knowledge'
 import type { StatementResult } from '@shared/types'
 import { cellToPlainText } from '@shared/export'
 import type { SavedChat, WorkspaceState } from '@shared/types'
@@ -27,8 +28,10 @@ export type ChatMessage =
       draft?: string
       /** What the answer's query returned when it ran in the editor: the first rows, for a follow-up about them. */
       ranResult?: AiTurnResult
-      /** The facts it offered to remember: kept, or let go. */
+      /** The facts it offered to remember, in chats from before it learned for itself: kept, or let go. */
       memoryState?: Record<number, 'saved' | 'dismissed'>
+      /** What it learned that the user forgot from here, by its place in the answer's list. */
+      forgotten?: number[]
       endedAt?: number
       /** The ask behind this answer, for "What was sent". Not kept across relaunches: that record lives in memory. */
       requestId?: string
@@ -231,6 +234,13 @@ export function turnResult(results: StatementResult[] | null | undefined, max = 
     rows: rows.rows.slice(0, max).map((r) => r.map((v) => (v === null ? null : cellToPlainText(v).slice(0, 200)))),
     rowCount: rows.rowCount
   }
+}
+
+/** How something learned is named under the answer that learned it. */
+export function learnedLabel(item: AiLearned): string {
+  const name = item.kind === 'term' ? `“${item.name}”` : item.name
+  const what = item.kind === 'query' ? `${name} (runbook)` : item.kind === 'domain' ? `${name} (domain)` : name
+  return item.corrected ? `${what}, corrected` : what
 }
 
 /** A short name for a fact kept as an instruction: its opening words. */

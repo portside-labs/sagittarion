@@ -8,7 +8,8 @@ import { BYOK_PROVIDERS, LOCAL_PROVIDERS, MODEL_CATALOG, PROVIDERS, activeConnec
 import { describeCounts, type AiPrivacyReport } from '@shared/privacy'
 import type { ToolApprovalDecision, ToolApprovalRequest } from '@shared/connectors'
 import { getSessionStore, useStore } from '@/store'
-import { chatStatus, chatTitle, memoryName, turnResult, type ChatMessage, type ChatState, type ChatStep } from '@/lib/chat'
+import { chatStatus, chatTitle, learnedLabel, memoryName, turnResult, type ChatMessage, type ChatState, type ChatStep } from '@/lib/chat'
+import type { AiLearned } from '@shared/knowledge'
 import { emptyInstruction } from '@shared/instructions'
 import { SqlCode } from './SqlCode'
 import { Icon } from './Icons'
@@ -547,6 +548,18 @@ export function AskPanel({ onCollapse }: { onCollapse: () => void }) {
       toast('error', 'Could not remember that', errorMessage(e))
     }
   }
+  /** Undoes something the model learned while answering: forgotten, or a correction taken back. */
+  const forgetLearned = async (messageId: string, index: number, item: AiLearned) => {
+    try {
+      await window.api.knowledge.forget(item)
+      setChat((c) => ({
+        ...c,
+        messages: c.messages.map((m) => (m.id === messageId && m.role === 'assistant' ? { ...m, forgotten: [...new Set([...(m.forgotten ?? []), index])] } : m))
+      }))
+    } catch (e) {
+      toast('error', 'Could not forget that', errorMessage(e))
+    }
+  }
   const setMemory = (messageId: string, index: number, state: 'saved' | 'dismissed') =>
     setChat((c) => ({
       ...c,
@@ -794,7 +807,33 @@ export function AskPanel({ onCollapse }: { onCollapse: () => void }) {
             </span>
           </div>
         ) : null}
-        {/* Facts the model offered to remember, so it need not ask again. */}
+        {/* What the model learned while answering, kept already: named here, to forget with a click. */}
+        {(() => {
+          const learned = m.result && m.result.kind !== 'cancelled' ? (m.result.learned ?? []) : []
+          const shown = learned.map((item, i) => ({ item, i })).filter(({ i }) => !m.forgotten?.includes(i))
+          if (!shown.length) return null
+          return (
+            <div className="ask-learned" data-testid="ask-learned">
+              <Icon name="sparkles" size={12} />
+              <span className="ask-learned-label">Learned</span>
+              {shown.map(({ item, i }) => (
+                <span key={i} className="ask-learned-item" title={item.meaning} data-testid="ask-learned-item" data-kind={item.kind}>
+                  {learnedLabel(item)}
+                  <button
+                    className="ask-learned-forget"
+                    onClick={() => void forgetLearned(m.id, i, item)}
+                    title={item.corrected ? 'Forget this correction' : 'Forget this'}
+                    aria-label={`Forget ${item.name}`}
+                    data-testid="ask-learned-forget"
+                  >
+                    <Icon name="x" size={10} />
+                  </button>
+                </span>
+              ))}
+            </div>
+          )
+        })()}
+        {/* Facts the model offered to remember, in chats from before it learned for itself. */}
         {(m.result && m.result.kind !== 'cancelled' ? (m.result.memories ?? []) : []).map((mem, i) => {
           const state = m.memoryState?.[i]
           if (state === 'dismissed') return null

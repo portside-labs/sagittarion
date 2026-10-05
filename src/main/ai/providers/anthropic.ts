@@ -23,7 +23,12 @@ function mapMessages(req: ChatRequest): unknown[] {
   const out: any[] = []
   for (const m of req.messages) {
     if (m.role === 'user') {
-      out.push({ role: 'user', content: m.content })
+      const last = out[out.length - 1]
+      // Words after tool results (such as being told to answer now) go in the same turn as the results.
+      if (last && last.role === 'user') {
+        if (!Array.isArray(last.content)) last.content = [{ type: 'text', text: last.content }]
+        last.content.push({ type: 'text', text: m.content })
+      } else out.push({ role: 'user', content: m.content })
     } else if (m.role === 'assistant') {
       const content: unknown[] = []
       if (m.content) content.push({ type: 'text', text: m.content })
@@ -36,6 +41,14 @@ function mapMessages(req: ChatRequest): unknown[] {
       if (last && last.role === 'user' && Array.isArray(last.content) && last.content[0]?.type === 'tool_result') last.content.push(block)
       else out.push({ role: 'user', content: [block] })
     }
+  }
+  // Where the request caches its prompt, the conversation is cached too, up to its last message: the next step of the
+  // same question reads all of it back at a tenth of the price instead of paying for it again.
+  if (req.system.some((b) => b.cacheable) && out.length) {
+    const last = out[out.length - 1]
+    if (!Array.isArray(last.content)) last.content = [{ type: 'text', text: last.content }]
+    const block = last.content[last.content.length - 1]
+    if (block) block.cache_control = { type: 'ephemeral' }
   }
   return out
 }

@@ -23,7 +23,7 @@ export function tokenize(text: string): string[] {
   const out: string[] = []
   const parts = text
     .replace(/([a-z0-9])([A-Z])/g, '$1 $2')
-    .replace(/[_\-./:,()[\]{}"'`]+/g, ' ')
+    .replace(/[_\-./:,()[\]{}"'`?!;]+/g, ' ')
     .toLowerCase()
     .split(/\s+/)
   for (const p of parts) {
@@ -369,7 +369,11 @@ export class SchemaIndex {
    * foreign keys and fills the budget in score order. Columns are loaded for
    * whatever is selected.
    */
-  async select(question: string, budgetTokens: number, opts: { recentKeys?: string[]; queryVector?: number[] | null; seeds?: number } = {}): Promise<Selection> {
+  async select(
+    question: string,
+    budgetTokens: number,
+    opts: { recentKeys?: string[]; queryVector?: number[] | null; seeds?: number; knownKeys?: string[] } = {}
+  ): Promise<Selection> {
     const totalTables = this.tables.size
     if (this.totalTokens <= budgetTokens) {
       const keys = [...this.tables.keys()]
@@ -381,6 +385,10 @@ export class SchemaIndex {
     const scores = new Map<string, number>(ranked.map((r) => [r.key, r.score]))
     const top = ranked.length ? ranked[0].score : 1
     for (const k of opts.recentKeys ?? []) if (this.tables.has(k)) scores.set(k, (scores.get(k) ?? 0) + top * 0.5)
+    // Tables the business knowledge points at, such as the one a term the question uses lives in: in front.
+    ;(opts.knownKeys ?? []).forEach((k, i) => {
+      if (this.tables.has(k)) scores.set(k, (scores.get(k) ?? 0) + top * (1.5 - i * 0.05))
+    })
     const ordered = [...scores.entries()].sort((a, b) => b[1] - a[1])
     const seedCount = opts.seeds ?? 8
     const seeds = ordered.slice(0, seedCount).map(([k]) => k)

@@ -45,7 +45,7 @@ describe('privacy settings', () => {
       expect(s.privacy.enabled).toBe(false)
       expect(JSON.parse(readFileSync(path.join(dir, 'settings.json'), 'utf8')).ai.privacy).toEqual(s.privacy)
       // Other settings are untouched.
-      expect(s.agent).toEqual({ schemaBudgetTokens: 8000, autoRun: true, sendSampleValues: false, readResults: { scope: 'selected', connectionIds: [] } })
+      expect(s.agent).toEqual({ schemaBudgetTokens: 8000, maxRequests: 6, learn: true, autoRun: true, sendSampleValues: false, readResults: { scope: 'selected', connectionIds: [] } })
     })
   )
 

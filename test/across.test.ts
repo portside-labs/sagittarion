@@ -266,12 +266,13 @@ describe('instructions across databases', () => {
       ['propose_query', 'database'],
       ['search_schema', 'database'],
       ['describe_table', 'database'],
-      ['sample_values', 'database'],
-      ['remember', 'database']
+      ['sample_values', 'database']
     ])
     expect(acrossTools(['db1', 'db2'], ['db1', 'db2']).map((t) => t.name)).toContain('run_query')
-    // A fact is about one database, or all of them.
-    const remember = acrossTools(['db1', 'db2'], []).find((t) => t.name === 'remember')!
-    expect((remember.parameters as any).properties.database.enum).toEqual(['db1', 'db2', 'all'])
+    // Where knowledge is kept: learning for one database at a time, and the runbook run only where results can be read.
+    const learning = acrossTools(['db1', 'db2'], ['db2'], true)
+    expect(learning.map((t) => t.name)).toEqual(['propose_query', 'search_schema', 'describe_table', 'sample_values', 'run_query', 'learn', 'save_query', 'run_saved_query'])
+    expect((learning.find((t) => t.name === 'learn')!.parameters as any).properties.database.enum).toEqual(['db1', 'db2'])
+    expect((learning.find((t) => t.name === 'run_saved_query')!.parameters as any).properties.database.enum).toEqual(['db2'])
   })
 })

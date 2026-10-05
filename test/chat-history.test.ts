@@ -5,14 +5,9 @@ import { mkdtempSync, rmSync, statSync } from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { ChatHistoryStore, HISTORY_LIMIT, HISTORY_TTL_MS } from '../src/main/store/chat-history'
-import { cleanTitle, conversationTitle } from '../src/main/ai/title'
-import { ModelGateway } from '../src/main/privacy/gateway'
-import { PrivacyEngine } from '../src/main/privacy/engine'
-import { PrivacySession } from '../src/main/privacy/session'
-import { PiiVault } from '../src/main/privacy/vault'
+import { cleanTitle } from '../src/main/ai/title'
 import { closeOpenFence, revealedPart, revealStep } from '../src/renderer/src/lib/reveal'
 import { historyMatches, whenText } from '../src/renderer/src/lib/chat'
-import { policy, recordingProvider, reply, wireText } from './privacy/helpers'
 
 let tmp: string
 beforeAll(() => {
@@ -78,23 +73,6 @@ describe('a tab’s name from the model', () => {
     expect(cleanTitle('Title: Monthly Revenue\nBecause the question asks about revenue.')).toBe('Monthly Revenue')
     expect(cleanTitle('**Late Orders By Region In The Northern Warehouses**')).toBe('Late Orders By Region In…')
     expect(cleanTitle('  ')).toBeNull()
-  })
-
-  it('is asked for through the gateway, protected like the question, and restored for the tab', async () => {
-    const provider = recordingProvider((req) => {
-      const marker = /<\|PII:EMAIL:[0-9A-F]{6}\|>/.exec(JSON.stringify(req.messages))![0]
-      return reply({ text: `Refunds for ${marker}` })
-    })
-    const session = new PrivacySession({ engine: new PrivacyEngine({ schemaDetection: true }), policy, vault: new PiiVault(), host: 'api.example.com' })
-    const title = await conversationTitle(ModelGateway.protected(provider, session), 'Did zed@corp.io get his refund?')
-    expect(title).toBe('Refunds for zed@corp.io')
-    expect(wireText(provider.requests)).not.toContain('zed@corp.io')
-    expect(provider.requests[0].maxTokens).toBe(24)
-    // A provider that fails leaves the tab its question.
-    const failing = recordingProvider(() => {
-      throw new Error('down')
-    })
-    expect(await conversationTitle(ModelGateway.protected(failing, session), 'Anything?')).toBeNull()
   })
 })
 

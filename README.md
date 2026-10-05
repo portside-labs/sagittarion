@@ -19,6 +19,12 @@ sensitive values are masked on your machine before they reach the model.
   Generated SQL is read-only and checked with `EXPLAIN` before it runs. Let
   it read query results on a connection and it works questions out itself.
   Instructions teach it your definitions, for every database or just one.
+- **Learns your business.** Ask keeps what it works out about each database:
+  what your words mean in the data, the rules you tell it, which tables make
+  up each part of the business, and the queries that answered a question,
+  to call again. Ask in your own terms, and repeat questions take fewer
+  requests. It stays on your computer; each answer shows what it learned, to
+  forget there.
 - **Ask across databases.** The chat stays beside your connections, with
   conversations in tabs and a history to pick them up again. Add several
   databases to one and it follows a customer, an order or a request from one

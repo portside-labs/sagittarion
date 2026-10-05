@@ -32,6 +32,8 @@ question and the chat history over IPC and gets an `AiResult` back.
 | Rules block: dialect, server version, today's date, default schema; in a chat across databases, each database's connection name, dialect and key | `systemRules` / `acrossRules` in `ai/prompt.ts` | no (connection names are protected like any text) |
 | Schema block: table and column names, types, keys, row estimates, **table comments**, **sample values** (when *Send sample column values* is on) | `SchemaIndex.render` in `ai/schema-index.ts` | yes: samples, comments |
 | The user's instructions (Settings → Instructions): the global ones and the connection's own | `instructionsPrompt` in `ai/prompt.ts` | typed by the user; may name people or values |
+| Business knowledge that bears on the question: terms, rules, domains, runbook queries, values earlier queries compared columns with, earlier queries on the same tables | `renderRecall` in `knowledge/recall.ts` | yes: values in terms' SQL, runbook SQL and earlier queries; protected as prose, like instructions |
+| `describe_table`'s notes on a table: its domain, the terms and runbook queries on it, how data moves there | `tableNotes` in `knowledge/recall.ts` | yes: values in terms' SQL; the result is then protected as prose rather than as structured text |
 | The question, and earlier questions of the chat | renderer → `ai:ask` | typed by the user; often names, emails, ids |
 | Earlier SQL and clarifications of the chat | renderer → `ai:ask` (`AiTurn`) | literals in `WHERE` clauses |
 | `search_schema` / `describe_table` results | `SchemaIndex.search` / `describe` | yes: samples, comments |
@@ -42,7 +44,7 @@ question and the chat history over IPC and gets an `AiResult` back.
 | `run_query` results, only on connections where the user lets Ask read results | `readQuery` in `nl2sql.ts` | yes: up to 50 rows, about 12,000 characters, each value protected with its column as context |
 | What an earlier answer's query returned in the editor, in follow-ups, on the same connections only | `editorResult` in `nl2sql.ts` | yes: up to 20 rows, protected the same way |
 | Embedding requests: table descriptions and the question | `queryVector` in `nl2sql.ts` | comments, the question |
-| A name for a new conversation's tab: its first question, sent once more | `conversationTitle` in `ai/title.ts` | typed by the user; protected like the question |
+| A request for a name for a new conversation's tab, added to its first question; the name comes back with the answer | `TITLE_REQUEST` in `ai/prompt.ts` | no (fixed text) |
 | Connection test ping | `settings:testProvider` in `main/index.ts` | no (fixed text) |
 
 Query results are sent only from connections where the user lets Ask read
@@ -82,9 +84,15 @@ placeholder in every database of the chat, which is what lets the model match
 a customer in one database to the same customer in another without seeing who
 it is.
 
-The model may offer to remember a fact the user told it, such as an id. It
-becomes an instruction only if the user keeps it, and is then sent as
-instructions are.
+The app keeps business knowledge per connection, in `knowledge/<id>.json`
+under the app's data folder, on this computer only: what the model learned
+while answering (terms with their SQL, rules, domains, runbook queries, with
+real values, restored from placeholders before they are kept), and what the
+statements run on the connection show (their SQL, the joins in them, the text
+values they compared columns with). Nothing of it is sent until a question it
+bears on, and then as prose, protected like instructions. Turning learning off
+in Settings stops both the keeping and the sending; Forget everything learned
+deletes the files, and deleting a connection deletes its file.
 
 There is no logging, telemetry, crash reporting or worker-thread code in the
 app today; section 11 sets the rules for when there is.

@@ -186,7 +186,7 @@ export class PrivacySession {
     }
     const fields: Field[] = []
     out.system.forEach((b) => {
-      fields.push({ text: b.text, ctx: { role: b.structured ? 'structured' : 'prose' }, where: b.structured && b.cacheable ? 'the schema' : 'the instructions', origin: 'local', set: (t) => (b.text = t) })
+      fields.push({ text: b.text, ctx: { role: b.structured ? 'structured' : 'prose' }, where: b.label ?? (b.structured && b.cacheable ? 'the schema' : 'the instructions'), origin: 'local', set: (t) => (b.text = t) })
     })
     // Tool definitions are written by the app and by the user's connectors, not typed by the user. A connector's can
     // still hold example values (a site's address, an id, an @mention) or real ones (the user's own site or account),

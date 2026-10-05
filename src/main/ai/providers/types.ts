@@ -30,6 +30,8 @@ export interface SystemBlock {
    * table name for a person; its sample values and comments were protected beforehand. Never sent on the wire.
    */
   structured?: boolean
+  /** What the block is, as Local AI Privacy reports where it protected something: "the business knowledge". */
+  label?: string
 }
 
 export interface ChatRequest {

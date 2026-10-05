@@ -4,11 +4,16 @@
 // verified before it leaves; the model's answers keep their placeholders in the transcript (that is what it wrote),
 // and are restored only where they are used here: the SQL that runs, and the words shown in the chat.
 import type { DatabaseKind, QueryResponse, TableRef } from '@shared/types'
-import type { AiClarification, AiDatabaseRef, AiMemory, AiProgressStep, AiQueryResult, AiRanQuery, AiResult, AiTurn, AiUsage } from '@shared/ai'
+import { DEFAULT_MAX_REQUESTS, type AiClarification, type AiDatabaseRef, type AiProgressStep, type AiQueryResult, type AiRanQuery, type AiResult, type AiTurn, type AiUsage } from '@shared/ai'
+import type { AiLearned, KnowledgeSource } from '@shared/knowledge'
 import { cellToPlainText } from '@shared/export'
 import { describeCounts, type SealedText, type SealedTurn, type SensitiveEntityType } from '@shared/privacy'
 import { checkReadOnlySql, explainStatement } from './guard'
-import { acrossRules, acrossTools, instructionsPrompt, isoDate, RESULT_CHARS, RESULT_ROWS, singleTools, systemRules } from './prompt'
+import { acrossRules, acrossTools, instructionsPrompt, isoDate, KEEPING_TOOLS, LAST_REQUEST, RESULT_CHARS, RESULT_ROWS, singleTools, systemRules, TITLE_REQUEST } from './prompt'
+import { cleanTitle } from './title'
+import type { KnowledgeBook } from '../knowledge/book'
+import { isEmptyRecall, recallSize, renderRecall, type Recall } from '../knowledge/recall'
+import { analyzeSql, bindParams, sameSqlKey } from '../knowledge/sql-facts'
 import { parseJsonObject, ProviderError, throwIfAborted, type ChatMessage, type ChatRequest, type ChatResponse, type ToolCall, type ToolDef } from './providers/types'
 import { estimateTokens, shortComment, tokenize, type RenderView, type SchemaIndex, type Selection } from './schema-index'
 import type { EmbeddingCache } from './embeddings'
@@ -31,6 +36,9 @@ export interface AgentConnectors {
   call(name: string, args: Record<string, unknown>, signal?: AbortSignal): Promise<{ content: string; isError?: boolean; declined?: boolean }>
 }
 
+/** One database's business knowledge, as an ask uses it: recalled for the question, and added to as the model learns. */
+export type AgentKnowledge = Pick<KnowledgeBook, 'connectionId' | 'recall' | 'notes' | 'learn' | 'learnDomain' | 'keep' | 'entry' | 'ranEntry' | 'ran' | 'used' | 'answered'>
+
 /** One database an ask can see: the chat's own, or another it has in context. */
 export interface AgentDatabase {
   /** What the model calls it in tools: a short key, unique in the ask. */
@@ -48,6 +56,8 @@ export interface AgentDatabase {
   recentTables?: string[]
   /** The user lets the model run read-only queries here and read their results, to work questions out itself. */
   readResults?: boolean
+  /** What is known about the business behind it, when the app keeps that. */
+  knowledge?: AgentKnowledge
 }
 
 export interface AskDeps {
@@ -56,9 +66,13 @@ export interface AskDeps {
   index: SchemaIndex
   /** The way to the model: protects and verifies every request when Local AI Privacy applies to the connection. */
   provider: ModelGateway
-  settings: { sendSampleValues: boolean; autoRun: boolean; schemaBudgetTokens: number; embeddingModel?: string }
+  settings: { sendSampleValues: boolean; autoRun: boolean; schemaBudgetTokens: number; embeddingModel?: string; maxRequests?: number }
   /** For the one database the fields above describe: whether the model may read query results on it. */
   readResults?: boolean
+  /** For the one database the fields above describe: what is known about the business behind it. */
+  knowledge?: AgentKnowledge
+  /** The conversation's first question: the model names it too, in its answer, rather than in a request of its own. */
+  title?: boolean
   /** Its saved connection, which a fact the model offers to remember is about. */
   connectionId?: string
   /** Runs SQL under the database's read-only guard. */
@@ -80,6 +94,7 @@ export interface AskDeps {
   instructions?: { name: string; text: string; databases?: string[] }[]
   now?: Date
   recentTables?: string[]
+  /** The most requests the ask may make; the settings' maxRequests otherwise. */
   maxToolSteps?: number
   maxRepairs?: number
   /** Streams what is happening to the UI. */
@@ -223,9 +238,43 @@ function databasesOf(deps: AskDeps): AgentDatabase[] {
       distinctValues: deps.distinctValues,
       recentTables: deps.recentTables,
       readResults: deps.readResults,
-      connectionId: deps.connectionId
+      connectionId: deps.connectionId,
+      knowledge: deps.knowledge
     }
   ]
+}
+
+/** A long earlier answer as it is replayed in a follow-up: its beginning, which is what a follow-up is usually about. */
+const REPLAY_CHARS = 3000
+
+/** A line that names the conversation, as the model is asked to write it first in a reply in words. */
+const TITLE_LINE = /^\s*(?:[*_#]+\s*)?title\s*[:：]\s*(.+?)\s*[*_]*\s*$/i
+
+/** A reply in words without its title line, and the title. */
+export function splitTitle(text: string): { title?: string; text: string } {
+  const lines = text.split('\n')
+  const first = lines.findIndex((l) => l.trim())
+  const m = first >= 0 ? TITLE_LINE.exec(lines[first]) : null
+  if (!m) return { text }
+  return { title: m[1], text: lines.slice(first + 1).join('\n').replace(/^\s*\n/, '') }
+}
+
+/** What the stream shows while a first line that may be the title is still arriving: nothing of it. */
+export function hideTitle(raw: string): string {
+  const start = raw.trimStart()
+  if (!start.includes('\n')) return /^(?:[*_#]+\s*)?t(?:i(?:t(?:l(?:e)?)?)?)?$/i.test(start) || /^(?:[*_#]+\s*)?title\s*[:：]/i.test(start) || /^[*_#]+\s*$/.test(start) ? '' : raw
+  return splitTitle(raw).text
+}
+
+/** A source as the model gave it; anything else counts as unchecked. */
+function sourceOf(v: unknown): KnowledgeSource {
+  return v === 'user' || v === 'data' ? v : 'inferred'
+}
+
+/** A table's name as SQL writes it, quoted. */
+function quotedTable(ref: TableRef): string {
+  const q = (s: string) => `"${s.replace(/"/g, '""')}"`
+  return ref.schema ? `${q(ref.schema)}.${q(ref.name)}` : q(ref.name)
 }
 
 /** A render view for these tables, or none when nothing is protected. */
@@ -280,12 +329,15 @@ async function queryVector(deps: AskDeps, db: AgentDatabase, question: string): 
     const commented = keys.filter((k) => index.tables.get(k)?.comment)
     const view = commented.length ? await viewFor(deps, db, commented) : undefined
     const vectors = new Map<string, number[]>()
-    const missing: { key: string; text: string }[] = []
+    const missing: { key: string; text: string; cacheText: string }[] = []
     for (const key of keys) {
       const text = index.embeddingText(key, view)
-      const cached = embeddingCache ? await embeddingCache.get(model, text) : undefined
+      // Kept by the table's own words: the placeholders in its comment differ from one conversation to the next, and
+      // the whole schema would otherwise be embedded again for each.
+      const cacheText = index.embeddingText(key)
+      const cached = embeddingCache ? await embeddingCache.get(model, cacheText) : undefined
       if (cached) vectors.set(key, cached)
-      else missing.push({ key, text })
+      else missing.push({ key, text, cacheText })
     }
     for (let i = 0; i < missing.length; i += 100) {
       const batch = missing.slice(i, i + 100)
@@ -298,7 +350,7 @@ async function queryVector(deps: AskDeps, db: AgentDatabase, question: string): 
         const v = embedded[j]
         if (v && v.length) {
           vectors.set(b.key, v)
-          if (embeddingCache) void embeddingCache.set(model, b.text, v)
+          if (embeddingCache) void embeddingCache.set(model, b.cacheText, v)
         }
       })
     }
@@ -351,8 +403,12 @@ async function run(deps: AskDeps, question: string, history: AiTurn[], usage: Ai
   const refOf = (db: AgentDatabase): AiDatabaseRef => ({ connectionId: db.connectionId ?? '', name: db.name })
   /** The queries the model ran to look into the question, as they ran here. */
   const ranQueries: AiRanQuery[] = []
-  /** Facts the model offered to remember, for the user to keep or not. */
-  const memories: AiMemory[] = []
+  /** What the model learned and kept on its way, for the answer to show. */
+  const learned: AiLearned[] = []
+  /** The conversation's name, when the model gave one with its answer. */
+  let title: string | undefined
+  /** Business knowledge is kept for at least one database here. */
+  const learning = dbs.some((d) => d.knowledge)
   // Table and column names are never protected, so the model can still write SQL with them. The list grows as
   // tables are described, so it is refreshed before each protection.
   privacy?.useSchema(identifiers())
@@ -361,6 +417,29 @@ async function run(deps: AskDeps, question: string, history: AiTurn[], usage: Ai
   const instructions = (deps.instructions ?? []).filter((i) => i.text.trim())
   if (instructions.length) {
     progress.note('instructions', instructions.length === 1 ? 'Following 1 instruction' : `Following ${instructions.length} instructions`, instructions.map((i) => i.name).join(', '))
+  }
+
+  // What is known about the business, found here without a model call: the terms and values the question uses, the
+  // runbook queries like it, and the tables they point at, which go in front of the model even when it names none.
+  const recalls = new Map<AgentDatabase, Recall>()
+  if (learning) {
+    const recalling = progress.start('knowledge', 'Recalling what this team means')
+    for (const db of dbs) {
+      if (!db.knowledge) continue
+      try {
+        recalls.set(db, await db.knowledge.recall(question, db.index))
+      } catch {
+        /* a help, not a requirement */
+      }
+    }
+    const sizes = [...recalls.values()].map(recallSize)
+    const sum = (k: 'terms' | 'rules' | 'runbook') => sizes.reduce((n, s) => n + s[k], 0)
+    const parts = [
+      sum('terms') ? `${sum('terms')} term${sum('terms') === 1 ? '' : 's'}` : '',
+      sum('rules') ? `${sum('rules')} rule${sum('rules') === 1 ? '' : 's'}` : '',
+      sum('runbook') ? `${sum('runbook')} runbook quer${sum('runbook') === 1 ? 'y' : 'ies'}` : ''
+    ].filter(Boolean)
+    recalling.done(parts.length ? parts.join(', ') : 'nothing that bears on this yet')
   }
 
   // Schema context for each database: everything when it fits, otherwise retrieve. Several share the budget.
@@ -372,7 +451,7 @@ async function run(deps: AskDeps, question: string, history: AiTurn[], usage: Ai
     const vector = db.index.totalTokens > budget ? await queryVector(deps, db, question) : null
     if (vector) embedded = true
     throwIfAborted(deps.signal)
-    const selection = await db.index.select(question, budget, { recentKeys: db.recentTables, queryVector: vector })
+    const selection = await db.index.select(question, budget, { recentKeys: db.recentTables, queryVector: vector, knownKeys: recalls.get(db)?.tables })
     contexts.push({ db, selection, shown: new Set(selection.keys) })
   }
   const describeSelection = (sel: Selection) =>
@@ -406,6 +485,14 @@ async function run(deps: AskDeps, question: string, history: AiTurn[], usage: Ai
     }
   }
   const schemaBlock = sections.join('\n\n')
+  // What this team means: after the schema, so a schema that stays the same from one question to the next stays cached.
+  const knowledgeBlock = contexts
+    .map((c) => {
+      const r = recalls.get(c.db)
+      return r && !isEmptyRecall(r) ? renderRecall(r, { title: across ? `"${c.db.key}" (${c.db.name})` : undefined, runSaved: Boolean(c.db.readResults) }) : ''
+    })
+    .filter(Boolean)
+    .join('\n\n')
   const today = isoDate(deps.now ?? new Date())
 
   /**
@@ -440,14 +527,16 @@ async function run(deps: AskDeps, question: string, history: AiTurn[], usage: Ai
     messages.push({ role: 'user', content: sealed?.question.text ?? turn.question })
     const sql = turn.sql ? (sealed?.sql?.text ?? turn.sql) : undefined
     const result = sql ? await editorResult(turn) : ''
-    const said = sql ? `SQL used${turn.database ? ` on ${turn.database}` : ''}:\n${sql}` : (sealed?.answer?.text ?? turn.answer ?? '(no answer)')
+    // A long answer, such as one drawn from a connector's pages, is replayed shortened: every later request carries it.
+    const words = sealed?.answer?.text ?? turn.answer ?? '(no answer)'
+    const said = sql ? `SQL used${turn.database ? ` on ${turn.database}` : ''}:\n${sql}` : words.length > REPLAY_CHARS ? `${safeSlice(words, REPLAY_CHARS)}\n…(shortened)` : words
     messages.push({ role: 'assistant', content: result ? `${said}\n\n${result}` : said })
   }
-  messages.push({ role: 'user', content: (await provider.seal(question))?.text ?? question })
+  const asked = (await provider.seal(question))?.text ?? question
+  messages.push({ role: 'user', content: deps.title ? asked + TITLE_REQUEST : asked })
 
-  // Connectors take steps of their own, following a trail across databases takes more, and working a question out
-  // from the data takes the most.
-  const maxSteps = deps.maxToolSteps ?? (investigating ? 25 : across ? 16 : deps.connectors?.tools.length ? 10 : 6)
+  // Every request costs the user money: an ask makes at most this many, the last of them made to answer.
+  const maxSteps = Math.max(2, Math.round(deps.maxToolSteps ?? deps.settings.maxRequests ?? DEFAULT_MAX_REQUESTS))
   const maxRepairs = deps.maxRepairs ?? 2
   let repairs = 0
   let explained = false
@@ -474,33 +563,44 @@ async function run(deps: AskDeps, question: string, history: AiTurn[], usage: Ai
     }
   }
 
-  /** `last`: the final step of a chat across databases, where the model answers with what it found instead of looking further. */
+  /**
+   * `last`: the final request of the ask, where the model answers with what it found instead of looking further: in
+   * words, or with propose_query where the answer is a query to run.
+   */
   const complete = async (last = false): Promise<ChatResponse> => {
     throwIfAborted(deps.signal)
     const connectorTools = deps.connectors?.tools ?? []
+    const keeping = toolsEnabled && learning
     const rules = across
       ? acrossRules(
           dbs.map((d) => ({ key: d.key, name: d.name, kind: d.kind, serverVersion: d.serverVersion, defaultSchema: d.index.defaultSchema })),
           today,
-          { tools: toolsEnabled, readable: toolsEnabled ? readableKeys : [], connectors: Boolean(toolsEnabled && connectorTools.length) }
+          { tools: toolsEnabled, readable: toolsEnabled ? readableKeys : [], connectors: Boolean(toolsEnabled && connectorTools.length), learning: keeping, maxRequests: maxSteps }
         )
-      : systemRules(dbs[0].kind, dbs[0].serverVersion, today, dbs[0].index.defaultSchema, toolsEnabled, Boolean(toolsEnabled && connectorTools.length), investigating)
+      : systemRules(dbs[0].kind, dbs[0].serverVersion, today, dbs[0].index.defaultSchema, toolsEnabled, Boolean(toolsEnabled && connectorTools.length), investigating, {
+          learning: keeping,
+          maxRequests: maxSteps
+        })
+    const inWords = investigating || across || connectorTools.length > 0
     const req: ChatRequest = {
       system: [
         { text: rules, structured: true },
         // Prose the user wrote, so protected as prose; before the schema, so its cache breakpoint covers both.
         ...(instructions.length ? [{ text: instructionsPrompt(instructions, across) }] : []),
-        { text: schemaBlock, cacheable: true, structured: true }
+        { text: schemaBlock, cacheable: true, structured: true },
+        // Business words and values, so protected as prose.
+        ...(knowledgeBlock ? [{ text: knowledgeBlock, cacheable: true, label: 'the business knowledge' }] : [])
       ],
-      messages,
-      tools: toolsEnabled ? [...(across ? acrossTools(dbs.map((d) => d.key), readableKeys) : singleTools(investigating)), ...connectorTools] : undefined,
-      toolChoice: toolsEnabled ? (last ? ('none' as const) : ('auto' as const)) : undefined
+      // The last request says so at the end, where it leaves what came before (and is cached) as it was.
+      messages: last ? [...messages, { role: 'user', content: LAST_REQUEST }] : messages,
+      tools: toolsEnabled ? [...(across ? acrossTools(dbs.map((d) => d.key), readableKeys, keeping) : singleTools(investigating, keeping)), ...connectorTools] : undefined,
+      toolChoice: toolsEnabled ? (last ? (inWords ? ('none' as const) : { name: 'propose_query' }) : ('auto' as const)) : undefined
     }
     const outbound = await prepare(req)
     throwIfAborted(deps.signal)
-    const asking = progress.start('request', `Asking ${provider.model || provider.kind}${usage.requests ? ` (request ${usage.requests + 1})` : ''}`)
+    const asking = progress.start('request', `Asking ${provider.model || provider.kind} (request ${usage.requests + 1} of ${maxSteps})`)
     // Prose the model writes is shown as it streams; a JSON answer, asked for when tools are not, is not prose.
-    const draft = deps.onStream && toolsEnabled ? new Draft(deps.onStream, (raw) => provider.previewText(raw)) : null
+    const draft = deps.onStream && toolsEnabled ? new Draft(deps.onStream, (raw) => provider.previewText(deps.title ? hideTitle(raw) : raw)) : null
     try {
       const res = await provider.send(outbound, deps.signal, draft ? (delta) => draft.add(delta) : undefined)
       if (res.toolCalls.length) draft?.clear()
@@ -549,12 +649,22 @@ async function run(deps: AskDeps, question: string, history: AiTurn[], usage: Ai
       privacy: provider.report(sealed),
       ...(cutShort ? { cutShort } : {}),
       ...(ranQueries.length ? { queries: ranQueries } : {}),
-      ...(memories.length ? { memories } : {})
+      ...(learned.length ? { learned } : {}),
+      ...(title ? { title } : {})
     }
   }
 
   const finish = async (p: Proposal, tokenizedSql: string, restored: Restored, db: AgentDatabase): Promise<AiQueryResult> => {
     const tablesUsed = p.tablesUsed.map(shownText)
+    // The terms the answer was built on hold up so far; they hold up more if the user runs it.
+    const r = recalls.get(db)
+    if (db.knowledge && r) {
+      const sqlKey = sameSqlKey(restored.text)
+      const keys = new Set(tablesUsed.map((t) => db.index.find(t)?.key ?? t))
+      const basis = r.terms.filter((f) => (f.sql && sqlKey.includes(sameSqlKey(f.sql))) || f.tables.some((t) => keys.has(t))).map((f) => f.id)
+      void db.knowledge.used(basis, 0.02).catch(() => undefined)
+      db.knowledge.answered(restored.text, { facts: basis, question })
+    }
     progress.note('done', across ? `Query ready for ${db.name}` : 'Query ready', tablesUsed.length ? `uses ${tablesUsed.join(', ')}` : undefined)
     const warnings = restored.withheld
       ? [`The query refers to ${restored.withheld === 1 ? 'a value' : `${restored.withheld} values`} the model never saw in full (masked or withheld by the privacy policy). Replace ${restored.withheld === 1 ? 'it' : 'them'} before running.`]
@@ -577,7 +687,8 @@ async function run(deps: AskDeps, question: string, history: AiTurn[], usage: Ai
       autoRun: deps.settings.autoRun && explained && !warnings.length,
       ...(across ? { database: refOf(db) } : {}),
       ...(ranQueries.length ? { queries: ranQueries } : {}),
-      ...(memories.length ? { memories } : {}),
+      ...(learned.length ? { learned } : {}),
+      ...(title ? { title } : {}),
       ...(warnings.length ? { warnings } : {}),
       privacy: provider.report(sealed)
     }
@@ -595,7 +706,7 @@ async function run(deps: AskDeps, question: string, history: AiTurn[], usage: Ai
    * Runs one read-only query for the model to read: checked, restored for this database, and its result sent back as
    * a short table with every value protected with its column as context, like sample values.
    */
-  const readQuery = async (db: AgentDatabase, raw: string, step: ReturnType<Progress['start']>): Promise<{ content: string; structured?: boolean }> => {
+  const readQuery = async (db: AgentDatabase, raw: string, step: ReturnType<Progress['start']>): Promise<{ content: string; structured?: boolean; ok?: boolean }> => {
     const gate = checkReadOnlySql(raw)
     if (!gate.ok) {
       step.fail(shownText(gate.reason))
@@ -625,6 +736,8 @@ async function run(deps: AskDeps, question: string, history: AiTurn[], usage: Ai
     } catch (e: any) {
       message = e?.message ?? String(e)
     }
+    // What the model ran is counted too: its joins and values teach the knowledge where things are.
+    void db.knowledge?.ran(restored.text, { by: 'model', question, ok: message === null && first?.kind === 'rows' }, db.index).catch(() => undefined)
     if (message !== null || !first || first.kind !== 'rows') {
       ranQueries.push({ database: refOf(db), sql: restored.text, error: message ?? 'No rows.' })
       step.fail(shownText(message ?? 'no rows'))
@@ -655,21 +768,176 @@ async function run(deps: AskDeps, question: string, history: AiTurn[], usage: Ai
     ranQueries.push({ database: refOf(db), sql: restored.text, rows: rows.length })
     step.done(`${rows.length}${first.rows.length > RESULT_ROWS || first.truncated ? '+' : ''} row${rows.length === 1 ? '' : 's'}`)
     const head = `${lines.length} row${lines.length === 1 ? '' : 's'} from "${db.key}"${more ? ', more not shown: narrow the query or select fewer columns' : ''}:`
-    return { content: [head, first.columns.map((c) => c.name).join(' | '), ...lines].join('\n'), structured: true }
+    return { content: [head, first.columns.map((c) => c.name).join(' | '), ...lines].join('\n'), structured: true, ok: true }
+  }
+
+  /** The tables a tool call names, as the schema has them: those it knows, and those it does not. */
+  const tablesNamed = (db: AgentDatabase, raw: unknown): { known: string[]; unknown: string[] } => {
+    const known: string[] = []
+    const unknown: string[] = []
+    for (const name of Array.isArray(raw) ? raw.map((x) => shownText(String(x)).trim()).filter(Boolean) : []) {
+      const key = db.index.find(name)?.key
+      if (key) {
+        if (!known.includes(key)) known.push(key)
+      } else unknown.push(name)
+    }
+    return { known, unknown }
+  }
+
+  /** The SQL a tool call gave, in real values; a string is why it cannot be used. */
+  const realSql = (db: AgentDatabase, raw: unknown): { sql: string } | string => {
+    const restored = provider.restoreSql(String(raw ?? ''), db.kind)
+    if (restored.unknown.length || restored.damaged.length) return `It uses placeholders that match nothing: ${[...new Set([...restored.unknown, ...restored.damaged])].slice(0, 5).join(', ')}. Copy each one exactly.`
+    if (restored.withheld) return 'It refers to a value you were never shown in full.'
+    return { sql: restored.text.trim().replace(/;\s*$/, '') }
+  }
+
+  /** Whether a term's SQL holds up on its table: as a condition, or failing that as an expression. */
+  const checkTermSql = async (db: AgentDatabase, key: string, sql: string): Promise<string | null> => {
+    const t = db.index.tables.get(key)
+    if (!t) return null
+    let problem: string | null = null
+    for (const probe of [`SELECT 1 FROM ${quotedTable(t.ref)} WHERE ${sql}`, `SELECT ${sql} FROM ${quotedTable(t.ref)}`]) {
+      if (!checkReadOnlySql(probe).ok) return 'It is not read-only SQL.'
+      try {
+        const first = (await db.runQuery(explainStatement(db.kind, probe), 5)).results[0]
+        if (!first || first.kind !== 'error') return null
+        problem ??= first.message
+      } catch (e: any) {
+        problem ??= e?.message ?? String(e)
+      }
+    }
+    return `The database rejected it: ${problem}`
+  }
+
+  /** learn: a term, rule or domain, kept at once. */
+  const learnTool = async (args: Record<string, unknown>): Promise<{ content: string }> => {
+    const target = dbFor(args)
+    if (typeof target === 'string') return { content: target }
+    const db = target
+    if (!db.knowledge || !db.connectionId) return { content: 'Nothing is kept for this database.' }
+    const kind = args.kind === 'rule' ? 'rule' : args.kind === 'domain' ? 'domain' : 'term'
+    const name = shownText(String(args.name ?? '')).replace(/\s+/g, ' ').trim()
+    const meaning = shownText(String(args.meaning ?? '')).replace(/\s+/g, ' ').trim()
+    if (!name || !meaning) return { content: 'Give its name and what it means.' }
+    const source = sourceOf(args.source)
+    const tables = tablesNamed(db, args.tables)
+    const unknownNote = tables.unknown.length ? ` These are not tables here, so they were left out: ${tables.unknown.join(', ')}.` : ''
+    if (kind === 'domain') {
+      if (!tables.known.length) return { content: `Not kept: name the tables in ${name}, as the schema has them.${unknownNote}` }
+      const out = await db.knowledge.learnDomain({ path: name, description: meaning, tables: tables.known, source })
+      if (out.kind === 'refused') return { content: `Not kept: ${out.domain.path} is already described, by the user, as: ${out.domain.description ?? ''}` }
+      learned.push({ kind: 'domain', id: out.domain.path, connectionId: db.connectionId, name: out.domain.path, meaning: out.domain.description ?? meaning })
+      progress.note('knowledge', `Learned the domain ${out.domain.path}`, `${tables.known.length} table${tables.known.length === 1 ? '' : 's'}`)
+      return { content: `Kept.${unknownNote}` }
+    }
+    let sql: string | undefined
+    if (typeof args.sql === 'string' && args.sql.trim()) {
+      const real = realSql(db, args.sql)
+      if (typeof real === 'string') return { content: `Not kept: ${real}` }
+      // Checked against its table when it has one: what is kept is SQL the database takes.
+      const problem = tables.known.length === 1 ? await checkTermSql(db, tables.known[0], real.sql) : null
+      if (problem) return { content: `Not kept: ${problem} Write it with the table's name, as a condition or an expression.` }
+      sql = real.sql
+    }
+    const aliases = Array.isArray(args.aliases) ? args.aliases.map((a) => shownText(String(a))) : []
+    const domain = typeof args.domain === 'string' ? shownText(args.domain) : undefined
+    const out = await db.knowledge.learn({ kind, name, meaning, sql, tables: tables.known, aliases, domain, source, question })
+    if (out.kind === 'refused') {
+      return { content: `Not kept: the user said "${out.fact.name}" means: ${out.fact.meaning} Go by that, and ask them only if the data says otherwise.` }
+    }
+    learned.push({
+      kind,
+      id: out.fact.id,
+      connectionId: db.connectionId,
+      name: out.fact.name,
+      meaning: out.fact.meaning,
+      ...(out.kind === 'corrected' ? { corrected: true } : {})
+    })
+    progress.note('knowledge', `${out.kind === 'corrected' ? 'Corrected' : out.kind === 'confirmed' ? 'Confirmed' : 'Learned'} ${kind === 'rule' ? 'a rule' : `"${out.fact.name}"`}`, safeSlice(out.fact.meaning, 120))
+    return { content: `Kept.${unknownNote}` }
+  }
+
+  /** save_query: a query kept in the runbook with its parameters, once the database takes it. */
+  const saveTool = async (args: Record<string, unknown>): Promise<{ content: string }> => {
+    const target = dbFor(args)
+    if (typeof target === 'string') return { content: target }
+    const db = target
+    if (!db.knowledge || !db.connectionId) return { content: 'Nothing is kept for this database.' }
+    const name = shownText(String(args.name ?? '')).replace(/\s+/g, ' ').trim()
+    const purpose = shownText(String(args.purpose ?? '')).replace(/\s+/g, ' ').trim()
+    if (!name) return { content: 'Give the query a name.' }
+    const real = realSql(db, args.sql)
+    if (typeof real === 'string') return { content: `Not kept: ${real}` }
+    const facts = analyzeSql(real.sql)
+    const given = new Map<string, { description?: string; example?: string }>()
+    for (const p of Array.isArray(args.params) ? args.params : []) {
+      if (!p || typeof p !== 'object' || typeof (p as any).name !== 'string') continue
+      const q = p as Record<string, unknown>
+      given.set(String(q.name).replace(/^:/, ''), {
+        ...(typeof q.description === 'string' ? { description: shownText(q.description) } : {}),
+        ...(q.example !== undefined && q.example !== null ? { example: shownText(String(q.example)) } : {})
+      })
+    }
+    const params = facts.params.map((n) => ({ name: n, ...given.get(n) }))
+    // Checked as it would run: each parameter with its value in this question, or NULL.
+    const sample = bindParams(real.sql, Object.fromEntries(params.map((p) => [p.name, p.example ?? null])))
+    const gate = checkReadOnlySql(sample)
+    if (!gate.ok) return { content: `Not kept: ${gate.reason}` }
+    try {
+      const first = (await db.runQuery(explainStatement(db.kind, gate.sql), 5)).results[0]
+      if (first?.kind === 'error') return { content: `Not kept: the database rejected it: ${first.message}` }
+    } catch (e: any) {
+      return { content: `Not kept: the database rejected it: ${e?.message ?? e}` }
+    }
+    const tables = facts.reads.map((r) => db.index.find(r.name, r.schema)?.key).filter((k): k is string => Boolean(k))
+    // Checked in the data when a query of the same shape ran in this ask and returned rows.
+    const ran = ranQueries.some((q) => q.database.connectionId === db.connectionId && q.rows !== undefined && analyzeSql(q.sql).shape === analyzeSql(sample).shape)
+    const out = await db.knowledge.keep({
+      name,
+      purpose,
+      sql: real.sql,
+      params,
+      tables: [...new Set(tables)],
+      domain: typeof args.domain === 'string' ? shownText(args.domain) : undefined,
+      question,
+      source: ran ? 'data' : 'inferred'
+    })
+    learned.push({ kind: 'query', id: out.entry.id, connectionId: db.connectionId, name: out.entry.name, meaning: out.entry.purpose })
+    progress.note('knowledge', `${out.kind === 'updated' ? 'Updated' : 'Saved'} "${out.entry.name}" in the runbook`, out.entry.id)
+    return { content: `Kept as ${out.entry.id}.` }
+  }
+
+  /** run_saved_query: a runbook query with the model's values bound into it, run and read like run_query. */
+  const runSavedTool = async (args: Record<string, unknown>): Promise<{ content: string; structured?: boolean }> => {
+    const target = dbFor(args)
+    if (typeof target === 'string') return { content: target }
+    const db = target
+    if (!db.readResults) return { content: `Results cannot be read on ${across ? `"${db.key}"` : 'this database'}: use the runbook query's SQL in propose_query instead.` }
+    const entry = db.knowledge ? await db.knowledge.entry(String(args.id ?? '')) : undefined
+    if (!entry || !db.knowledge) return { content: `There is no runbook query ${String(args.id ?? '')}${across ? ` on "${db.key}"` : ''}.` }
+    const values: Record<string, string | null> = {}
+    for (const v of Array.isArray(args.values) ? args.values : []) {
+      if (v && typeof v === 'object' && typeof (v as any).name === 'string') values[String((v as any).name).replace(/^:/, '')] = (v as any).value == null ? null : shownText(String((v as any).value))
+    }
+    const missing = entry.params.filter((p) => !(p.name in values)).map((p) => p.name)
+    if (missing.length) return { content: `Give a value for ${missing.join(', ')}.` }
+    const step = progress.start('query', `Ran "${entry.name}" from the runbook${across ? ` on ${db.name}` : ''}`)
+    const out = await readQuery(db, bindParams(entry.sql, values), step)
+    void db.knowledge.ranEntry(entry.id, Boolean(out.ok), question).catch(() => undefined)
+    return out
   }
 
   const runTool = async (call: ToolCall): Promise<{ content: string; structured?: boolean }> => {
     usage.toolCalls++
     const args = call.args ?? {}
-    if (call.name === 'remember') {
-      const fact = shownText(String(args.fact ?? '')).replace(/\s+/g, ' ').trim()
-      if (!fact) return { content: 'Give the fact to remember.' }
-      const key = String(args.database ?? '')
-      const about = across ? (key === 'all' ? [] : dbs.filter((d) => d.key === key)) : dbs.slice(0, 1)
-      const connectionIds = about.flatMap((d) => (d.connectionId ? [d.connectionId] : []))
-      if (!memories.some((m) => m.fact === fact)) memories.push({ fact: safeSlice(fact, 500), connectionIds })
-      progress.note('tool', 'Model offered to remember something', safeSlice(fact, 120))
-      return { content: 'Offered to the user, who decides whether to keep it. Carry on.' }
+    try {
+      if (call.name === 'learn') return await learnTool(args)
+      if (call.name === 'save_query') return await saveTool(args)
+      if (call.name === 'run_saved_query') return await runSavedTool(args)
+    } catch (e: any) {
+      if (e instanceof PrivacyBlockedError || deps.signal?.aborted) throw e
+      return { content: `It failed: ${e?.message ?? e}` }
     }
     const named = call.name === 'search_schema' || call.name === 'describe_table' || call.name === 'sample_values' || call.name === 'run_query'
     const target = named ? dbFor(args) : dbs[0]
@@ -711,7 +979,9 @@ async function run(deps: AskDeps, question: string, history: AiTurn[], usage: Ai
       const text = await db.index.describe(t.key, await viewFor(deps, db, [t.key]))
       ctx.shown.add(t.key)
       step.done(`${t.meta?.columns.length ?? 0} columns`)
-      return { content: text, structured: true }
+      // Its domain, the terms and runbook queries on it, and how data moves there: business words, so read as prose.
+      const notes = db.knowledge ? await db.knowledge.notes(t.key, db.index).catch(() => [] as string[]) : []
+      return notes.length ? { content: `${text}\n${notes.join('\n')}` } : { content: text, structured: true }
     }
     if (call.name === 'sample_values') {
       const table = shownText(String(args.table ?? ''))
@@ -773,26 +1043,69 @@ async function run(deps: AskDeps, question: string, history: AiTurn[], usage: Ai
     return walk(value) as Record<string, unknown>
   }
 
+  /** The model's words as the answer: without the title line it was asked for, and counted for the terms it used. */
+  const answerInWords = async (text: string, stopReason: string): Promise<AiClarification> => {
+    let words = text.trim()
+    if (deps.title) {
+      const split = splitTitle(words)
+      if (split.title && split.text.trim()) {
+        title = cleanTitle(shownText(split.title)) ?? undefined
+        words = split.text.trim()
+      }
+    }
+    // Terms on the tables the model looked at, which led to an answer, hold up so far.
+    for (const [db, r] of recalls) {
+      if (!db.knowledge || !r.terms.length) continue
+      const looked = new Set(
+        ranQueries
+          .filter((q) => q.database.connectionId === (db.connectionId ?? '') && q.rows !== undefined)
+          .flatMap((q) => analyzeSql(q.sql).reads.map((t) => db.index.find(t.name, t.schema)?.key))
+          .filter((k): k is string => Boolean(k))
+      )
+      const basis = r.terms.filter((f) => f.tables.some((t) => looked.has(t))).map((f) => f.id)
+      void db.knowledge.used(basis, 0.02).catch(() => undefined)
+    }
+    progress.note('done', investigating ? 'Answered' : 'Model answered in words, without a query')
+    // "max_tokens" (Anthropic) and "length" (OpenAI and the like): the reply stopped at the model's limit.
+    return clarify(safeSlice(words, MAX_PROSE_CHARS), undefined, /^(max_tokens|length)$/.test(stopReason))
+  }
+
   let lastText = ''
   for (let step = 0; step < maxSteps; step++) {
-    const res = await complete((across || investigating) && step === maxSteps - 1)
+    const res = await complete(step === maxSteps - 1)
     lastText = res.text
+    // learn and save_query need no reply. They are kept now; when they come with an answer, the ask ends here
+    // instead of spending a request on telling the model they were kept.
+    const answers = new Map<ToolCall, { content: string; structured?: boolean }>()
+    const answer = async (call: ToolCall) => {
+      let out = answers.get(call)
+      if (!out) {
+        out = await runTool(call)
+        answers.set(call, out)
+      }
+      return out
+    }
+    for (const call of res.toolCalls) if (KEEPING_TOOLS.has(call.name)) await answer(call)
     let calls = res.toolCalls
-    if (!calls.length) {
-      const parsed = parseJsonObject(res.text)
+    if (!calls.some((c) => !KEEPING_TOOLS.has(c.name))) {
+      const parsed = calls.length ? null : parseJsonObject(res.text)
       if (parsed && (typeof parsed.sql === 'string' || typeof parsed.needs_clarification === 'string')) {
         calls = [{ id: 'json', name: 'propose_query', args: parsed }]
       } else if (res.text.trim()) {
-        progress.note('done', investigating ? 'Answered' : 'Model answered in words, without a query')
-        // "max_tokens" (Anthropic) and "length" (OpenAI and the like): the reply stopped at the model's limit.
-        return clarify(safeSlice(res.text.trim(), MAX_PROSE_CHARS), undefined, /^(max_tokens|length)$/.test(res.stopReason))
-      } else {
+        return answerInWords(res.text, res.stopReason)
+      } else if (!calls.length) {
         progress.note('error', 'Model returned an empty answer')
         return clarify('', 'The model returned an empty answer. Try rephrasing the question.')
+      } else {
+        // Only learning, and no answer yet: the next reply has it.
+        messages.push({ role: 'assistant', content: res.text, toolCalls: calls })
+        for (const call of calls) messages.push({ role: 'tool', toolCallId: call.id, name: call.name, ...(await answer(call)) })
+        continue
       }
     }
     const proposal = calls.find((c) => c.name === 'propose_query')
     if (proposal) {
+      if (deps.title && typeof proposal.args.title === 'string' && proposal.args.title.trim()) title = cleanTitle(shownText(proposal.args.title)) ?? undefined
       const p = readProposal(proposal.args)
       if (p.needsClarification && !p.sql.trim()) {
         progress.note('done', 'Model asked for clarification')
@@ -840,8 +1153,8 @@ async function run(deps: AskDeps, question: string, history: AiTurn[], usage: Ai
         // Every tool call in the turn needs an answer, or the next request is rejected.
         messages.push({ role: 'assistant', content: res.text, toolCalls: calls })
         for (const call of calls) {
-          const answer = call === proposal ? { content: `${problem}\nFix the query and call propose_query again. Use describe_table if unsure about a column.` } : await runTool(call)
-          messages.push({ role: 'tool', toolCallId: call.id, name: call.name, ...answer })
+          const reply = call === proposal ? { content: `${problem}\nFix the query and call propose_query again. Use describe_table if unsure about a column.` } : await answer(call)
+          messages.push({ role: 'tool', toolCallId: call.id, name: call.name, ...reply })
         }
       } else {
         messages.push({ role: 'assistant', content: res.text })
@@ -851,7 +1164,7 @@ async function run(deps: AskDeps, question: string, history: AiTurn[], usage: Ai
     }
     // Information tools: answer each and loop.
     messages.push({ role: 'assistant', content: res.text, toolCalls: calls })
-    for (const call of calls) messages.push({ role: 'tool', toolCallId: call.id, name: call.name, ...(await runTool(call)) })
+    for (const call of calls) messages.push({ role: 'tool', toolCallId: call.id, name: call.name, ...(await answer(call)) })
   }
   progress.note('error', 'Model kept exploring without proposing a query')
   return clarify(

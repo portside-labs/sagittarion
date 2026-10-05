@@ -5,6 +5,8 @@ import {
   LOCAL_PROVIDERS,
   PROVIDERS,
   SCHEMA_BUDGETS,
+  DEFAULT_MAX_REQUESTS,
+  MAX_REQUEST_CHOICES,
   activeConnection,
   type AgentSettings,
   type AiConnection,
@@ -47,7 +49,14 @@ interface Draft {
   embeddingModel: string
 }
 
-const DEFAULT_AGENT: AgentSettings = { schemaBudgetTokens: 8000, autoRun: true, sendSampleValues: false, readResults: { scope: 'selected', connectionIds: [] } }
+const DEFAULT_AGENT: AgentSettings = {
+  schemaBudgetTokens: 8000,
+  maxRequests: DEFAULT_MAX_REQUESTS,
+  learn: true,
+  autoRun: true,
+  sendSampleValues: false,
+  readResults: { scope: 'selected', connectionIds: [] }
+}
 
 function draftFrom(c: AiConnection, model?: string): Draft {
   return { type: c.type, provider: c.provider, baseUrl: c.baseUrl, model: model || c.defaultModel, embeddingModel: c.embeddingModel }
@@ -170,6 +179,7 @@ export function SettingsDialog() {
   const settings = useStore((s) => s.settings)
   const loadSettings = useStore((s) => s.loadSettings)
   const toast = useStore((s) => s.toast)
+  const confirm = useStore((s) => s.confirm)
   const ui = useStore((s) => s.ui)
   const setUiPref = useStore((s) => s.setUiPref)
   const themeSyntax = THEMES.find((t) => t.id === ui.theme)?.syntax
@@ -284,6 +294,8 @@ export function SettingsDialog() {
     agent.sendSampleValues !== settings.agent.sendSampleValues ||
     JSON.stringify(agent.readResults) !== JSON.stringify(settings.agent.readResults) ||
     agent.schemaBudgetTokens !== settings.agent.schemaBudgetTokens ||
+    agent.maxRequests !== settings.agent.maxRequests ||
+    agent.learn !== settings.agent.learn ||
     (Object.keys(DEFAULT_PRIVACY) as (keyof PrivacySettings)[]).some((k) => privacySettings[k] !== (settings.privacy ?? DEFAULT_PRIVACY)[k])
 
   const save = async () => {
@@ -839,6 +851,22 @@ export function SettingsDialog() {
               among them are replaced with placeholders first.
             </span>
           </div>
+          <div className="field">
+            <label>Requests per question</label>
+            <select className="select" value={agent.maxRequests} onChange={(e) => setAgent({ ...agent, maxRequests: Number(e.target.value) })} data-testid="ai-max-requests">
+              {[...new Set([...MAX_REQUEST_CHOICES, agent.maxRequests])]
+                .sort((a, b) => a - b)
+                .map((n) => (
+                  <option key={n} value={n}>
+                    up to {n}
+                  </option>
+                ))}
+            </select>
+            <span className="hint">
+              Your provider bills every request. Ask often answers in one or two, but looking things up takes more: each lookup is a request of its
+              own. It is told this limit, looks several things up at once, and answers with what it has at the last.
+            </span>
+          </div>
           <div className="field" data-testid="read-results">
             <label>Let Ask read query results</label>
             <span className="hint">
@@ -854,6 +882,42 @@ export function SettingsDialog() {
               testPrefix="read-results"
               hint={agent.readResults.scope === 'selected' && !agent.readResults.connectionIds.length ? 'None chosen: Ask reads no results anywhere.' : undefined}
             />
+          </div>
+
+          <h2 className="section-gap">
+            <Icon name="sparkles" /> Learning
+          </h2>
+          <div className="field">
+            <label className="checkbox">
+              <input type="checkbox" checked={agent.learn} onChange={(e) => setAgent({ ...agent, learn: e.target.checked })} data-testid="ai-learn" />
+              Learn your business's words, rules and queries
+            </label>
+            <span className="hint">
+              Ask keeps what it works out about each connection: what words like a program's name mean in the data, rules you tell it, which tables
+              make up each part of the business, and the queries that answered a question, to answer the next one like it in fewer requests. It also
+              learns from the queries you run. It is kept on this computer and used in later questions; each answer shows what it learned, to forget
+              there.
+            </span>
+            <span className="row">
+              <button
+                className="btn small"
+                type="button"
+                onClick={() =>
+                  void confirm('Forget everything Ask has learned?', 'Terms, rules, domains and runbook queries for every connection go. Instructions you wrote stay.', 'Forget', true).then(async (yes) => {
+                    if (!yes) return
+                    try {
+                      await window.api.knowledge.forgetAll()
+                      toast('success', 'Forgot everything Ask had learned')
+                    } catch (e) {
+                      toast('error', 'Could not forget', errorMessage(e))
+                    }
+                  })
+                }
+                data-testid="ai-forget-learned"
+              >
+                Forget everything learned
+              </button>
+            </span>
           </div>
 
           <h2 className="section-gap">

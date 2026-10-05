@@ -92,6 +92,10 @@ const api: Api = {
     setEnabled: (id, enabled) => ipcRenderer.invoke('instructions:setEnabled', id, enabled),
     remove: (id) => ipcRenderer.invoke('instructions:remove', id)
   },
+  knowledge: {
+    forget: (item) => ipcRenderer.invoke('knowledge:forget', item),
+    forgetAll: () => ipcRenderer.invoke('knowledge:forgetAll')
+  },
   connectors: {
     list: () => ipcRenderer.invoke('connectors:list'),
     save: (input) => ipcRenderer.invoke('connectors:save', input),

@@ -691,36 +691,46 @@ async function main() {
         const email = /<\|PII:EMAIL:[0-9A-F]{6}\|>/.exec(typeof question === 'string' ? question : JSON.stringify(question))?.[0]
         const toolCall = (name, args) =>
           res.end(JSON.stringify({ model: 'mock-sql', choices: [{ message: { content: null, tool_calls: [{ id: `t${r.messages.length}`, type: 'function', function: { name, arguments: JSON.stringify(args) } }] } }], usage: { prompt_tokens: 900, completion_tokens: 40 } }))
-        // Asked to name a new conversation for its tab.
-        const system = r.messages.find((m) => m.role === 'system')?.content ?? ''
-        if (/Name the conversation/.test(system)) {
-          const name = /first user/i.test(String(question)) ? 'First User Lookup' : 'User Lookup'
-          return res.end(JSON.stringify({ model: 'mock-sql', choices: [{ message: { content: `"${name}."` }, finish_reason: 'stop' }], usage: { prompt_tokens: 40, completion_tokens: 4 } }))
-        }
+        // A conversation's first question asks for its name too, which comes with the answer: in propose_query's title,
+        // or on the first line of a reply in words.
+        const naming = /Name it for a small tab/.test(String(question))
+        const name = /first user/i.test(String(question)) ? 'First User Lookup' : 'User Lookup'
+        const titled = (text) => (naming ? `Title: ${name}\n\n${text}` : text)
         // A chat across two databases: find the user in the second, follow the email into the first by its placeholder, answer.
-        // One database, results readable: look at the users, offer to remember a fact, then answer.
+        // One database, results readable: look at the users, then answer, keeping what it learned in the same reply.
         if (/october spawn/i.test(String(question))) {
           const results = r.messages.filter((m) => m.role === 'tool')
           if (!results.length) return toolCall('run_query', { sql: 'SELECT id, name, email FROM users ORDER BY id LIMIT 3', purpose: 'the users to check' })
-          if (results.length === 1) return toolCall('remember', { fact: 'The spawn checks run against the users table.' })
           const rowCount = /^(\d+) rows?/.exec(results[0].content)?.[1] ?? '?'
-          return res.end(JSON.stringify({ model: 'mock-sql', choices: [{ message: { content: `**Ready.** I checked ${rowCount} users; every one has an email.` }, finish_reason: 'stop' }], usage: { prompt_tokens: 900, completion_tokens: 30 } }))
+          const learn = { kind: 'rule', name: 'Spawn checks', meaning: 'The spawn checks run against the users table.', tables: ['users'], source: 'user' }
+          return res.end(
+            JSON.stringify({
+              model: 'mock-sql',
+              choices: [
+                {
+                  message: { content: titled(`**Ready.** I checked ${rowCount} users; every one has an email.`), tool_calls: [{ id: 'l1', type: 'function', function: { name: 'learn', arguments: JSON.stringify(learn) } }] },
+                  finish_reason: 'tool_calls'
+                }
+              ],
+              usage: { prompt_tokens: 900, completion_tokens: 30 }
+            })
+          )
         }
         if (/across both databases/i.test(String(question))) {
           const results = r.messages.filter((m) => m.role === 'tool')
           if (!results.length) return toolCall('run_query', { database: 'db2', sql: 'SELECT id, email FROM users WHERE id = 1', purpose: 'the user' })
           const found = /<\|PII:EMAIL:[0-9A-F]{6}\|>/.exec(results[0].content)?.[0] ?? 'missing'
           if (results.length === 1) return toolCall('run_query', { database: 'db1', sql: `SELECT id, name FROM users WHERE email = '${found}'`, purpose: 'the same user here' })
-          return res.end(JSON.stringify({ model: 'mock-sql', choices: [{ message: { content: `**Timeline**\n\n1. User 1 is ${found} in both databases.` }, finish_reason: 'stop' }], usage: { prompt_tokens: 900, completion_tokens: 60 } }))
+          return res.end(JSON.stringify({ model: 'mock-sql', choices: [{ message: { content: titled(`**Timeline**\n\n1. User 1 is ${found} in both databases.`) }, finish_reason: 'stop' }], usage: { prompt_tokens: 900, completion_tokens: 60 } }))
         }
         if (/count the users in the other database/i.test(String(question))) {
           return toolCall('propose_query', { database: 'db2', sql: 'SELECT count(*) AS n FROM users', explanation: 'Counts the users.', tables_used: ['users'] })
         }
         // A question a connector's documentation would answer: a long reply in markdown, without a query.
         if (/how do i use the client library/i.test(String(question))) {
-          return res.end(JSON.stringify({ model: 'mock-sql', choices: [{ message: { content: DOCS_ANSWER }, finish_reason: 'stop' }], usage: { prompt_tokens: 900, completion_tokens: 700 } }))
+          return res.end(JSON.stringify({ model: 'mock-sql', choices: [{ message: { content: titled(DOCS_ANSWER) }, finish_reason: 'stop' }], usage: { prompt_tokens: 900, completion_tokens: 700 } }))
         }
-        const args = { sql: 'SELECT id, name FROM users ORDER BY id LIMIT 1', explanation: 'The first user.', tables_used: ['users'] }
+        const args = { sql: 'SELECT id, name FROM users ORDER BY id LIMIT 1', explanation: 'The first user.', tables_used: ['users'], ...(naming ? { title: `"${name}."` } : {}) }
         const calls =
           flag && email
             ? [
@@ -903,18 +913,32 @@ async function main() {
       await chatEl('ask-button').click()
       await answered(answersLook)
       const sentLook = aiRequests.slice(beforeLook)
-      assert(sentLook.length === 3 && sentLook[0].includes('"run_query"') && sentLook[0].includes('Find things out before you ask'), 'with results readable, the model can run queries and is told to look first')
+      // Two requests: what it learned came with its answer, so no request went on telling the model it was kept.
+      assert(sentLook.length === 2 && sentLook[0].includes('"run_query"') && sentLook[0].includes('"learn"') && sentLook[0].includes('Find things out before you ask'), 'with results readable, the model can run queries and is told to look first')
+      assert(sentLook[0].includes('You have at most 6 requests to the model for this question'), 'and how many requests it has')
       assert(!sentLook.join('\n').includes(userEmail), 'the emails in the results never reached the model')
       const looked = chatEl('ask-result').last()
       assert((await looked.locator('.chat-markdown').textContent()).includes('I checked 3 users'), 'it answers with what it found')
       assert((await looked.getByTestId('ask-queries-toggle').textContent()).includes('1 query'), 'with the query it ran')
-      const memory = looked.getByTestId('ask-memory')
-      assert((await memory.textContent()).includes(`Remember for ${frontName}? The spawn checks run against the users table.`), 'it offers to remember what it learned')
-      await memory.getByTestId('ask-memory-save').click()
-      await page.waitForFunction(() => [...document.querySelectorAll('[data-testid=chat-pane] [data-testid=ask-memory]')].pop()?.classList.contains('saved'))
-      const kept = JSON.parse(fs.readFileSync(path.join(userData, 'instructions.json'), 'utf8')).instructions.find((i) => i.text === 'The spawn checks run against the users table.')
-      assert(kept && kept.name === 'The spawn checks run against the users table' && kept.scope === 'selected' && kept.connectionIds.length === 1, 'kept, it is an instruction for this connection')
-      console.log('one database: Ask reads results where it is let, works the question out, and remembers what it learned')
+      // What it learned is kept already, without a yes: named under the answer, to forget there.
+      const learnedLine = looked.getByTestId('ask-learned')
+      assert((await learnedLine.textContent()).includes('Spawn checks'), 'the answer names what it learned')
+      assert((await learnedLine.getByTestId('ask-learned-item').getAttribute('title')) === 'The spawn checks run against the users table.', 'with what it means on hover')
+      const knowledgeDir = path.join(userData, 'knowledge')
+      const keptRule = () => {
+        try {
+          return fs.readdirSync(knowledgeDir).flatMap((f) => JSON.parse(fs.readFileSync(path.join(knowledgeDir, f), 'utf8')).facts).find((f) => f.name === 'Spawn checks')
+        } catch {
+          return undefined
+        }
+      }
+      for (let i = 0; i < 50 && !keptRule(); i++) await page.waitForTimeout(100)
+      assert(keptRule()?.source === 'user' && keptRule()?.tables[0] === 'users', 'kept for this connection, as the user said it')
+      await learnedLine.getByTestId('ask-learned-forget').click()
+      await learnedLine.waitFor({ state: 'detached' })
+      for (let i = 0; i < 50 && keptRule(); i++) await page.waitForTimeout(100)
+      assert(!keptRule(), 'forgotten from the answer, it is gone')
+      console.log('one database: Ask reads results where it is let, works the question out, and keeps what it learned without asking')
 
       // ------------------------------------------------------------ a chat across databases
       const otherName = 'E2E local file'
@@ -981,9 +1005,10 @@ async function main() {
       await chatEl('ask-button').click()
       await answered(0)
       await page.waitForFunction(() => document.querySelectorAll('[data-testid=chat-pane] [data-testid=chat-tab]')[1]?.dataset.title === 'First User Lookup')
-      // Asked once, with its first question, protected like any request.
-      const named = aiRequests.filter((b) => b.includes('Name the conversation'))
-      assert(named.length === 2 && !named.join('\n').includes('radia.1@example.com'), 'each conversation is named once, from its first question')
+      // Named with its first answer, not in a request of its own.
+      const named = aiRequests.filter((b) => b.includes('Name it for a small tab'))
+      assert(named.length === 2 && !named.join('\n').includes('radia.1@example.com'), 'each conversation is named with its first answer')
+      assert(!aiRequests.some((b) => b.includes('Name the conversation')), 'never in a request of its own')
       // A third, closed again: the one beside it comes to the front.
       await chatEl('chat-tab-new').click()
       assert((await chatEl('chat-tab').count()) === 3, 'another conversation opens')

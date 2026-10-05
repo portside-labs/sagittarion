@@ -93,9 +93,49 @@ Where the user lets Ask read results (`AgentSettings.readResults`: every
 connection, or chosen ones; none by default), the model works questions out
 instead of writing one query: it has `run_query` (up to 50 rows, protected),
 rules that tell it to look things up before asking and to say what it
-assumed, up to 25 steps with a final answer forced at the last, and sees what
-earlier answers' queries returned in the editor. Everywhere the model can call
-`remember`; the chat offers the fact to keep as an instruction.
+assumed, and sees what earlier answers' queries returned in the editor.
+
+Every request is billed, so an ask makes at most `AgentSettings.maxRequests`
+of them (6 unless the user picks otherwise), the last forced to answer: in
+words where the model reads results or uses connectors, with `propose_query`
+otherwise. The rules tell the model its budget and to call independent tools
+together. Anthropic requests cache the conversation as well as the prompt, so
+the steps of one question read it back instead of paying for it again;
+embeddings are cached by each table's own text; long earlier answers are
+replayed shortened; and a new conversation's name comes with its first answer
+rather than in a request of its own.
+
+**Business knowledge** (`src/main/knowledge/`) is what Ask learns about the
+business behind each saved connection, so questions can be asked in its own
+words. It is kept per connection in `knowledge/<id>.json` (`KnowledgeStore`),
+and turned off with `AgentSettings.learn`.
+
+- What it holds: terms (a word the business uses, what it means, the SQL
+  condition or expression for it and its tables) and rules; domains and
+  subdomains, with their tables (`Marketing › Programs`); the runbook, queries
+  that answered business questions, with `:parameters`; the statements run on
+  the connection, by shape; joins seen in them and what triggers, functions
+  and views read and write (`DataLink`); and the text values queries compared
+  columns with.
+- How it learns without the model: every read statement run in the editor or
+  by the model is read by `analyzeSql` (`sql-facts.ts`) for its tables, joins
+  and values; tables are outlined into domains by schema, name and foreign
+  keys (`domains.ts`); after an ask, the triggers and definitions of the
+  tables it used are read for how data moves (`flow.ts`), a few at a time.
+- How the model adds to it: `learn` (a term, rule or domain) and `save_query`
+  (a runbook entry, checked with `EXPLAIN` first), kept at once without asking
+  the user. They need no reply, so they ride along with the answer or other
+  tool calls rather than costing a request. Each item says where it came from
+  (`user`, `data`, `inferred`, `structure`), which sets how far it is trusted:
+  a correction keeps what it replaced, and what the user said gives way only
+  to the user. Answers built on a term make it surer, more so when the user
+  runs the query; forgetting an item under an answer undoes it.
+- How it is used: `recall` (`recall.ts`) matches the question, with no model
+  call, against terms, values, the runbook and domains. The tables they point
+  at go into the schema excerpt even when the question names none, and a
+  "What this team means" section follows the schema. `run_saved_query` runs a
+  runbook entry with its values bound in, and `describe_table` adds a table's
+  domain, terms, runbook entries and data flow.
 
 The chat is one pane beside every connection (`ChatPane`), its conversations
 in tabs (`chats` in the app store, saved with the workspace). Each has its own
@@ -107,7 +147,7 @@ from the clock in the chat's header. Answers from hosted providers stream
 their streamed tool calls vary); the renderer reveals any answer at an easing
 pace (`lib/reveal.ts`), so a stream that comes in bursts, or an answer that
 arrives at once, unfolds evenly. The first question of a conversation also
-asks the model for a short name for its tab (`ai/title.ts`). A conversation follows the connection in front until its first
+asks the model for a short name for its tab, which comes with the answer. A conversation follows the connection in front until its first
 question, then keeps the databases it has in context; more can be added from
 the bar above the input, and are connected in the background.
 With more than one, an ask gets them all (`AskOptions.databases`): each is
@@ -151,6 +191,7 @@ src/main/db/                DatabaseDriver interface, SQLite and PostgreSQL driv
 src/main/connections/       ConnectionManager: opens either kind, tunnels, lifecycle
 src/main/agent/             sqlite_agent.py, the helper that opens SQLite files
 src/main/ai/                Ask: provider adapters, schema index and retrieval, read-only guard, orchestrator
+src/main/knowledge/         business knowledge: SQL reading, store, domains, recall, data flow
 src/main/privacy/           Local AI Privacy: detectors, policies, placeholder vault, restoration, verification
 src/main/privacy/semantic/  the optional on-device model: manifest, download, tokenizer, ONNX Runtime process
 src/main/connectors/        MCP connectors: settings store, clients, tools for an ask, approvals

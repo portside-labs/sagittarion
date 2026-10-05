@@ -304,8 +304,10 @@ describe('ask orchestrator', () => {
     expect(req.system[1].cacheable).toBe(true)
     expect(req.system[1].text).toContain('## Schema (all 7 tables)')
     expect(req.system[1].text).toContain('orders(id int pk, user_id int fk->users.id')
-    // Without leave to read results there is no run_query; remember is always on offer.
-    expect(req.tools?.map((t) => t.name)).toEqual(['propose_query', 'search_schema', 'describe_table', 'sample_values', 'remember'])
+    // Without leave to read results there is no run_query; without knowledge kept, nothing to learn with.
+    expect(req.tools?.map((t) => t.name)).toEqual(['propose_query', 'search_schema', 'describe_table', 'sample_values'])
+    // The model is told its request budget, and how to need fewer.
+    expect(req.system[0].text).toContain('You have at most 6 requests to the model for this question, this one included.')
   })
 
   it('feeds EXPLAIN failures back to the model and repairs the query', async () => {
@@ -592,12 +594,35 @@ describe('Anthropic adapter', () => {
     expect(body.messages[1].content.map((c: any) => c.type)).toEqual(['tool_use', 'tool_use'])
     expect(body.messages[2].role).toBe('user')
     expect(body.messages[2].content.map((c: any) => c.tool_use_id)).toEqual(['a', 'b'])
+    // The conversation so far is cached too, up to its last block: the next step of the question reads it back.
+    expect(body.messages[2].content.map((c: any) => c.cache_control)).toEqual([undefined, { type: 'ephemeral' }])
     expect(body.tools[0]).toMatchObject({ name: 'propose_query', input_schema: { type: 'object' } })
     expect(body.tool_choice).toEqual({ type: 'auto' })
     expect(res.text).toBe('Looking.')
     expect(res.toolCalls).toEqual([{ id: 'toolu_1', name: 'propose_query', args: { sql: 'SELECT 2' } }])
     expect(res.usage).toEqual({ inputTokens: 900, outputTokens: 40, cachedInputTokens: 800 })
     expect(p.supportsEmbeddings).toBe(false)
+  })
+
+  it('says the last request in the same turn as the tool results, and caches only where the prompt is cached', async () => {
+    const { fn, calls } = mockFetch(() => ({ body: { model: 'claude-x', stop_reason: 'end_turn', content: [{ type: 'text', text: 'Done.' }], usage: { input_tokens: 1, output_tokens: 1 } } }))
+    const p = new AnthropicProvider(providerConfigFor({ provider: 'anthropic', baseUrl: '', model: 'claude-x', embeddingModel: '' }, 'k', { fetchImpl: fn }))
+    const messages: ChatRequest['messages'] = [
+      { role: 'user', content: 'q' },
+      { role: 'assistant', content: '', toolCalls: [{ id: 'a', name: 'run_query', args: { sql: 'SELECT 1' } }] },
+      { role: 'tool', toolCallId: 'a', name: 'run_query', content: 'r1' },
+      { role: 'user', content: 'Answer now.' }
+    ]
+    await p.complete({ system: [{ text: 'schema', cacheable: true }], messages })
+    const turns = calls[0].json.messages
+    expect(turns).toHaveLength(3)
+    expect(turns[2].content).toEqual([
+      { type: 'tool_result', tool_use_id: 'a', content: 'r1' },
+      { type: 'text', text: 'Answer now.', cache_control: { type: 'ephemeral' } }
+    ])
+    // A request that caches nothing, such as a title or a connection test, marks nothing.
+    await p.complete({ system: [{ text: 'rules' }], messages: [{ role: 'user', content: 'hi' }] })
+    expect(calls[1].json.messages).toEqual([{ role: 'user', content: 'hi' }])
   })
 
   it('lists models and surfaces rate limits', async () => {

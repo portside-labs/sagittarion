@@ -46,7 +46,7 @@ describe('AI settings', () => {
       ])
       expect(s.activeConnectionId).toBe(s.connections[0].id)
       expect(s.activeModel).toBe('claude-x')
-      expect(s.agent).toEqual({ schemaBudgetTokens: 16000, autoRun: false, sendSampleValues: true, readResults: { scope: 'selected', connectionIds: [] } })
+      expect(s.agent).toEqual({ schemaBudgetTokens: 16000, maxRequests: 6, learn: true, autoRun: false, sendSampleValues: true, readResults: { scope: 'selected', connectionIds: [] } })
       expect((await settings.resolve()).apiKey).toBe('sk-ant-1')
       // The secret left the settings file for the credential store, still encrypted.
       const raw = readFileSync(path.join(dir, 'settings.json'), 'utf8')

@@ -1,7 +1,7 @@
 import { promises as fs } from 'node:fs'
 import path from 'node:path'
 import { randomUUID } from 'node:crypto'
-import { normalizeResultsAccess, PROVIDERS, type AgentSettings, type AiConnection, type AiConnectionInput, type AiSettings, type AiSettingsUpdate, type ProviderId } from '@shared/ai'
+import { DEFAULT_MAX_REQUESTS, normalizeResultsAccess, PROVIDERS, type AgentSettings, type AiConnection, type AiConnectionInput, type AiSettings, type AiSettingsUpdate, type ProviderId } from '@shared/ai'
 import { normalizePrivacy, type PrivacySettings } from '@shared/privacy'
 import type { CredentialStore } from './credentials'
 
@@ -46,7 +46,19 @@ interface StoredSettings {
   ai?: StoredAi | LegacyAi
 }
 
-const DEFAULT_AGENT: AgentSettings = { schemaBudgetTokens: 8000, autoRun: true, sendSampleValues: false, readResults: { scope: 'selected', connectionIds: [] } }
+const DEFAULT_AGENT: AgentSettings = {
+  schemaBudgetTokens: 8000,
+  maxRequests: DEFAULT_MAX_REQUESTS,
+  learn: true,
+  autoRun: true,
+  sendSampleValues: false,
+  readResults: { scope: 'selected', connectionIds: [] }
+}
+
+/** A request budget as kept: a whole number from 2 to 40, the default when there is none. */
+function requestBudget(v: unknown): number {
+  return typeof v === 'number' && Number.isFinite(v) ? Math.min(40, Math.max(2, Math.round(v))) : DEFAULT_MAX_REQUESTS
+}
 
 /** Provider ids as they were saved earlier map onto the current ones. */
 export function normalizeProviderId(raw: string | undefined): ProviderId {
@@ -137,6 +149,8 @@ export class SettingsStore {
       connections,
       agent: {
         schemaBudgetTokens: legacy.schemaBudgetTokens ?? DEFAULT_AGENT.schemaBudgetTokens,
+        maxRequests: DEFAULT_AGENT.maxRequests,
+        learn: DEFAULT_AGENT.learn,
         autoRun: legacy.autoRun ?? DEFAULT_AGENT.autoRun,
         sendSampleValues: Boolean(legacy.sendSampleValues),
         readResults: DEFAULT_AGENT.readResults
@@ -164,7 +178,13 @@ export class SettingsStore {
       connections,
       // Reading results was a yes or no for chats across databases before it went per connection; either way it now
       // starts with none, for the user to choose.
-      agent: { ...DEFAULT_AGENT, ...ai.agent, readResults: normalizeResultsAccess(ai.agent?.readResults) },
+      agent: {
+        ...DEFAULT_AGENT,
+        ...ai.agent,
+        maxRequests: requestBudget(ai.agent?.maxRequests),
+        learn: ai.agent?.learn !== false,
+        readResults: normalizeResultsAccess(ai.agent?.readResults)
+      },
       encryptionAvailable: this.credentials.available,
       managedAccount: null,
       privacy: normalizePrivacy(ai.privacy)
@@ -216,6 +236,8 @@ export class SettingsStore {
       if (typeof u.agent.sendSampleValues === 'boolean') ai.agent.sendSampleValues = u.agent.sendSampleValues
       if (u.agent.readResults && typeof u.agent.readResults === 'object') ai.agent.readResults = normalizeResultsAccess(u.agent.readResults)
       if (typeof u.agent.schemaBudgetTokens === 'number' && u.agent.schemaBudgetTokens >= 1000) ai.agent.schemaBudgetTokens = Math.round(u.agent.schemaBudgetTokens)
+      if (typeof u.agent.maxRequests === 'number') ai.agent.maxRequests = requestBudget(u.agent.maxRequests)
+      if (typeof u.agent.learn === 'boolean') ai.agent.learn = u.agent.learn
     }
     await this.persist({ ...stored, ai })
     return this.get()

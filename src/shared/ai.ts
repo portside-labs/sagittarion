@@ -1,4 +1,5 @@
 // Natural-language to SQL with an AI connection of the user's choosing: shared types, presets and catalogue.
+import type { AiLearned } from './knowledge'
 import type { AiPrivacyReport, PrivacySettings, SealedTurn } from './privacy'
 //
 // Three words that are kept apart on purpose:
@@ -280,9 +281,20 @@ export function connectionReady(c: AiConnection | null | undefined): boolean {
 }
 
 /** Settings of the database agent itself: the same whichever model answers. */
+/** The most requests to the model one question makes, unless the user picks otherwise. */
+export const DEFAULT_MAX_REQUESTS = 6
+export const MAX_REQUEST_CHOICES = [3, 6, 10, 16, 25] as const
+
 export interface AgentSettings {
   /** Token budget for the schema excerpt in each request. */
   schemaBudgetTokens: number
+  /** The most requests to the model one question may make, the last of them made to answer. */
+  maxRequests: number
+  /**
+   * Keep business knowledge per connection, on this computer: the terms, rules, domains and runbook queries the model
+   * works out, and what the queries run there show. Used in later questions.
+   */
+  learn: boolean
   /** Run generated queries automatically once they pass the read-only and EXPLAIN checks. */
   autoRun: boolean
   /** Send up to 20 distinct values of short text columns for the tables in context. */
@@ -468,7 +480,7 @@ export interface AiTurnResult {
   rowCount: number
 }
 
-/** A fact the model offers to keep as an instruction, so that it need not ask for it again. */
+/** A fact the model offered to keep as an instruction, in chats from before it learned for itself. */
 export interface AiMemory {
   fact: string
   /** The saved database connections it is about; none for every connection. */
@@ -504,8 +516,10 @@ export interface AiQueryResult {
   kind: 'query'
   /** A short name for the conversation, when its first question asked for one. */
   title?: string
-  /** Facts the model offers to remember. */
+  /** Facts the model offered to remember, in chats from before it learned for itself. */
   memories?: AiMemory[]
+  /** What the model learned and kept while answering: the answer shows it, and the user can forget it. */
+  learned?: AiLearned[]
   sql: string
   /** Where the query runs, in a chat across several databases; otherwise the chat's own. */
   database?: AiDatabaseRef
@@ -535,8 +549,10 @@ export interface AiClarification {
   queries?: AiRanQuery[]
   /** A short name for the conversation, when its first question asked for one. */
   title?: string
-  /** Facts the model offers to remember. */
+  /** Facts the model offered to remember, in chats from before it learned for itself. */
   memories?: AiMemory[]
+  /** What the model learned and kept while answering. */
+  learned?: AiLearned[]
 }
 
 export interface AiCancelled {
@@ -546,7 +562,7 @@ export interface AiCancelled {
 
 export type AiResult = AiQueryResult | AiClarification | AiCancelled
 
-export type AiStage = 'index' | 'instructions' | 'retrieve' | 'sample' | 'privacy' | 'request' | 'tool' | 'query' | 'check' | 'repair' | 'done' | 'error' | 'cancelled'
+export type AiStage = 'index' | 'instructions' | 'knowledge' | 'retrieve' | 'sample' | 'privacy' | 'request' | 'tool' | 'query' | 'check' | 'repair' | 'done' | 'error' | 'cancelled'
 
 /** One step of an ask, streamed to the renderer while the model works. A step is reported twice: running, then done or error. */
 export interface AiProgressEvent {

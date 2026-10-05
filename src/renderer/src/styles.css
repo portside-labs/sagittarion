@@ -5237,6 +5237,51 @@ html.drag-sorting * {
 }
 
 /* A fact the model offers to remember, under its answer. */
+.ask-learned {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 8px;
+  font-size: 11.5px;
+  color: var(--text-faint);
+}
+.ask-learned > svg {
+  flex: 0 0 auto;
+  color: var(--text-faint);
+}
+.ask-learned-label {
+  color: var(--text-faint);
+}
+.ask-learned-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  max-width: 100%;
+  padding: 1px 2px 1px 7px;
+  border-radius: 999px;
+  background: var(--bg-fill-hover);
+  color: var(--text-muted);
+  cursor: default;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.ask-learned-forget {
+  display: inline-grid;
+  place-items: center;
+  width: 16px;
+  height: 16px;
+  padding: 0;
+  border: 0;
+  border-radius: 50%;
+  background: transparent;
+  color: var(--text-faint);
+  cursor: pointer;
+}
+.ask-learned-forget:hover {
+  background: var(--bg-fill-active, var(--border));
+  color: var(--text);
+}
 .ask-memory {
   display: flex;
   align-items: flex-start;
